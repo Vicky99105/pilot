@@ -1,12 +1,13 @@
 import type { ReactNode } from 'react'
 import type { User } from './lib/api'
 import { match, usePath } from './lib/router'
-import { isStaff, isSupervisor, queueRoles } from './lib/users'
+import { canSeeMetrics, isStaff, isSupervisor, queueRoles } from './lib/users'
 import { CurrentUserProvider } from './hooks/CurrentUserProvider'
 import { useCurrentUser } from './hooks/useCurrentUser'
 import { TopBar } from './components/shell/TopBar'
 import { Empty, Loading, Notice } from './components/ui/primitives'
 import { ClaimPage } from './routes/ClaimPage'
+import { MetricsPage } from './routes/MetricsPage'
 import { MonitoringPage } from './routes/MonitoringPage'
 import { OverridesPage } from './routes/OverridesPage'
 import { ReviewPage, TaskPage } from './routes/ReviewPage'
@@ -22,6 +23,7 @@ function Route({ path, user }: { path: string; user: User }): ReactNode {
     if ((params = match('/tasks/:id', path))) return <TaskPage taskId={params.id} user={user} />
     if (match('/monitoring', path)) return <MonitoringPage user={user} />
     if (match('/overrides', path)) return <OverridesPage user={user} path={path} />
+    if (canSeeMetrics(user) && match('/metrics', path)) return <MetricsPage user={user} />
     if (isSupervisor(user)) {
       if (match('/supervisor', path)) return <SupervisorPage user={user} />
       // A supervisor who works no queue starts on the supervisor view.

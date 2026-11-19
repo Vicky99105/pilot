@@ -34,6 +34,7 @@ from app.shared.seed_ids import (
 )
 from app.shared.types import Role, Stage
 from tests.api.test_task_routes import UNREACHABLE
+from tests.database.factories import add_user
 from tests.docs import make_pdf
 from tests.fakes import FakeHealthService
 from tests.fakes.core import FakePermissionService
@@ -57,6 +58,7 @@ class Api:
     ) -> None:
         self.client, self.sessions, self.tasks = client, sessions, tasks
         self.signaller, self.starter = signaller, starter
+        self.monitoring = FakeMonitoring()
 
     async def get(self, user: UUID, path: str) -> httpx.Response:
         return await self.client.get(path, headers={"X-User-Id": str(user)})
@@ -101,7 +103,9 @@ async def api(sessions: async_sessionmaker[AsyncSession]) -> AsyncIterator[Api]:
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield Api(client, sessions, tasks, signaller, starter)
+        built = Api(client, sessions, tasks, signaller, starter)
+        built.monitoring = monitoring
+        yield built
 
 
 async def test_the_supervisor_view_is_for_supervisors_only(api: Api) -> None:
@@ -206,3 +210,27 @@ async def test_the_claimant_asks_for_a_closed_claim_to_be_reconsidered(api: Api)
     detail = await api.get(MEMBER_USER_ID, f"/api/claims/{closed}")
     assert [r["number"] for r in detail.json()["reconsiderations"]] == [1]
     assert detail.json()["status"] == "reconsideration"
+
+
+async def test_pilot_metrics_are_for_supervisors_and_admins_over_a_chosen_period(
+    api: Api,
+) -> None:
+    admin = await add_user(api.sessions, "Admin", [Role.ADMIN])
+    start, end = "2026-11-01T00:00:00Z", "2026-11-08T00:00:00Z"
+
+    chosen = await api.get(SUPERVISOR_USER_ID, f"/api/monitoring/metrics?start={start}&end={end}")
+    default = await api.get(admin, "/api/monitoring/metrics")
+    refused = await api.get(OPS_USER_ID, "/api/monitoring/metrics")
+    backwards = await api.get(
+        SUPERVISOR_USER_ID, f"/api/monitoring/metrics?start={end}&end={start}"
+    )
+
+    assert chosen.status_code == 200
+    assert chosen.json()["start"].startswith("2026-11-01T00:00:00")
+    assert api.monitoring.metrics_asked[0] == (
+        datetime(2026, 11, 1, tzinfo=UTC),
+        datetime(2026, 11, 8, tzinfo=UTC),
+    )
+    asked_start, asked_end = api.monitoring.metrics_asked[1]
+    assert default.status_code == 200 and asked_end - asked_start == timedelta(days=7)
+    assert (refused.status_code, backwards.status_code) == (403, 422)

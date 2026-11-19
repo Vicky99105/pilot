@@ -37,3 +37,6 @@ class Settings(BaseSettings):
     # Query loop: days the claimant has to reply, and the days after raising to remind them.
     query_reply_days: int = 15
     query_reminder_days: list[int] = [3, 7]
+    # Evals only: "role=provider:model,..." repoints model roles without editing
+    # config/models.yaml (see model_gateway.service.apply_role_overrides). Empty in production.
+    model_role_overrides: str = ""

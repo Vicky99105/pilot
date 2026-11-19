@@ -39,6 +39,11 @@ export function isSupervisor(user: User): boolean {
   return user.roles.includes('supervisor')
 }
 
+/** Pilot metrics are for supervisors and admins. Mirrors METRICS_ROLES in the monitoring routes. */
+export function canSeeMetrics(user: User): boolean {
+  return user.roles.includes('supervisor') || user.roles.includes('admin')
+}
+
 export const SYSTEM_LABELS: Record<SystemOfMedicine, string> = {
   allopathy: 'Allopathy',
   ayush: 'AYUSH',

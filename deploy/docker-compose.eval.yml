@@ -1,0 +1,44 @@
+# Local evals only (Phase 3). An isolated app beside the dev stack: its own databases
+# (claims_eval, mock_core_eval), Temporal namespace (eval) and task queue (claims-eval), file
+# store and port (127.0.0.1:8001). tools/eval/isolated.py creates the databases and the
+# namespace; its docstring has the start command. Never use this file on the server.
+
+services:
+  app-eval:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-claims}:${POSTGRES_PASSWORD:-local-dev-only}@postgres:5432/claims_eval
+      MOCK_CORE_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-claims}:${POSTGRES_PASSWORD:-local-dev-only}@postgres:5432/mock_core_eval
+      MOCK_CORE_BASE_URL: http://127.0.0.1:8000/mock-core
+      MOCK_CORE_ADMIN_ENABLED: "true"
+      FILE_STORE_DIR: /data/files
+      FILE_ENCRYPTION_KEY: ${FILE_ENCRYPTION_KEY:-bG9jYWwtZGV2LW9ubHktbm90LWEtcmVhbC1rZXktMDA=}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: eval
+      TEMPORAL_TASK_QUEUE: claims-eval
+      NOTIFICATIONS_GRAPH_ENABLED: "false"
+      # Repoint model roles without editing config/models.yaml: "role=provider:model,...".
+      MODEL_ROLE_OVERRIDES: ${MODEL_ROLE_OVERRIDES:-}
+      # The query loop's clock, in days (an unanswered-query case needs a short one).
+      QUERY_REPLY_DAYS: ${EVAL_QUERY_REPLY_DAYS:-15}
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - eval-file-store:/data/files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+volumes:
+  eval-file-store:

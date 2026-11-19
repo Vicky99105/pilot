@@ -137,7 +137,10 @@ def create_app(
                 sessions, app.state.intake_service, app.state.monitoring
             )
         gateway = model_gateway or build_model_gateway(
-            config_path=settings.config_dir / "models.yaml", file_store=files, sessions=sessions
+            config_path=settings.config_dir / "models.yaml",
+            file_store=files,
+            sessions=sessions,
+            role_overrides=settings.model_role_overrides,
         )
         rules = DefaultRulesEngine(settings.config_dir / "products")
         kb = DefaultKnowledgeBase(sessions)

@@ -483,3 +483,49 @@ async def test_quota_message_that_says_per_day_is_permanent(
 
     with pytest.raises(ModelQuotaExhausted):
         await _call(gateway)
+
+
+# --- Per-role model override (P3-2: lets the eval compare models without editing models.yaml)
+
+
+def test_role_override_swaps_provider_and_model_and_keeps_the_role_params() -> None:
+    from app.services.model_gateway.service import apply_role_overrides
+
+    repo = load_models_config(REPO_ROOT / "config" / "models.yaml")
+    changed = apply_role_overrides(
+        repo,
+        "reasoning=openrouter:anthropic/claude-sonnet-4.5, vision_extract=gemini:gemini-3.8-flash",
+    )
+    assert changed.roles[ModelRole.REASONING].provider == "openrouter"
+    assert changed.roles[ModelRole.REASONING].model == "anthropic/claude-sonnet-4.5"
+    assert changed.roles[ModelRole.REASONING].params == repo.roles[ModelRole.REASONING].params
+    assert changed.roles[ModelRole.VISION_EXTRACT].model == "gemini-3.8-flash"
+    assert changed.roles[ModelRole.FAST_TEXT] == repo.roles[ModelRole.FAST_TEXT]
+    assert repo.roles[ModelRole.REASONING].provider == "gemini"  # the input is not changed
+
+
+def test_an_empty_override_changes_nothing() -> None:
+    from app.services.model_gateway.service import apply_role_overrides
+
+    repo = load_models_config(REPO_ROOT / "config" / "models.yaml")
+    assert apply_role_overrides(repo, "") == repo
+    assert apply_role_overrides(repo, None) == repo
+
+
+@pytest.mark.parametrize(
+    "spec",
+    ["nonsense=gemini:x", "reasoning=nowhere:x", "reasoning", "reasoning=gemini:", "reasoning=:x"],
+)
+def test_a_bad_override_fails_loudly(spec: str) -> None:
+    from app.services.model_gateway.service import apply_role_overrides
+
+    repo = load_models_config(REPO_ROOT / "config" / "models.yaml")
+    with pytest.raises(ValueError):
+        apply_role_overrides(repo, spec)
+
+
+def test_settings_read_the_override_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import Settings
+
+    monkeypatch.setenv("MODEL_ROLE_OVERRIDES", "fast_text=gemini:gemini-3.8-flash")
+    assert Settings().model_role_overrides == "fast_text=gemini:gemini-3.8-flash"

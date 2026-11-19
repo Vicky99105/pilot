@@ -10,7 +10,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models import ClaimRow, EventRow, utcnow
-from app.services.monitoring.contract import ClaimEvent, ClaimStatusRow, ClaimTurnaround
+from app.services.monitoring._metrics import pilot_metrics
+from app.services.monitoring.contract import (
+    ClaimEvent,
+    ClaimStatusRow,
+    ClaimTurnaround,
+    PilotMetrics,
+)
 from app.shared.types import Stage
 
 CLOSED = "closed"
@@ -106,3 +112,7 @@ class DefaultMonitoring:
             within_deadline=end <= claim.deadline if claim.deadline else None,
             checkpoints=sum(1 for e in events if e.action == "checkpoint_opened"),
         )
+
+    async def metrics(self, *, start: datetime, end: datetime) -> PilotMetrics:
+        async with self._sessions() as session:
+            return await pilot_metrics(session, start, end, self._now())

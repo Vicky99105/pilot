@@ -1,6 +1,6 @@
 import type { User } from '../../lib/api'
 import { href } from '../../lib/router'
-import { isStaff, isSupervisor, SEEDED_USERS } from '../../lib/users'
+import { canSeeMetrics, isStaff, isSupervisor, SEEDED_USERS } from '../../lib/users'
 
 export function TopBar({
   userId,
@@ -22,6 +22,7 @@ export function TopBar({
           ...(isSupervisor(user) ? [{ to: '/supervisor', label: 'Supervisor' }] : []),
           { to: '/monitoring', label: 'Monitoring' },
           { to: '/overrides', label: 'Overrides' },
+          ...(canSeeMetrics(user) ? [{ to: '/metrics', label: 'Metrics' }] : []),
         ]
       : user.kind === 'hospital'
         ? [

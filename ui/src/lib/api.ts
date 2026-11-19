@@ -374,6 +374,91 @@ export type SupervisorOverview = {
   held_claims: HeldClaim[]
 }
 
+// --- Pilot metrics -----------------------------------------------------------------------
+// Every metric counts what happened in [start, end). Rates are 0..1, null when the base is 0.
+
+export type TaskTurnaround = {
+  key: string // a queue (role) or a stage
+  completed: number
+  p50_seconds: number | null
+  p95_seconds: number | null
+  late: number // completed after the task deadline
+}
+
+export type RequestTurnaround = {
+  request_type: string // reimbursement, preauth, enhancement, discharge, reconsideration
+  answered: number
+  p50_seconds: number | null
+  p95_seconds: number | null
+  breaches: number
+}
+
+export type QueryReason = { reason: string; claims: number; rate: number | null }
+
+export type QueryRate = {
+  claims_received: number
+  claims_queried: number
+  rate: number | null
+  by_reason: QueryReason[]
+}
+
+export type OverrideRate = {
+  key: string // a stage or a user ID
+  name: string | null
+  decided: number
+  overridden: number
+  rate: number | null
+  entries: number
+}
+
+export type Outcomes = {
+  decided: number
+  by_decision: Record<string, number>
+  referred_to_crc: number
+  risk_scored: number
+  risk_referred: number
+  risk_referral_rate: number | null
+  reconsiderations: number
+}
+
+export type ModelUse = {
+  role: string
+  calls: number
+  claims: number
+  invalid: number
+  total_cost: number // USD
+  cost_per_claim: number | null
+  latency_p50_ms: number | null
+  latency_p95_ms: number | null
+}
+
+export type ModelCosts = {
+  calls: number
+  claims: number
+  total_cost: number
+  cost_per_claim_mean: number | null
+  cost_per_claim_p50: number | null
+  cost_per_claim_p95: number | null
+  latency_per_claim_p50_ms: number | null
+  latency_per_claim_p95_ms: number | null
+  by_role: ModelUse[]
+}
+
+export type PilotMetrics = {
+  start: IsoDateTime
+  end: IsoDateTime
+  generated_at: IsoDateTime
+  turnaround_by_role: TaskTurnaround[]
+  turnaround_by_stage: TaskTurnaround[]
+  request_turnaround: RequestTurnaround[]
+  clock_breaches: number
+  queries: QueryRate
+  overrides_by_stage: OverrideRate[]
+  overrides_by_user: OverrideRate[]
+  outcomes: Outcomes
+  models: ModelCosts
+}
+
 // --- Override log ------------------------------------------------------------------------
 
 export type OverrideKind =
@@ -518,6 +603,11 @@ export const api = {
     ),
   hold: (claimId: Uuid, reason: string) => request<HeldClaim>(`/api/claims/${claimId}/hold`, json({ reason })),
   resume: (claimId: Uuid, reason: string) => request<null>(`/api/claims/${claimId}/resume`, json({ reason })),
+
+  pilotMetrics: (start: IsoDateTime, end: IsoDateTime) =>
+    request<PilotMetrics>(
+      `/api/monitoring/metrics?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`,
+    ),
 
   overrides: (filter: OverrideFilter = {}) => {
     const query = new URLSearchParams()

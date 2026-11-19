@@ -65,6 +65,29 @@ def load_models_config(path: Path) -> ModelsConfig:
     return ModelsConfig.model_validate(yaml.safe_load(path.read_text()))
 
 
+def apply_role_overrides(config: ModelsConfig, spec: str | None) -> ModelsConfig:
+    """The config with some roles pointed at another provider and model, for evals.
+
+    spec is comma-separated "role=provider:model" (MODEL_ROLE_OVERRIDES), for example
+    "reasoning=openrouter:anthropic/claude-sonnet-4.5". The provider must be one models.yaml
+    configures. A role keeps its params. An unknown role or provider raises ValueError, so a
+    typo stops startup instead of running the eval on the wrong model."""
+    roles = dict(config.roles)
+    for item in filter(None, (part.strip() for part in (spec or "").split(","))):
+        role_name, _, target = item.partition("=")
+        provider, _, model = target.partition(":")
+        if not (role_name and provider and model):
+            raise ValueError(f"model override {item!r} is not role=provider:model")
+        try:
+            role = ModelRole(role_name.strip())
+        except ValueError as exc:
+            raise ValueError(f"model override names an unknown role {role_name!r}") from exc
+        if provider not in config.providers:
+            raise ValueError(f"model override names an unconfigured provider {provider!r}")
+        roles[role] = roles[role].model_copy(update={"provider": provider, "model": model})
+    return config.model_copy(update={"roles": roles})
+
+
 class DefaultModelGateway:
     def __init__(
         self,
@@ -231,13 +254,15 @@ def build_model_gateway(
     config_path: Path,
     file_store: FileStore,
     sessions: async_sessionmaker[AsyncSession],
+    role_overrides: str | None = None,
 ) -> DefaultModelGateway:
     """Build the gateway with one provider client per configured provider.
 
     API keys are read from the environment variable each provider names. A missing key
     does not stop startup; calls through that provider fail with a permanent error.
+    role_overrides (see apply_role_overrides) repoints roles without editing models.yaml.
     """
-    config = load_models_config(config_path)
+    config = apply_role_overrides(load_models_config(config_path), role_overrides)
     providers = {
         name: OpenAICompatibleProvider(
             name=name,
