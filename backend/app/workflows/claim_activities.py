@@ -5,6 +5,7 @@ Monitoring contract, which also keeps claims.status at the current stage.
 """
 
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from typing import Any, TypeVar
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from app.services.decision.contract import ApproverOutcome, CrcOutcome, Decision
 from app.services.digitisation.contract import DigitisationService
 from app.services.intake.contract import IntakeService
 from app.services.medical_review.contract import MedicalReviewService
+from app.services.model_gateway.contract import ModelUnavailable
 from app.services.monitoring.contract import Monitoring
 from app.services.query.contract import NothingToAsk, Query, QueryService
 from app.services.registration.contract import RegistrationOverrides, RegistrationService
@@ -35,14 +37,17 @@ from app.workflows.claim_models import (
     EventInput,
     OpenTaskInput,
     OutcomeInput,
+    OverruleOutcome,
     QueryRaised,
     QueryStepInput,
     StageInput,
     StageResult,
+    VerdictOutcome,
 )
 
 R = TypeVar("R")
 _LINE_EDITS = TypeAdapter(list[LineEdit])
+MODEL_UNAVAILABLE = "ModelUnavailable"  # the ApplicationError type of a retryable model failure
 
 
 async def _non_retryable_on_permanent(call: Awaitable[R]) -> R:
@@ -92,9 +97,17 @@ class ClaimActivities:
 
     async def _run(self, claim_id: UUID, stage: Stage, call: Awaitable[R]) -> R:
         """Run a stage's service call. A permanent failure is recorded as an event, so it
-        shows in the claim's history, and is not retried."""
+        shows in the claim's history, and is not retried. A model that is unavailable is
+        retried after the wait the provider asked for, when it named one."""
         try:
             return await call
+        except ModelUnavailable as exc:
+            delay = exc.retry_after_seconds
+            raise ApplicationError(
+                f"{type(exc).__name__}: {exc}"[:2000],
+                type=MODEL_UNAVAILABLE,
+                next_retry_delay=timedelta(seconds=delay) if delay is not None else None,
+            ) from exc
         except PermanentError as exc:
             await self._monitoring.record_event(
                 claim_id=claim_id,
@@ -278,6 +291,40 @@ class ClaimActivities:
             },
             needs_checkpoint=findings.adverse,  # "medical findings" only when adverse
             checkpoint_payload=findings.model_dump(mode="json"),
+        )
+
+    @activity.defn(name="medical_outcome")
+    async def medical_outcome(self, inp: OutcomeInput) -> None:
+        """The medical officer's outcome: confirm the findings, or overrule some of them."""
+        if inp.outcome.get("action") == "confirm":
+            return
+        outcome = _parse(OverruleOutcome.model_validate, inp.outcome)
+        actor = f"user:{inp.outcome.get('completed_by')}"
+        await _non_retryable_on_permanent(
+            self._medical_review.overrule(
+                inp.claim_id, outcome.finding_ids, outcome.reason, actor=actor
+            )
+        )
+        await self._event(
+            _at(inp),
+            "findings_overruled",
+            {"finding_ids": outcome.finding_ids, "reason": outcome.reason.strip()},
+            actor=actor,
+        )
+
+    @activity.defn(name="investigation_outcome")
+    async def investigation_outcome(self, inp: OutcomeInput) -> None:
+        """The investigator's verdict, "cleared" or "fraud_confirmed", with a note."""
+        outcome = _parse(VerdictOutcome.model_validate, inp.outcome)
+        actor = f"user:{inp.outcome.get('completed_by')}"
+        report = await _non_retryable_on_permanent(
+            self._risk.record_verdict(inp.claim_id, outcome.action, outcome.note, actor=actor)
+        )
+        await self._event(
+            _at(inp),
+            "investigation_verdict",
+            {"verdict": report.verdict, "note": report.verdict_note},
+            actor=actor,
         )
 
     @activity.defn(name="risk")
@@ -538,6 +585,14 @@ class ClaimActivities:
             )
         )
 
+    @activity.defn(name="reconcile_claims")
+    async def reconcile_claims(self) -> list[str]:
+        """Start ClaimWorkflow for claims saved while Temporal was down."""
+        started = await _non_retryable_on_permanent(self._intake.start_missing_workflows())
+        if started:
+            activity.logger.info("Reconciler started workflows for %d claims", len(started))
+        return [str(c) for c in started]
+
     @activity.defn(name="open_task")
     async def open_task(self, inp: OpenTaskInput) -> UUID:
         task = await _non_retryable_on_permanent(
@@ -580,6 +635,9 @@ class ClaimActivities:
             "apply_corrections",
             "record_decision",
             "review_crc",
+            "medical_outcome",
+            "investigation_outcome",
+            "reconcile_claims",
             "query_reminder",
             "query_overdue",
             "query_reply",

@@ -11,6 +11,7 @@ from app.config import Settings
 from app.workflows.claim_activities import ClaimActivities
 from app.workflows.claim_workflow import ClaimWorkflow
 from app.workflows.ping import PingWorkflow, ping
+from app.workflows.reconcile import ReconcileClaimsWorkflow, ensure_reconcile_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +27,19 @@ def build_worker(
     return Worker(
         client,
         task_queue=task_queue,
-        workflows=[PingWorkflow, ClaimWorkflow],
+        workflows=[PingWorkflow, ClaimWorkflow, ReconcileClaimsWorkflow],
         activities=activities,
         max_concurrent_activities=MAX_CONCURRENT_ACTIVITIES,
     )
+
+
+async def _ensure_schedule(client: Client, task_queue: str) -> None:
+    """The reconciler schedule. A failure here is logged; the worker still runs."""
+    try:
+        created = await ensure_reconcile_schedule(client, task_queue)
+        logger.info("Reconciler schedule %s", "created" if created else "already exists")
+    except Exception:
+        logger.warning("Could not create the reconciler schedule", exc_info=True)
 
 
 def next_backoff(attempt: int) -> float:
@@ -51,6 +61,8 @@ async def run_worker_forever(
             )
             logger.info("Temporal worker connected to %s", settings.temporal_address)
             attempt = 0
+            if claim_activities is not None:
+                await _ensure_schedule(client, settings.temporal_task_queue)
             await build_worker(client, settings.temporal_task_queue, claim_activities).run()
         except asyncio.CancelledError:
             raise

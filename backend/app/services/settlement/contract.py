@@ -1,7 +1,8 @@
 """Contract for settlement. The order is fixed:
 
 1. check_payee: IFSC format, the account holder against the member, the cheque against
-   the claim form Part A. Nothing is paid.
+   the claim form Part A and, when the Submit-area form carries bank details, against
+   that form too. Nothing is paid.
 2. A person with the FINANCE role releases the payment (a workflow checkpoint).
 3. settle: the payment instruction (idempotency key claim_id + "pay" + decision version),
    then the sum insured block released with utilised = the paid amount, then the claim
@@ -24,7 +25,12 @@ from app.shared.errors import PermanentError
 IFSC_PATTERN = r"^[A-Z]{4}0[A-Z0-9]{6}$"
 HOLDER_MATCH_SCORE = 85  # rapidfuzz token sort ratio, 0 to 100
 
-PayeeCheckId = Literal["ifsc_format", "holder_matches_member", "cheque_matches_claim_form"]
+PayeeCheckId = Literal[
+    "ifsc_format",
+    "holder_matches_member",
+    "cheque_matches_claim_form",
+    "cheque_matches_submit_form",
+]
 
 
 class PayeeCheck(BaseModel):

@@ -12,11 +12,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
 from app.database.models import ClaimRow, FileRow
+from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.registration.service import DefaultRegistrationService
-from app.services.risk.contract import REFER_AT, NotReadyForRisk, RiskReport, RiskService
+from app.services.risk.contract import (
+    REFER_AT,
+    InvalidVerdict,
+    NotReadyForRisk,
+    RiskReport,
+    RiskService,
+    Verdict,
+)
 from app.services.risk.service import DefaultRiskService
 from app.services.rules.service import DefaultRulesEngine
+from app.shared.types import Stage
 from tests.database.factories import add_claim
 from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.model_gateway import FakeModelGateway
@@ -145,3 +154,44 @@ async def test_a_claim_without_registration_is_not_ready(env: Env) -> None:
 
     with pytest.raises(NotReadyForRisk):
         await env.service(FakeModelGateway({})).score(claim_id)
+
+
+# --- P2-1: the investigator's verdict takes effect -----------------------------------------
+
+
+async def _referred(env: Env) -> tuple[RiskService, UUID]:
+    spec = ClaimSpec(claimed=Decimal("48250.00"))
+    await env.claim(spec, file_hash="b" * 64)
+    claim_id = await env.claim(spec, file_hash="b" * 64)
+    service = env.service(FakeModelGateway({"risk_explanation": [EXPLAINED]}))
+    await service.score(claim_id)
+    return service, claim_id
+
+
+@pytest.mark.parametrize("verdict", ["cleared", "fraud_confirmed"])
+async def test_a_verdict_writes_a_new_risk_report_version(env: Env, verdict: Verdict) -> None:
+    service, claim_id = await _referred(env)
+    scored = await StageRecordRepository(env.sessions).latest(claim_id, Stage.RISK)
+    assert scored is not None
+
+    report = await service.record_verdict(
+        claim_id, verdict, "  Bills checked with the hospital  ", actor="user:inv"
+    )
+
+    stored = await StageRecordRepository(env.sessions).latest(claim_id, Stage.RISK)
+    assert stored is not None and stored.version == scored.version + 1
+    assert stored.created_by == "user:inv"
+    assert (report.verdict, report.verdict_note) == (verdict, "Bills checked with the hospital")
+    assert report.verdict_by == "user:inv"
+    assert (report.score, report.refer) == (60, True)  # the score itself is unchanged
+    # A repeat score keeps the verdict: the registration did not change.
+    assert await service.score(claim_id) == report
+
+
+async def test_a_verdict_needs_a_note_and_a_risk_report(env: Env) -> None:
+    service, claim_id = await _referred(env)
+
+    with pytest.raises(InvalidVerdict, match="note"):
+        await service.record_verdict(claim_id, "cleared", " ", actor="user:inv")
+    with pytest.raises(InvalidVerdict, match="risk report"):
+        await service.record_verdict(uuid4(), "cleared", "note", actor="user:inv")

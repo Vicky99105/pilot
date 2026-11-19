@@ -62,6 +62,7 @@ class DocType(StrEnum):
     PHARMACY_BILL = "pharmacy_bill"
     CANCELLED_CHEQUE = "cancelled_cheque"
     KYC = "kyc"
+    FIR_MLC = "fir_mlc"  # police FIR or medico-legal certificate, for an injury or accident
     OTHER = "other"
 
 

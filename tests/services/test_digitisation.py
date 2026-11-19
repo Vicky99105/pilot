@@ -152,6 +152,7 @@ class Env:
                     admission_date=date(2026, 11, 2),
                     discharge_date=date(2026, 11, 5),
                     claimed_amount=Decimal(claimed_amount),
+                    declaration_accepted=True,
                 ),
                 files=[
                     UploadedFile(filename="all.pdf", data=make_pdf([text for _, text in pages]))
@@ -257,7 +258,11 @@ async def test_bill_lines_must_sum_to_the_grand_total_within_one_rupee(env: Env)
     beyond = await env.extract(pages=[*PAGES, (DocType.OTHER, "x")])
 
     assert within.failed_checks == []
-    assert failed(beyond) == {"bill_grand_total": ["bill.grand_total"]}
+    assert failed(beyond) == {
+        "bill_grand_total": ["bill.grand_total"],
+        # Part A still claims the old total, so the claimed amount disagrees too.
+        "claimed_matches_bill": ["claimed.hospital_expenses", "bill.grand_total"],
+    }
 
 
 async def test_bill_lines_must_sum_to_their_section_total(env: Env) -> None:
@@ -432,3 +437,133 @@ async def test_a_reply_is_merged_into_a_new_record_version(env: Env) -> None:
         submission.claim_id, Stage.DIGITISATION
     )
     assert [r.version for r in history] == [1, 2]
+
+
+# --- P2-1: independent cross-checks of high-impact fields ---------------------------------
+
+
+def checks(record: ClaimRecord) -> dict[str, str]:
+    return {c.check_id: c.detail for c in record.failed_checks}
+
+
+async def test_the_summary_dates_and_the_cheque_bank_name_are_kept(env: Env) -> None:
+    record = await env.extract()
+
+    assert record.clinical.admission_date.value == date(2026, 11, 2)
+    assert record.clinical.discharge_date.value == date(2026, 11, 5)
+    assert record.bank.bank_name.value == "State Bank of India"
+
+
+async def test_an_accident_with_no_fir_mlc_and_no_injury_facts_is_flagged(env: Env) -> None:
+    env.replies[DocType.CLAIM_FORM_PART_A]["hospitalisation_due_to_injury"] = v(True)
+
+    record = await env.extract()
+
+    assert failed(record) == {"accident_evidence": ["admission.accident"]}
+    assert "no FIR or MLC" in checks(record)["accident_evidence"]
+
+
+async def test_an_accident_with_an_mlc_document_passes(env: Env) -> None:
+    env.replies[DocType.CLAIM_FORM_PART_A]["hospitalisation_due_to_injury"] = v(True)
+
+    record = await env.extract(pages=[*PAGES, (DocType.FIR_MLC, "MEDICO LEGAL CASE")])
+
+    assert "accident_evidence" not in failed(record)
+
+
+async def test_an_accident_with_injury_facts_passes(env: Env) -> None:
+    env.replies[DocType.CLAIM_FORM_PART_A]["hospitalisation_due_to_injury"] = v(True)
+    env.replies[DocType.DISCHARGE_SUMMARY]["diagnoses"] = [v("Fracture shaft of left femur")]
+
+    record = await env.extract()
+
+    assert "accident_evidence" not in failed(record)
+
+
+async def test_no_accident_but_an_fir_mlc_document_is_flagged(env: Env) -> None:
+    record = await env.extract(pages=[*PAGES, (DocType.FIR_MLC, "FIR COPY")])
+
+    assert failed(record) == {"accident_evidence": ["admission.accident"]}
+    assert "fir_mlc" in checks(record)["accident_evidence"]
+
+
+@pytest.mark.parametrize(
+    ("text", "flagged"),
+    [
+        ("Road traffic accident with injury to the left knee", True),
+        ("Alleged history of fall from a two-wheeler", True),
+        ("No history of trauma. Pain started 2 days ago", False),
+        ("Wounds healthy at discharge", False),
+    ],
+)
+async def test_no_accident_but_injury_facts_are_flagged(env: Env, text: str, flagged: bool) -> None:
+    env.replies[DocType.DISCHARGE_SUMMARY]["facts"] = [
+        {"kind": "history", "text": text, "page": 1, "confidence": 0.9}
+    ]
+
+    record = await env.extract()
+
+    assert ("accident_evidence" in failed(record)) is flagged
+    if flagged:
+        assert text in checks(record)["accident_evidence"]
+
+
+async def test_admission_and_discharge_dates_must_agree_across_documents(env: Env) -> None:
+    env.replies[DocType.DISCHARGE_SUMMARY]["admission_date"] = v("2026-11-01")
+    env.replies[DocType.FINAL_BILL]["lines"][1]["date"] = "2026-11-07"
+
+    record = await env.extract()
+
+    assert failed(record) == {
+        "dates_agree": [
+            "admission.admission_date",
+            "clinical.admission_date",
+            "bill.lines.1.date",
+        ]
+    }
+    detail = checks(record)["dates_agree"]
+    assert "2026-11-02" in detail and "2026-11-01" in detail and "2026-11-07" in detail
+
+
+async def test_an_ifsc_must_have_the_ifsc_format(env: Env) -> None:
+    env.replies[DocType.CLAIM_FORM_PART_A]["ifsc"] = v("SBIN001234")
+    env.replies[DocType.CANCELLED_CHEQUE]["ifsc"] = v("SBIN001234")
+
+    record = await env.extract()
+
+    assert failed(record) == {"ifsc_format": ["bank.ifsc", "claim_form_bank.ifsc"]}
+    assert "SBIN001234" in checks(record)["ifsc_format"]
+
+
+async def test_the_ifsc_bank_code_must_match_the_bank_on_the_cheque(env: Env) -> None:
+    env.replies[DocType.CANCELLED_CHEQUE]["bank_name"] = v("HDFC Bank Ltd., Saket")
+
+    record = await env.extract()
+
+    assert failed(record) == {
+        "ifsc_bank_code": ["bank.ifsc", "claim_form_bank.ifsc", "bank.bank_name"]
+    }
+    detail = checks(record)["ifsc_bank_code"]
+    assert "SBIN" in detail and "HDFC Bank Ltd., Saket" in detail
+
+
+async def test_an_unknown_bank_code_is_not_judged(env: Env) -> None:
+    for reply in (DocType.CLAIM_FORM_PART_A, DocType.CANCELLED_CHEQUE):
+        env.replies[reply]["ifsc"] = v("BSBL0004217")
+    env.replies[DocType.CANCELLED_CHEQUE]["bank_name"] = v("Bharat Sahakari Bank Ltd.")
+
+    record = await env.extract()
+
+    assert record.failed_checks == []
+
+
+async def test_the_claimed_hospital_expenses_must_match_the_bill_grand_total(env: Env) -> None:
+    env.replies[DocType.CLAIM_FORM_PART_A]["claimed_hospital_expenses"] = v("52000")
+
+    record = await env.extract()
+
+    assert failed(record) == {
+        "claimed_matches_bill": ["claimed.hospital_expenses", "bill.grand_total"]
+    }
+    detail = checks(record)["claimed_matches_bill"]
+    assert "52000.00" in detail and "48250.00" in detail

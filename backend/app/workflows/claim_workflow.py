@@ -19,11 +19,11 @@ from uuid import UUID
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from app.shared.types import Role, Stage
-    from app.workflows.claim_activities import ClaimActivities
+    from app.workflows.claim_activities import MODEL_UNAVAILABLE, ClaimActivities
     from app.workflows.claim_models import (
         ClaimInput,
         ClaimResult,
@@ -42,6 +42,14 @@ with workflow.unsafe.imports_passed_through():
 CHECKPOINT_SLA = timedelta(hours=4)
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 RETRY = RetryPolicy(maximum_attempts=3, non_retryable_error_types=["PermanentError"])
+# Activities that call a model. The cap is per activity: the activity is the unit of work.
+MODEL_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=10),
+    backoff_coefficient=2,
+    maximum_interval=timedelta(minutes=5),
+    maximum_attempts=8,
+    non_retryable_error_types=["PermanentError"],
+)
 PAID: tuple[FinalDecision, ...] = ("approve", "partial")
 
 # Stages after intake, in order. Query and monitoring run outside this list.
@@ -57,6 +65,16 @@ PIPELINE = [
     Stage.COMMUNICATION,
     Stage.SETTLEMENT,
 ]
+# Stages whose activity calls a model, directly or through a service.
+MODEL_STAGES = {
+    Stage.CLASSIFICATION,
+    Stage.DIGITISATION,
+    Stage.MEDICAL_REVIEW,
+    Stage.RISK,
+    Stage.ADJUDICATION,
+    Stage.DECISION,
+    Stage.COMMUNICATION,
+}
 # Where a query reply resumes: medical review onward, so its query items are re-evaluated.
 RESUME_AFTER_REPLY = Stage.MEDICAL_REVIEW
 
@@ -101,6 +119,12 @@ CORRECTABLE = {
     Stage.DIGITISATION: "fields",
     Stage.REGISTRATION: "overrides",
     Stage.BILL_REVIEW: "lines",
+}
+
+# Stages whose checkpoint outcome an activity records. A refused outcome reopens the task.
+RECORDED = {
+    Stage.MEDICAL_REVIEW: ClaimActivities.medical_outcome,
+    Stage.RISK: ClaimActivities.investigation_outcome,
 }
 
 CONDITIONAL = {
@@ -206,10 +230,48 @@ class ClaimWorkflow:
                 outcome = await self._corrected(
                     stage, checkpoint, outcome, result.checkpoint_payload
                 )
+            if stage in RECORDED:
+                outcome = await self._recorded(
+                    stage, checkpoint, outcome, result.checkpoint_payload, reachable
+                )
             target = send_back_target(outcome, reachable)
             if target is not None:
                 return target
         return None
+
+    async def _recorded(
+        self,
+        stage: Stage,
+        checkpoint: Checkpoint,
+        outcome: dict[str, Any],
+        payload: dict[str, Any],
+        reachable: list[Stage],
+    ) -> dict[str, Any]:
+        """Record a person's outcome through the stage's service. An outcome the service
+        refuses sends the same checkpoint back to the queue with the reason. A send-back is
+        returned as it is."""
+        assert self._claim_id is not None
+        while send_back_target(outcome, reachable) is None:
+            try:
+                await workflow.execute_activity_method(
+                    RECORDED[stage],
+                    OutcomeInput(
+                        claim_id=self._claim_id,
+                        stage=stage,
+                        task_id=UUID(self._last_task_id),
+                        outcome=outcome,
+                    ),
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                return outcome
+            except ActivityError as err:
+                reason = _reason(err)
+                await self._event(
+                    stage, "outcome_refused", {"kind": checkpoint.kind, "reason": reason}
+                )
+                outcome = await self._checkpoint(stage, checkpoint, {**payload, "error": reason})
+        return outcome
 
     async def _decide(self) -> Stage | None:
         """Approver, then the CRC for a partial or reject. Returns a send-back target."""
@@ -381,12 +443,19 @@ class ClaimWorkflow:
         assert self._claim_id is not None
         if submission_id is None and stage is Stage.CLASSIFICATION:
             submission_id = self._submission_id  # the claim's own submission, unless a reply
-        return await workflow.execute_activity_method(
-            STAGE_ACTIVITIES[stage],
-            StageInput(claim_id=self._claim_id, stage=stage, submission_id=submission_id),
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=RETRY,
-        )
+        try:
+            return await workflow.execute_activity_method(
+                STAGE_ACTIVITIES[stage],
+                StageInput(claim_id=self._claim_id, stage=stage, submission_id=submission_id),
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=MODEL_RETRY if stage in MODEL_STAGES else RETRY,
+            )
+        except ActivityError as err:
+            cause = err.cause
+            if isinstance(cause, ApplicationError) and cause.type == MODEL_UNAVAILABLE:
+                # Retries are used up. Record why, then fail the workflow.
+                await self._event(stage, "stage_failed", {"error": cause.message})
+            raise
 
     async def _corrected(
         self,

@@ -20,7 +20,12 @@ from app.services.decision.contract import (
 )
 from app.services.digitisation.contract import ClaimRecord
 from app.services.intake.contract import ClaimForm, Submission
-from app.services.medical_review.contract import Citation, Finding, MedicalFindings
+from app.services.medical_review.contract import (
+    Citation,
+    Finding,
+    InvalidOverrule,
+    MedicalFindings,
+)
 from app.services.query.contract import Query, QueryItem
 from app.services.registration.contract import (
     MatchedHospital,
@@ -28,7 +33,7 @@ from app.services.registration.contract import (
     RegistrationOverrides,
     RegistrationResult,
 )
-from app.services.risk.contract import RiskHit, RiskReport
+from app.services.risk.contract import InvalidVerdict, RiskHit, RiskReport, Verdict
 from app.services.settlement.contract import PaymentNotReleased, SettlementRecord
 from app.shared.types import DocType, RequestType, Role
 
@@ -44,6 +49,9 @@ class FakeIntakeService:
 
     async def accept(self, submission: Any) -> Submission:
         raise NotImplementedError("workflow tests start claims directly")
+
+    async def start_missing_workflows(self) -> list[UUID]:
+        return []
 
     async def get(self, submission_id: UUID) -> Submission | None:
         return Submission(
@@ -157,11 +165,23 @@ class FakeMedicalReviewService:
 
     def __init__(self, *, adverse: bool = False) -> None:
         self.adverse = adverse
+        self.overrules: list[tuple[list[int], str, str]] = []
+
+    async def overrule(
+        self, claim_id: UUID, finding_ids: list[int], reason: str, *, actor: str
+    ) -> MedicalFindings:
+        findings = await self.review(claim_id)
+        known = {f.finding_id for f in findings.findings}
+        if not finding_ids or not set(finding_ids) <= known or not reason.strip():
+            raise InvalidOverrule(f"cannot overrule {finding_ids}; findings are {known}")
+        self.overrules.append((finding_ids, reason.strip(), actor))
+        return findings.model_copy(update={"adverse": False})
 
     async def review(self, claim_id: UUID) -> MedicalFindings:
         findings = (
             [
                 Finding(
+                    finding_id=1,
                     kind="pre_existing",
                     text="history predates the policy",
                     severity="adverse",
@@ -192,6 +212,16 @@ class FakeRiskService:
 
     def __init__(self, *, refer: bool = False) -> None:
         self.refer = refer
+        self.verdicts: list[tuple[Verdict, str, str]] = []
+
+    async def record_verdict(
+        self, claim_id: UUID, verdict: Verdict, note: str, *, actor: str
+    ) -> RiskReport:
+        if not note.strip():
+            raise InvalidVerdict("a verdict needs a note")
+        self.verdicts.append((verdict, note.strip(), actor))
+        report = await self.score(claim_id)
+        return report.model_copy(update={"verdict": verdict, "verdict_note": note.strip()})
 
     async def score(self, claim_id: UUID) -> RiskReport:
         hits = [RiskHit(rule_id="RF3", weight=60, detail="file reused")] if self.refer else []

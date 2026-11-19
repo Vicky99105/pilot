@@ -118,6 +118,7 @@ class Harness:
                     admission_date=date(2026, 11, 2),
                     discharge_date=date(2026, 11, 5),
                     claimed_amount=Decimal("48250"),
+                    declaration_accepted=True,
                 ),
                 files=[UploadedFile(filename="all.pdf", data=make_pdf([t for _, t in PAGES]))],
             )

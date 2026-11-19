@@ -5,6 +5,7 @@ import re
 from rapidfuzz import fuzz
 
 from app.services.digitisation.contract import Bank
+from app.services.intake.contract import ClaimForm
 from app.services.settlement.contract import HOLDER_MATCH_SCORE, IFSC_PATTERN, PayeeCheck
 
 TITLES = {"mr", "mrs", "ms", "miss", "dr", "shri", "smt"}
@@ -19,7 +20,9 @@ def normalise_name(name: str) -> str:
     return " ".join(w for w in words if w not in TITLES)
 
 
-def payee_checks(cheque: Bank, claim_form: Bank, member_name: str | None) -> list[PayeeCheck]:
+def payee_checks(
+    cheque: Bank, claim_form: Bank, member_name: str | None, submit_form: ClaimForm | None = None
+) -> list[PayeeCheck]:
     ifsc = (cheque.ifsc.value or "").strip().upper()
     holder = cheque.account_holder.value or ""
     score = (
@@ -33,6 +36,20 @@ def payee_checks(cheque: Bank, claim_form: Bank, member_name: str | None) -> lis
     )
     form_ifsc = (claim_form.ifsc.value or "").strip().upper()
     same = bool(account) and account == form_account and ifsc == form_ifsc
+    third = []
+    if submit_form is not None and (submit_form.bank_account_number or submit_form.ifsc):
+        typed_account = digits(submit_form.bank_account_number)
+        typed_ifsc = (submit_form.ifsc or "").strip().upper()
+        third.append(
+            PayeeCheck(
+                check_id="cheque_matches_submit_form",
+                passed=bool(account) and account == typed_account and ifsc == typed_ifsc,
+                detail=(
+                    f"cheque account {account or '(none)'} / {ifsc or '(none)'} against the "
+                    f"submitted form {typed_account or '(none)'} / {typed_ifsc or '(none)'}"
+                ),
+            )
+        )
     return [
         PayeeCheck(
             check_id="ifsc_format",
@@ -55,4 +72,5 @@ def payee_checks(cheque: Bank, claim_form: Bank, member_name: str | None) -> lis
                 f"Part A {form_account or '(none)'} / {form_ifsc or '(none)'}"
             ),
         ),
+        *third,
     ]

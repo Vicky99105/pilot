@@ -17,6 +17,7 @@ from app.services.model_gateway.contract import (
     Message,
     ModelGateway,
     ModelOutputInvalid,
+    ModelQuotaExhausted,
     ModelRole,
     ModelUnavailable,
 )
@@ -360,3 +361,125 @@ async def test_thinking_tokens_count_as_output_tokens() -> None:
         params={},
     )
     assert (reply.input_tokens, reply.output_tokens) == (9, 246)
+
+
+def _gemini_429(*details: dict[str, Any], message: str = "Resource has been exhausted") -> Any:
+    """Gemini's OpenAI-compatible endpoint wraps the google.rpc error in a list."""
+    return [
+        {
+            "error": {
+                "code": 429,
+                "message": message,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": list(details),
+            }
+        }
+    ]
+
+
+RETRY_INFO = {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "22s"}
+
+
+def _quota(quota_id: str) -> dict[str, Any]:
+    return {
+        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+        "violations": [
+            {
+                "quotaMetric": "generativelanguage.googleapis.com/generate_content_requests",
+                "quotaId": quota_id,
+            }
+        ],
+    }
+
+
+async def _call(gateway: ModelGateway) -> None:
+    await gateway.structured(
+        ModelRole.REASONING,
+        [Message(role="user", content="x")],
+        DocLabel,
+        claim_id=None,
+        purpose="p",
+    )
+
+
+async def test_rate_limit_carries_the_retry_delay_gemini_sends(
+    make_gateway: GatewayFactory,
+) -> None:
+    gateway, _ = make_gateway(
+        [
+            httpx.Response(
+                429, json=_gemini_429(_quota("GenerateRequestsPerMinutePerProject"), RETRY_INFO)
+            )
+        ]
+    )
+
+    with pytest.raises(ModelUnavailable) as raised:
+        await _call(gateway)
+
+    assert raised.value.retry_after_seconds == 22.0
+
+
+async def test_rate_limit_reads_the_retry_after_header(make_gateway: GatewayFactory) -> None:
+    gateway, _ = make_gateway(
+        [httpx.Response(429, headers={"Retry-After": "7"}, json={"error": {"code": 429}})]
+    )
+
+    with pytest.raises(ModelUnavailable) as raised:
+        await _call(gateway)
+
+    assert raised.value.retry_after_seconds == 7.0
+
+
+async def test_server_error_without_a_hint_has_no_retry_delay(
+    make_gateway: GatewayFactory,
+) -> None:
+    gateway, _ = make_gateway([httpx.Response(503, text="overloaded")])
+
+    with pytest.raises(ModelUnavailable) as raised:
+        await _call(gateway)
+
+    assert raised.value.retry_after_seconds is None
+
+
+async def test_daily_quota_exhaustion_is_permanent(
+    make_gateway: GatewayFactory, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    gateway, _ = make_gateway(
+        [
+            httpx.Response(
+                429,
+                json=_gemini_429(
+                    _quota("GenerateRequestsPerDayPerProjectPerModel-FreeTier"), RETRY_INFO
+                ),
+            )
+        ]
+    )
+
+    with pytest.raises(ModelQuotaExhausted) as raised:
+        await _call(gateway)
+
+    assert isinstance(raised.value, PermanentError)
+    assert "per day" in str(raised.value)
+    [call] = await _calls(sessions)
+    assert call.valid is False
+
+
+async def test_quota_message_that_says_per_day_is_permanent(
+    make_gateway: GatewayFactory,
+) -> None:
+    gateway, _ = make_gateway(
+        [
+            httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "code": 429,
+                        "message": "Quota exceeded: requests per day for this model.",
+                    }
+                },
+            )
+        ]
+    )
+
+    with pytest.raises(ModelQuotaExhausted):
+        await _call(gateway)

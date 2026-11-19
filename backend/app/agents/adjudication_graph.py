@@ -24,10 +24,15 @@ from app.services.adjudication.contract import (
 )
 from app.services.bill_review.contract import DeductionSheet
 from app.services.knowledge_base.contract import PolicyClause
-from app.services.medical_review.contract import CLAUSE_PREFIX, DocumentRequest, MedicalFindings
+from app.services.medical_review.contract import (
+    CLAUSE_PREFIX,
+    DocumentRequest,
+    Finding,
+    MedicalFindings,
+)
 from app.services.model_gateway.contract import ModelGateway, ModelRole
 from app.services.registration.contract import RegistrationResult
-from app.services.risk.contract import RiskReport
+from app.services.risk.contract import FRAUD_CLAUSE, RiskReport
 from app.shared.types import DocType, RuleResult, Stage
 
 MAX_REVISIONS = 1
@@ -62,9 +67,14 @@ def expected_decision(
     outstanding: list[str],
     medical: MedicalFindings | None,
     sheet: DeductionSheet,
+    risk: RiskReport | None = None,
 ) -> tuple[Decision, str]:
-    """The decision rules, in order: failed eligibility, then missing information, then
-    deductions."""
+    """The decision rules, in order: fraud an investigator confirmed, then failed
+    eligibility, then missing information, then deductions."""
+    if risk is not None and risk.verdict == "fraud_confirmed":
+        return "reject", (
+            f"an investigator confirmed fraud (clause {FRAUD_CLAUSE}): {risk.verdict_note}"
+        )
     if failed_rules:
         return "reject", "eligibility rules failed: " + ", ".join(r.rule_id for r in failed_rules)
     query_items = medical.query_items if medical else []
@@ -108,7 +118,9 @@ async def run_adjudication(
         refs = [r.clause_ref for r in failed]
         refs += [ln.clause_ref for ln in sheet.lines if ln.deducted > 0]
         refs += [r.clause_ref for r in sheet.rule_results if r.rule_id == "R21"]
-        for finding in medical.findings if medical else []:
+        if risk is not None and risk.verdict == "fraud_confirmed":
+            refs.insert(0, FRAUD_CLAUSE)
+        for finding in _standing(medical):
             refs += [
                 c.ref.removeprefix(CLAUSE_PREFIX)
                 for c in finding.citations
@@ -120,7 +132,7 @@ async def run_adjudication(
             if clause is not None:
                 clauses.append(clause)
 
-        expected, because = expected_decision(failed, outstanding, medical, sheet)
+        expected, because = expected_decision(failed, outstanding, medical, sheet, risk)
         versions = {
             "registration": registered.version,
             "bill_review": reviewed.version,
@@ -281,7 +293,7 @@ def _view(inputs: AdjudicationInputs) -> dict[str, Any]:
         ],
         "medical": {
             "verified_codes": [v.code.code for v in medical.verified_codes] if medical else [],
-            "findings": [f.model_dump(mode="json") for f in medical.findings] if medical else [],
+            "findings": [f.model_dump(mode="json") for f in _standing(medical)],
             "query_items": [q.model_dump(mode="json") for q in medical.query_items]
             if medical
             else [],
@@ -290,6 +302,8 @@ def _view(inputs: AdjudicationInputs) -> dict[str, Any]:
             "score": inputs.risk.score if inputs.risk else None,
             "refer": inputs.risk.refer if inputs.risk else None,
             "explanation": inputs.risk.explanation if inputs.risk else None,
+            "investigator_verdict": inputs.risk.verdict if inputs.risk else None,
+            "investigator_note": inputs.risk.verdict_note if inputs.risk else None,
         },
         "payable_on_sheet": str(sheet.payable),
     }
@@ -332,6 +346,11 @@ def _self_check(inputs: AdjudicationInputs, reply: DecisionReply) -> list[str]:
                 f"query item {item} is not an outstanding document or a medical review request"
             )
     return errors
+
+
+def _standing(medical: MedicalFindings | None) -> list[Finding]:
+    """The medical findings that hold: a medical officer has not overruled them."""
+    return [f for f in medical.findings if not f.overruled] if medical else []
 
 
 def _rule_ids(inputs: AdjudicationInputs) -> set[str]:

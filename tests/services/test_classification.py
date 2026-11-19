@@ -61,6 +61,7 @@ class Env:
                     patient_name="Asha Verma",
                     admission_date=date(2026, 11, 2),
                     claimed_amount=Decimal("48250"),
+                    declaration_accepted=True,
                 ),
                 files=[
                     UploadedFile(filename=f"f{i}.pdf", data=make_pdf(pages), slot=slot)

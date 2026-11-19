@@ -68,6 +68,13 @@ POLICY_CLAUSES: list[tuple[str, str, str]] = [
         "after all other limits and deductions.",
     ),
     (
+        "FRAUD",
+        "Fraudulent claims",
+        "Nothing is paid on a claim that is fraudulent, or that is backed by a false "
+        "statement or a false document. Any amount already paid on such a claim must be "
+        "repaid to the insurer.",
+    ),
+    (
         "Excl01",
         "Pre-existing diseases",
         "Conditions that existed before the first policy are excluded until 36 months of "

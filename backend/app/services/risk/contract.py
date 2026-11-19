@@ -4,7 +4,7 @@ The score and the referral are computed by code. A model writes only the explana
 Callers import this module only.
 """
 
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -20,6 +20,9 @@ WEIGHTS = {
     "RF3": 60,  # a file with the same hash was submitted on another claim
 }
 EARLY_CLAIM_DAYS = 30
+FRAUD_CLAUSE = "FRAUD"  # the policy clause a reject for confirmed fraud cites
+
+Verdict = Literal["cleared", "fraud_confirmed"]
 HIGH_CLAIM_SHARE = "0.5"  # of the sum insured
 
 
@@ -36,13 +39,28 @@ class RiskReport(BaseModel):
     score: int  # 0 to 100
     refer: bool  # score >= REFER_AT
     explanation: str
+    # Set by an investigator on a referred claim. "fraud_confirmed" makes adjudication reject.
+    verdict: Verdict | None = None
+    verdict_note: str | None = None
+    verdict_by: str | None = None
 
 
 class NotReadyForRisk(PermanentError):
     """The claim has no registration or no policy yet."""
 
 
+class InvalidVerdict(PermanentError):
+    """The verdict has no note, or the claim has no risk report to rule on."""
+
+
 class RiskService(Protocol):
     async def score(self, claim_id: UUID) -> RiskReport:
         """Idempotent per RegistrationResult version."""
+        ...
+
+    async def record_verdict(
+        self, claim_id: UUID, verdict: Verdict, note: str, *, actor: str
+    ) -> RiskReport:
+        """An investigator's verdict on the latest report, written as a new RiskReport
+        version. The score and the hits are unchanged."""
         ...

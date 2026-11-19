@@ -21,6 +21,7 @@ from app.database.repositories.stage_records import append_in_session
 from app.services.file_store.contract import FileStore
 from app.services.intake._helpers import CheckedFile, check_file, files_digest
 from app.services.intake.contract import (
+    DECLARATION_REQUIRED,
     Channel,
     ClaimForm,
     FollowupSignaller,
@@ -45,7 +46,11 @@ TURNAROUND = {
 }
 DEFAULT_TURNAROUND = timedelta(days=15)  # reimbursement and every other request type
 MERGED_WARNING = "Merged upload: missing documents are checked after classification"
-NOT_STARTED_WARNING = "Processing not started yet (workflow service unavailable); resubmit to retry"
+NOT_STARTED_WARNING = (
+    "Processing not started yet (workflow service unavailable); it starts automatically "
+    "within minutes"
+)
+RECONCILE_BATCH = 100  # claims started per reconciler run
 NOT_SIGNALLED_WARNING = "Follow-up stored but not delivered to the claim's workflow yet"
 FOLLOWUP_SIGNAL = "followup_received"
 
@@ -68,6 +73,12 @@ class DefaultIntakeService:
         self._now = now
 
     async def accept(self, submission: SubmissionInput) -> Submission:
+        if (
+            submission.channel == "member"
+            and submission.parent_claim_id is None
+            and not submission.form.declaration_accepted
+        ):
+            raise SubmissionRejected([DECLARATION_REQUIRED])
         checked = await self._check(submission)
         digest = files_digest([f.sha256 for f in checked])
         if submission.parent_claim_id is None:
@@ -130,6 +141,28 @@ class DefaultIntakeService:
     async def get(self, submission_id: UUID) -> Submission | None:
         async with self._sessions() as session:
             return await _load(session, submission_id)
+
+    async def start_missing_workflows(self) -> list[UUID]:
+        async with self._sessions() as session:
+            pending = list(
+                await session.scalars(
+                    select(ClaimRow.submission_id)
+                    .where(
+                        ClaimRow.status == RECEIVED,
+                        ClaimRow.workflow_id.is_(None),
+                        ClaimRow.submission_id.is_not(None),
+                    )
+                    .order_by(ClaimRow.created_at)
+                    .limit(RECONCILE_BATCH)
+                )
+            )
+        started = []
+        for submission_id in pending:
+            assert submission_id is not None
+            submission = await self.get(submission_id)
+            if submission is not None and await self._start(submission):
+                started.append(submission.claim_id)
+        return started
 
     async def _get_existing(self, submission_id: UUID) -> Submission:
         found = await self.get(submission_id)
@@ -282,7 +315,10 @@ class DefaultIntakeService:
         slots = {f.slot for f in checked}
         return [d for d in required if d not in slots]
 
-    async def _start(self, submission: Submission) -> None:
+    async def _start(self, submission: Submission) -> bool:
+        """Start the claim's workflow and record its ID. A start Temporal refuses as a
+        duplicate is ignored. Returns False, with one warning on the submission, when the
+        workflow service cannot be reached; the reconciler tries again later."""
         workflow_id = str(submission.claim_id)
         try:
             await self._starter.start_claim(
@@ -297,12 +333,14 @@ class DefaultIntakeService:
             async with self._sessions.begin() as session:
                 row = await session.get(SubmissionRow, submission.submission_id)
                 assert row is not None
-                row.warnings = [*row.warnings, NOT_STARTED_WARNING]
-            return
+                if NOT_STARTED_WARNING not in row.warnings:
+                    row.warnings = [*row.warnings, NOT_STARTED_WARNING]
+            return False
         async with self._sessions.begin() as session:
             claim = await session.get(ClaimRow, submission.claim_id)
             assert claim is not None
             claim.workflow_id = workflow_id
+        return True
 
 
 async def _load(session: AsyncSession, submission_id: UUID) -> Submission | None:

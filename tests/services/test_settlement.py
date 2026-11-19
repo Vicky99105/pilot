@@ -2,11 +2,13 @@
 instruction, then the block release and closure. Order matters."""
 
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models import ClaimRow
+from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.settlement.contract import (
     PayeeCheckFailed,
@@ -15,6 +17,7 @@ from app.services.settlement.contract import (
 )
 from app.services.settlement.service import DefaultSettlementService
 from app.shared.seed_ids import FINANCE_USER_ID, OPS_USER_ID
+from app.shared.types import Stage
 from tests.fakes.core import FakeMoneyService
 from tests.services.decided_claims import BREACH_PAYABLE, bank, decided_claim
 
@@ -120,3 +123,56 @@ async def test_failed_payee_checks_block_the_payment(
     with pytest.raises(PayeeCheckFailed, match="ifsc_format"):
         await settlement.settle(claim.claim_id, released_by=FINANCE_USER_ID)
     assert claim.money.payments == {}
+
+
+# --- P2-1: the Submit-area form's bank details are a third source --------------------------
+
+
+async def _with_form_bank(
+    sessions: async_sessionmaker[AsyncSession], claim_id: UUID, account: str, ifsc: str
+) -> None:
+    records = StageRecordRepository(sessions)
+    intake = await records.latest(claim_id, Stage.INTAKE)
+    assert intake is not None
+    form = {**intake.payload["form"], "bank_account_number": account, "ifsc": ifsc}
+    await records.append(claim_id, Stage.INTAKE, {**intake.payload, "form": form}, created_by="t")
+
+
+async def test_the_submit_form_bank_details_agreeing_with_the_cheque_pass(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    claim = await decided_claim(sessions, "partial")
+    await _with_form_bank(sessions, claim.claim_id, "123456789012", "SBIN0001234")
+
+    checked = await service(sessions, claim.money).check_payee(claim.claim_id)
+
+    assert ("cheque_matches_submit_form", True) in [
+        (c.check_id, c.passed) for c in checked.payee_checks
+    ]
+
+
+async def test_submit_form_bank_details_that_differ_from_the_cheque_block_the_payment(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    claim = await decided_claim(sessions, "partial")
+    await _with_form_bank(sessions, claim.claim_id, "111122223333", "SBIN0001234")
+    settlement = service(sessions, claim.money)
+
+    checked = await settlement.check_payee(claim.claim_id)
+
+    [check] = [c for c in checked.payee_checks if c.check_id == "cheque_matches_submit_form"]
+    assert check.passed is False
+    assert "111122223333" in check.detail and "123456789012" in check.detail
+    with pytest.raises(PayeeCheckFailed, match="cheque_matches_submit_form"):
+        await settlement.settle(claim.claim_id, released_by=FINANCE_USER_ID)
+    assert claim.money.payments == {}
+
+
+async def test_a_form_without_bank_details_adds_no_third_check(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    claim = await decided_claim(sessions, "partial")
+
+    checked = await service(sessions, claim.money).check_payee(claim.claim_id)
+
+    assert "cheque_matches_submit_form" not in [c.check_id for c in checked.payee_checks]

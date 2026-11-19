@@ -47,6 +47,7 @@ export const DOC_TYPES = [
   'pharmacy_bill',
   'cancelled_cheque',
   'kyc',
+  'fir_mlc',
   'other',
 ] as const
 export type DocType = (typeof DOC_TYPES)[number]

@@ -14,6 +14,7 @@ from app.database.repositories.stage_records import StageRecordRepository, appen
 from app.integrations.core.contract import MoneyService, Payee
 from app.services.decision.contract import PAID, DecisionRecord
 from app.services.digitisation.contract import ClaimRecord
+from app.services.intake.contract import ClaimForm
 from app.services.registration.contract import RegistrationResult
 from app.services.settlement._helpers import digits, payee_checks
 from app.services.settlement.contract import (
@@ -49,7 +50,12 @@ class DefaultSettlementService:
         payee, checks = None, []
         if decision.final_decision in PAID:
             record = await self._claim_record(claim_id)
-            checks = payee_checks(record.bank, record.claim_form_bank, registration.member.name)
+            checks = payee_checks(
+                record.bank,
+                record.claim_form_bank,
+                registration.member.name,
+                await self._submit_form(claim_id),
+            )
             payee = Payee(
                 kind="member",
                 name=record.bank.account_holder.value or "",
@@ -159,6 +165,13 @@ class DefaultSettlementService:
         if stored is None:
             raise NotReadyForSettlement(f"claim {claim_id} has no extracted record")
         return ClaimRecord.model_validate(stored.payload)
+
+    async def _submit_form(self, claim_id: UUID) -> ClaimForm | None:
+        """The form typed in the Submit area, from the claim's intake record."""
+        stored = await self._records.latest(claim_id, Stage.INTAKE)
+        if stored is None or "form" not in stored.payload:
+            return None
+        return ClaimForm.model_validate(stored.payload["form"])
 
     async def _is_finance(self, user_id: UUID) -> bool:
         async with self._sessions() as session:

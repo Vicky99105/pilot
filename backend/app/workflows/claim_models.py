@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.shared.types import RequestType, Role, Stage
 
@@ -70,6 +70,21 @@ class OutcomeInput(BaseModel):
     stage: Stage
     task_id: UUID
     outcome: dict[str, Any]
+
+
+class OverruleOutcome(BaseModel):
+    """The medical officer's overrule: the findings that do not hold, and why."""
+
+    action: Literal["overrule"]
+    finding_ids: list[int] = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class VerdictOutcome(BaseModel):
+    """The investigator's verdict on a referred claim, with what they found."""
+
+    action: Literal["cleared", "fraud_confirmed"]
+    note: str = Field(min_length=1)
 
 
 class DecisionStep(BaseModel):

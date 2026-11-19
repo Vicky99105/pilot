@@ -20,6 +20,7 @@ from app.services.medical_review.contract import (
     Citation,
     DroppedItem,
     Finding,
+    InvalidOverrule,
     MedicalFindings,
     NotReadyForMedicalReview,
 )
@@ -100,7 +101,10 @@ class DefaultMedicalReviewService:
             policy=policy,
         )
         rule_results = self._rules.evaluate(RERUN_RULES, facts, product)
-        findings = [*result["findings"], *_eligibility(rule_results)]
+        findings = [
+            f.model_copy(update={"finding_id": i})
+            for i, f in enumerate([*result["findings"], *_eligibility(rule_results)], start=1)
+        ]
         medical = MedicalFindings(
             claim_id=claim_id,
             digitisation_version=digitised.version,
@@ -112,12 +116,64 @@ class DefaultMedicalReviewService:
             lookups=result["lookups"],
             dropped=[*result["dropped"], *repeated],
             revisions=result["revisions"],
-            adverse=any(f.severity == "adverse" for f in findings),
+            adverse=_adverse(findings),
         )
         await self._records.append(
             claim_id, Stage.MEDICAL_REVIEW, medical.model_dump(mode="json"), created_by="model"
         )
         return medical
+
+    async def overrule(
+        self, claim_id: UUID, finding_ids: list[int], reason: str, *, actor: str
+    ) -> MedicalFindings:
+        reason = reason.strip()
+        if not finding_ids:
+            raise InvalidOverrule("an overrule names at least one finding")
+        if not reason:
+            raise InvalidOverrule("an overrule needs a reason")
+        latest = await self._records.latest(claim_id, Stage.MEDICAL_REVIEW)
+        if latest is None:
+            raise InvalidOverrule(f"claim {claim_id} has no medical findings to overrule")
+        current = MedicalFindings.model_validate(latest.payload)
+        known = {f.finding_id for f in current.findings}
+        unknown = sorted(set(finding_ids) - known)
+        if unknown:
+            raise InvalidOverrule(
+                f"no findings with ids {unknown}; the findings are {sorted(known)}"
+            )
+        chosen = set(finding_ids)
+        findings = [
+            f.model_copy(
+                update={"overruled": True, "judged_by": "person", "overrule_reason": reason}
+            )
+            if f.finding_id in chosen
+            else f
+            for f in current.findings
+        ]
+        waived = {f.rule_id for f in findings if f.overruled and f.rule_id}
+        rule_results = [
+            r.model_copy(
+                update={
+                    "passed": True,
+                    "judged_by": "person",
+                    "reason": f"overruled by a medical officer: {reason} (was: {r.reason})",
+                }
+            )
+            if r.rule_id in waived and not r.passed
+            else r
+            for r in current.rule_results
+        ]
+        overruled = current.model_copy(
+            update={
+                "findings": findings,
+                "rule_results": rule_results,
+                "adverse": _adverse(findings),
+            }
+        )
+        await self._records.append(
+            claim_id, Stage.MEDICAL_REVIEW, overruled.model_dump(mode="json"), created_by=actor
+        )
+        return overruled
 
     async def _answered_doc_types(self, claim_id: UUID) -> set[DocType]:
         """Document types asked for in the claim's answered queries, from each query's latest
@@ -188,10 +244,15 @@ def _case_file(record: ClaimRecord, policy: MemberPolicy, clause_refs: list[str]
     )
 
 
+def _adverse(findings: list[Finding]) -> bool:
+    return any(f.severity == "adverse" and not f.overruled for f in findings)
+
+
 def _eligibility(results: list[RuleResult]) -> list[Finding]:
     return [
         Finding(
             kind="eligibility",
+            rule_id=r.rule_id,
             text=f"{r.rule_id} failed on the verified facts: {r.reason}",
             severity="adverse",
             citations=[Citation(ref=f"{CLAUSE_PREFIX}{r.clause_ref}")] if r.clause_ref else [],

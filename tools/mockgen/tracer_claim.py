@@ -413,6 +413,8 @@ def ground_truth(claim: TracerClaim, rules: RulesEngine, files: dict[str, Any]) 
         "claim_form_bank.ifsc": IFSC,
         "claim_form_bank.account_holder": ACCOUNT_HOLDER,
         "clinical.patient_name": PATIENT,
+        "clinical.admission_date": claim.admission,
+        "clinical.discharge_date": claim.discharge,
         "bill.bill_number": claim.bill_number,
         "bill.patient_name": PATIENT,
         "bill.grand_total": total,

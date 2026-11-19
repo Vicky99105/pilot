@@ -131,6 +131,7 @@ REIMBURSEMENT_CHECKLIST: list[tuple[DocType, bool, Decimal | None, str | None]] 
     (DocType.PHARMACY_BILL, False, None, "When pharmacy was bought outside the hospital"),
     (DocType.CANCELLED_CHEQUE, True, None, "For payment to the member's account"),
     (DocType.KYC, True, Decimal("100000.00"), "Mandatory only when the claim is Rs 1 lakh or more"),
+    (DocType.FIR_MLC, False, None, "When the stay was due to an injury or accident"),
 ]
 
 

@@ -25,12 +25,17 @@ from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
 from app.services.knowledge_base.contract import PolicyClause
 from app.services.knowledge_base.service import DefaultKnowledgeBase
-from app.services.medical_review.contract import DocumentRequest, MedicalFindings
+from app.services.medical_review.contract import (
+    Citation,
+    DocumentRequest,
+    Finding,
+    MedicalFindings,
+)
 from app.services.registration.service import DefaultRegistrationService
 from app.services.risk.contract import RiskReport
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import PRODUCT_UIN
-from app.shared.types import DocType, Stage
+from app.shared.types import DocType, RuleResult, Stage
 from tests.database.factories import add_claim
 from tests.fakes.adjudication import FakeAdjudicationTools
 from tests.fakes.core import FakeMoneyService, FakePolicyService
@@ -300,3 +305,109 @@ async def test_guardrail_rejects_an_amount_over_the_available_balance(env: Env) 
 
     assert draft.guardrail_passed is False
     assert any("exceeds the available balance" in e for e in draft.guardrail_errors)
+
+
+# --- P2-1: human outcomes take effect -------------------------------------------------------
+
+
+async def _append_verdict(
+    sessions: async_sessionmaker[AsyncSession], claim_id: UUID, verdict: str
+) -> None:
+    repo = StageRecordRepository(sessions)
+    latest = await repo.latest(claim_id, Stage.RISK)
+    assert latest is not None
+    report = {
+        **latest.payload,
+        "verdict": verdict,
+        "verdict_note": "Forged bill",
+        "verdict_by": "x",
+    }
+    await repo.append(claim_id, Stage.RISK, report, created_by="user:inv")
+
+
+FRAUD_REJECT = {
+    "decision": "reject",
+    "reasons": [{"text": "The investigator confirmed fraud", "clause_ref": "FRAUD"}],
+    "summary": "Fraud was confirmed.",
+}
+
+
+async def test_confirmed_fraud_makes_the_rule_reject_citing_the_fraud_clause(env: Env) -> None:
+    claim_id = await env.reviewed()
+    await _append_verdict(env.sessions, claim_id, "fraud_confirmed")
+    gateway = FakeModelGateway({"adjudication_decide": [FRAUD_REJECT]})
+
+    draft = await env.service(gateway).draft(claim_id)
+
+    assert (draft.expected_decision, draft.decision, draft.amount) == ("reject", "reject", 0)
+    assert draft.guardrail_passed is True, draft.self_check_errors
+    spec = gateway.calls[-1].schema
+    assert spec is not None
+    reason = spec.model_json_schema()["$defs"]["ReasonClosed"]["properties"]
+    assert "FRAUD" in reason["clause_ref"]["anyOf"][0]["enum"]
+    assert spec.model_json_schema()["properties"]["decision"]["enum"] == ["reject"]
+
+
+async def test_a_cleared_verdict_leaves_the_decision_rules_as_they_were(env: Env) -> None:
+    claim_id = await env.reviewed()
+    await _append_verdict(env.sessions, claim_id, "cleared")
+    gateway = FakeModelGateway({"adjudication_decide": [PARTIAL]})
+
+    draft = await env.service(gateway).draft(claim_id)
+
+    assert draft.expected_decision == "partial"
+
+
+async def test_overruled_findings_are_ignored(env: Env) -> None:
+    claim_id = await env.reviewed()
+    overruled = Finding(
+        finding_id=1,
+        kind="eligibility",
+        text="R5 failed: illness within the initial waiting period",
+        severity="adverse",
+        citations=[Citation(ref="clause:Excl03")],
+        judged_by="person",
+        rule_id="R5",
+        overruled=True,
+        overrule_reason="Portability: the waiting period is served",
+    )
+    standing = Finding(
+        finding_id=2,
+        kind="clinical",
+        text="CT shows a localised collection",
+        severity="info",
+        citations=[Citation(ref="clause:ROOM-CAP")],
+        judged_by="model",
+    )
+    repo = StageRecordRepository(env.sessions)
+    latest = await repo.latest(claim_id, Stage.MEDICAL_REVIEW)
+    assert latest is not None
+    medical = MedicalFindings.model_validate(latest.payload).model_copy(
+        update={
+            "findings": [overruled, standing],
+            "rule_results": [
+                RuleResult(
+                    rule_id="R5",
+                    passed=True,
+                    reason="overruled by a medical officer",
+                    clause_ref="Excl03",
+                    judged_by="person",
+                )
+            ],
+        }
+    )
+    await repo.append(
+        claim_id, Stage.MEDICAL_REVIEW, medical.model_dump(mode="json"), created_by="user:mo"
+    )
+    gateway = FakeModelGateway({"adjudication_decide": [PARTIAL]})
+
+    draft = await env.service(gateway).draft(claim_id)
+
+    assert draft.expected_decision == "partial"
+    sent = " ".join(m.content for m in gateway.calls[-1].messages or [])
+    assert standing.text in sent
+    assert overruled.text not in sent
+    spec = gateway.calls[-1].schema
+    assert spec is not None
+    reason = spec.model_json_schema()["$defs"]["ReasonClosed"]["properties"]
+    assert "Excl03" not in reason["clause_ref"]["anyOf"][0]["enum"]

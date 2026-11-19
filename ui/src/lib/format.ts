@@ -58,6 +58,7 @@ const DOC_LABELS: Record<DocType, string> = {
   pharmacy_bill: 'Pharmacy bills',
   cancelled_cheque: 'Cancelled cheque',
   kyc: 'KYC document',
+  fir_mlc: 'FIR or medico-legal certificate',
   other: 'Other',
 }
 

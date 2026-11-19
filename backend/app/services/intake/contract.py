@@ -18,6 +18,9 @@ ClaimCategory = Literal["inpatient", "day_care", "pre_post_hospitalisation"]
 Cause = Literal["illness", "injury", "maternity"]
 IFSC_PATTERN = r"^[A-Z]{4}0[A-Z0-9]{6}$"
 
+# A member's new claim must carry the accepted declaration; follow-ups reuse the claim's form.
+DECLARATION_REQUIRED = "the declaration must be accepted"
+
 MB = 1024 * 1024
 MAX_FILE_BYTES: dict[Channel, int] = {"hospital": 15 * MB, "member": 10 * MB}
 
@@ -116,6 +119,13 @@ class IntakeService(Protocol):
         ...
 
     async def get(self, submission_id: UUID) -> Submission | None: ...
+
+    async def start_missing_workflows(self) -> list[UUID]:
+        """Start ClaimWorkflow for every claim still in status "received" with no workflow,
+        such as a claim saved while Temporal was down. The workflow ID is the claim ID, so a
+        start Temporal refuses as a duplicate is ignored and the ID is recorded. Returns the
+        claims whose workflow ID is now recorded."""
+        ...
 
 
 class WorkflowAlreadyStarted(Exception):

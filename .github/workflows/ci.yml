@@ -13,6 +13,35 @@ env:
   COMPOSE: docker compose -f deploy/docker-compose.yml
 
 jobs:
+  # Tests marked pg: behaviour only real Postgres has (migrations, SKIP LOCKED, the money
+  # idempotency race, trigram search). Each test makes and drops its own database.
+  pg-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.15
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PG_TEST_DATABASE_URL: postgresql+psycopg://postgres:ci-only@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.7"
+      - name: Install backend dependencies
+        run: uv sync --project backend --locked
+      - name: Pytest (pg)
+        run: uv run --project backend pytest tests -m pg
+
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30

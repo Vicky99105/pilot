@@ -24,24 +24,40 @@ function Citations({ citations, cite }: { citations: Citation[]; cite: (ref: Pag
 
 const SEVERITY_TONE = { info: 'neutral', query: 'warn', adverse: 'danger' } as const
 
-/** medical_findings: outcome {action: "confirm" | "overrule", reason} or a send-back. */
+/**
+ * medical_findings: outcome {action: "confirm"}, {action: "overrule", finding_ids, reason}
+ * or a send-back. Overruled findings are kept with the reason; adjudication ignores them.
+ */
 export function MedicalFindings({ payload, cite, submit, busy }: KindProps<MedicalPayload>) {
   const [overruling, setOverruling] = useState(false)
   const [reason, setReason] = useState('')
+  const [chosen, setChosen] = useState<number[]>([])
+  const toggle = (id: number) =>
+    setChosen((ids) => (ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]))
 
   return (
     <div className="space-y-4">
       <Section title="Findings">
         <ul className="space-y-2">
-          {payload.findings.map((f, i) => (
-            <li key={i} className="rounded-md border border-line p-2 text-sm">
+          {payload.findings.map((f) => (
+            <li key={f.finding_id} className="rounded-md border border-line p-2 text-sm">
               <div className="mb-1 flex flex-wrap items-center gap-2">
-                <Chip tone={SEVERITY_TONE[f.severity]}>{humanise(f.severity)}</Chip>
+                {overruling && !f.overruled && (
+                  <input
+                    type="checkbox"
+                    aria-label={`Overrule finding ${f.finding_id}`}
+                    checked={chosen.includes(f.finding_id)}
+                    onChange={() => toggle(f.finding_id)}
+                  />
+                )}
+                <Chip tone={f.overruled ? 'neutral' : SEVERITY_TONE[f.severity]}>{humanise(f.severity)}</Chip>
+                {f.overruled && <Chip tone="neutral">Overruled</Chip>}
                 <span className="text-xs text-muted">
                   {humanise(f.kind)}, by {f.judged_by}
                 </span>
               </div>
-              <p>{f.text}</p>
+              <p className={f.overruled ? 'text-muted line-through' : undefined}>{f.text}</p>
+              {f.overrule_reason && <p className="text-xs text-muted">Overruled: {f.overrule_reason}</p>}
               <div className="mt-1">
                 <Citations citations={f.citations} cite={cite} />
               </div>
@@ -89,8 +105,8 @@ export function MedicalFindings({ payload, cite, submit, busy }: KindProps<Medic
       </Section>
       {overruling && (
         <>
-          <Notice tone="warn">Overruling records your reason in the claim history. It does not change the findings.</Notice>
-          <TextArea label="Why the adverse finding does not hold" value={reason} onChange={setReason} required />
+          <Notice tone="warn">Tick the findings that do not hold. Adjudication ignores them, and your reason is kept with them.</Notice>
+          <TextArea label="Why these findings do not hold" value={reason} onChange={setReason} required />
         </>
       )}
       <Actions>
@@ -107,8 +123,8 @@ export function MedicalFindings({ payload, cite, submit, busy }: KindProps<Medic
           <>
             <Button
               variant="primary"
-              disabled={busy || !reason.trim()}
-              onClick={() => submit({ action: 'overrule', reason: reason.trim() })}
+              disabled={busy || !reason.trim() || chosen.length === 0}
+              onClick={() => submit({ action: 'overrule', finding_ids: chosen, reason: reason.trim() })}
             >
               Overrule and continue
             </Button>
@@ -123,7 +139,7 @@ export function MedicalFindings({ payload, cite, submit, busy }: KindProps<Medic
   )
 }
 
-/** investigate: outcome {action: "confirm", verdict: "genuine" | "suspicious", note}. */
+/** investigate: outcome {action: "cleared" | "fraud_confirmed", note} or a send-back. */
 export function Investigate({ payload, submit, busy }: KindProps<RiskPayload>) {
   const [note, setNote] = useState('')
   return (
@@ -147,15 +163,16 @@ export function Investigate({ payload, submit, busy }: KindProps<RiskPayload>) {
         <Button
           variant="primary"
           disabled={busy || !note.trim()}
-          onClick={() => submit({ action: 'confirm', verdict: 'genuine', note: note.trim() })}
+          onClick={() => submit({ action: 'cleared', note: note.trim() })}
         >
-          Genuine, continue
+          Cleared, continue
         </Button>
         <Button
+          variant="danger"
           disabled={busy || !note.trim()}
-          onClick={() => submit({ action: 'confirm', verdict: 'suspicious', note: note.trim() })}
+          onClick={() => submit({ action: 'fraud_confirmed', note: note.trim() })}
         >
-          Suspicious, continue to the approver
+          Fraud confirmed: the claim is rejected
         </Button>
         <SendBack stage={payload.stage} busy={busy} submit={submit} />
       </Actions>

@@ -43,6 +43,7 @@ FORM = {
     "admission_date": "2026-11-02",
     "discharge_date": "2026-11-05",
     "claimed_amount": "48250",
+    "declaration_accepted": True,
 }
 
 

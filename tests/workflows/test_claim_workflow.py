@@ -41,6 +41,7 @@ TASK_QUEUE = "test-claims"
 ALWAYS_ON = ["confirm_registration", "confirm_deductions", "approve", "release_payment"]
 PERSON = str(uuid.uuid4())  # completes every task in these tests
 DEFAULT_OUTCOMES = {
+    "investigate": {"action": "cleared", "note": "Bills checked with the hospital"},
     "approve": {"action": "approve"},
     "crc": {"action": "uphold"},
     "release_payment": {"action": "release"},
@@ -68,6 +69,8 @@ class Harness:
     query: FakeQueryService
     settlement: FakeSettlementService
     classification: FakeClassificationService
+    medical: FakeMedicalReviewService
+    risk: FakeRiskService
 
     async def start(self) -> WorkflowHandle[ClaimWorkflow, ClaimResult]:
         return await self.env.client.start_workflow(
@@ -110,13 +113,15 @@ async def _harness(
     adverse: bool = False,
     refer: bool = False,
     decision: Decision = "approve",
+    classification: FakeClassificationService | None = None,
 ) -> AsyncIterator[Harness]:
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
         monitoring, tasks = FakeMonitoring(), FakeTaskService()
         query, settlement = FakeQueryService(), FakeSettlementService(final=decision)
-        classification = FakeClassificationService()
+        classification = classification or FakeClassificationService()
+        medical, risk = FakeMedicalReviewService(adverse=adverse), FakeRiskService(refer=refer)
         activities = activities_cls(
             monitoring,
             tasks,
@@ -125,8 +130,8 @@ async def _harness(
             digitisation=FakeDigitisationService(),
             registration=FakeRegistrationService(),
             bill_review=FakeBillReviewService(),
-            medical_review=FakeMedicalReviewService(adverse=adverse),
-            risk=FakeRiskService(refer=refer),
+            medical_review=medical,
+            risk=risk,
             adjudication=FakeAdjudicationService(decision),
             decision=FakeDecisionService(decision),
             communication=FakeCommunicationService(),
@@ -135,7 +140,7 @@ async def _harness(
         )
         worker: Worker = build_worker(env.client, TASK_QUEUE, claim_activities=activities)
         async with worker:
-            yield Harness(env, tasks, monitoring, query, settlement, classification)
+            yield Harness(env, tasks, monitoring, query, settlement, classification, medical, risk)
 
 
 @pytest.fixture
@@ -307,6 +312,78 @@ async def test_a_referral_opens_the_investigator_task(referral_harness: Harness)
         await h.complete(handle, kind)
     assert (await handle.result()).status == "closed"
     assert "medical_findings" not in h.opened_kinds()
+
+
+# --- P2-1: the medical officer's and the investigator's outcomes take effect -------------
+
+
+async def test_an_overrule_writes_new_findings_through_the_service(
+    adverse_harness: Harness,
+) -> None:
+    h = adverse_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions"]:
+        await h.complete(handle, kind)
+    overrule = {"action": "overrule", "finding_ids": [1], "reason": "History is post-policy"}
+    await h.complete(handle, "medical_findings", overrule)
+    for kind in ["approve", "release_payment"]:
+        await h.complete(handle, kind)
+
+    assert (await handle.result()).status == "closed"
+    [(ids, reason, actor)] = h.medical.overrules
+    assert (ids, reason, actor) == ([1], "History is post-policy", f"user:{PERSON}")
+    [event] = [e for e in h.monitoring.recorded if e.action == "findings_overruled"]
+    assert event.detail == {"finding_ids": [1], "reason": "History is post-policy"}
+
+
+async def test_an_overrule_without_finding_ids_reopens_the_medical_task(
+    adverse_harness: Harness,
+) -> None:
+    h = adverse_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions"]:
+        await h.complete(handle, kind)
+    await h.complete(handle, "medical_findings", {"action": "overrule", "reason": "No ids"})
+    await h.wait_for(lambda: bool(h.tasks.unfinished("medical_findings")), "reopened task")
+    [task] = h.tasks.unfinished("medical_findings")
+
+    assert "finding_ids" in task.payload["error"]
+    assert h.medical.overrules == []
+    await handle.terminate()
+
+
+@pytest.mark.parametrize("verdict", ["cleared", "fraud_confirmed"])
+async def test_the_investigator_verdict_is_recorded_through_the_service(
+    referral_harness: Harness, verdict: str
+) -> None:
+    h = referral_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions"]:
+        await h.complete(handle, kind)
+    await h.complete(handle, "investigate", {"action": verdict, "note": " Forged pharmacy bill "})
+    await h.wait_for(lambda: bool(h.tasks.unfinished("approve")), "approver task")
+
+    assert h.risk.verdicts == [(verdict, "Forged pharmacy bill", f"user:{PERSON}")]
+    # Adjudication runs after the verdict, so the decision rules see it.
+    assert h.monitoring.actions(Stage.ADJUDICATION) == ["stage_completed"]
+    await handle.terminate()
+
+
+async def test_the_old_investigator_outcome_shape_reopens_the_task(
+    referral_harness: Harness,
+) -> None:
+    h = referral_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions"]:
+        await h.complete(handle, kind)
+    old = {"action": "confirm", "verdict": "genuine", "note": "Looks fine"}
+    await h.complete(handle, "investigate", old)
+    await h.wait_for(lambda: bool(h.tasks.unfinished("investigate")), "reopened task")
+    [task] = h.tasks.unfinished("investigate")
+
+    assert "cleared" in task.payload["error"] and "fraud_confirmed" in task.payload["error"]
+    assert h.risk.verdicts == []
+    await handle.terminate()
 
 
 # --- Slice 5: decision, query loop and settlement order ------------------------------------

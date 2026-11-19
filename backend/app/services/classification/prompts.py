@@ -30,6 +30,7 @@ DOC_TYPE_GUIDE = {
     DocType.PHARMACY_BILL: "Pharmacy or chemist bill for medicines",
     DocType.CANCELLED_CHEQUE: "Cancelled cheque or bank passbook page showing account and IFSC",
     DocType.KYC: "Identity or address proof: Aadhaar, PAN, passport, voter ID",
+    DocType.FIR_MLC: "Police FIR or medico-legal certificate (MLC) for an injury or accident",
     DocType.OTHER: "Anything else",
 }
 

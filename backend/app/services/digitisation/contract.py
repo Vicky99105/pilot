@@ -71,6 +71,9 @@ class ClinicalFact(BaseModel):
 
 class Clinical(BaseModel):  # from the discharge summary
     patient_name: Field[str] = missing()
+    # The summary's own dates, kept to cross-check Part A (the admission section's source).
+    admission_date: Field[date] = missing()
+    discharge_date: Field[date] = missing()
     diagnoses: list[Field[str]] = []  # as written; coding happens in medical review
     procedures: list[Field[str]] = []
     hospital_codes: list[Code] = []  # codes the hospital wrote, unverified
@@ -106,6 +109,10 @@ class Bank(BaseModel):
     account_holder: Field[str] = missing()
 
 
+class ChequeBank(Bank):  # the cheque also prints the bank's name; Part A has no such field
+    bank_name: Field[str] = missing()
+
+
 class CheckResult(BaseModel):
     check_id: str
     passed: bool
@@ -123,7 +130,7 @@ class ClaimRecord(BaseModel):
     claimed: ClaimedAmounts = ClaimedAmounts()
     clinical: Clinical = Clinical()
     bill: Bill = Bill()
-    bank: Bank = Bank()  # from the cancelled cheque
+    bank: ChequeBank = ChequeBank()  # from the cancelled cheque
     claim_form_bank: Bank = Bank()  # as typed on claim form Part A
     failed_checks: list[CheckResult] = []
     low_confidence_fields: list[str] = []  # dotted paths

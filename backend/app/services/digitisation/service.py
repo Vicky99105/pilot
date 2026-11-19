@@ -104,7 +104,9 @@ class DefaultDigitisationService:
         return await self._finish(record, created_by=actor)
 
     async def _finish(self, record: ClaimRecord, *, created_by: str) -> ClaimRecord:
-        record.failed_checks = failed_checks(record, await self._form(record.claim_id))
+        record.failed_checks = failed_checks(
+            record, await self._form(record.claim_id), await self._held(record.claim_id)
+        )
         record.low_confidence_fields = low_confidence_fields(record)
         await self._records.append(
             record.claim_id,
@@ -119,6 +121,14 @@ class DefaultDigitisationService:
         async with self._sessions() as session:
             claim = await session.get(ClaimRow, claim_id)
         return claim.submission_id if claim else None
+
+    async def _held(self, claim_id: UUID) -> frozenset[DocType]:
+        """Document types in any of the claim's document sets (the bundle and each reply)."""
+        return frozenset(
+            DocType(document["doc_type"])
+            for record in await self._records.history(claim_id, Stage.CLASSIFICATION)
+            for document in record.payload.get("documents", [])
+        )
 
     async def _form(self, claim_id: UUID) -> ClaimForm | None:
         intake = await self._records.latest(claim_id, Stage.INTAKE)

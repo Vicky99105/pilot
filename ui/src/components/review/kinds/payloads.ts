@@ -126,7 +126,17 @@ export type MedicalPayload = Common & {
     citations: Citation[]
     rationale: string
   }[]
-  findings: { kind: string; text: string; severity: 'info' | 'query' | 'adverse'; citations: Citation[]; judged_by: string }[]
+  findings: {
+    finding_id: number
+    kind: string
+    text: string
+    severity: 'info' | 'query' | 'adverse'
+    citations: Citation[]
+    judged_by: 'code' | 'model' | 'person'
+    rule_id: string | null
+    overruled: boolean
+    overrule_reason: string | null
+  }[]
   query_items: DocumentRequest[]
   rule_results: RuleResult[]
   dropped: { item: string; detail: string; reason: string }[]
@@ -138,6 +148,8 @@ export type RiskPayload = Common & {
   score: number
   refer: boolean
   explanation: string
+  verdict: 'cleared' | 'fraud_confirmed' | null
+  verdict_note: string | null
 }
 
 export type Draft = {

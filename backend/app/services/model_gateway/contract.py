@@ -29,7 +29,16 @@ class ModelOutputInvalid(PermanentError):
 
 
 class ModelUnavailable(Exception):
-    """The provider failed in a way that a later retry can fix."""
+    """The provider failed in a way that a later retry can fix. retry_after_seconds is the
+    wait the provider asked for (a 429's retryDelay or Retry-After), when it named one."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ModelQuotaExhausted(PermanentError):
+    """The provider's quota for the day is used up. Retrying within the day cannot succeed."""
 
 
 class ModelGateway(Protocol):

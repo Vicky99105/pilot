@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.database.models import ClaimRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.intake.contract import (
@@ -53,6 +54,7 @@ def _form(**overrides: Any) -> ClaimForm:
         "admission_date": date(2026, 11, 2),
         "discharge_date": date(2026, 11, 5),
         "claimed_amount": Decimal("48250"),
+        "declaration_accepted": True,
     }
     return ClaimForm(**(fields | overrides))
 
@@ -297,3 +299,85 @@ async def test_a_follow_up_is_kept_with_a_warning_when_the_signal_fails(env: Env
 
 async def test_get_returns_none_for_an_unknown_submission(env: Env) -> None:
     assert await env.intake.get(UUID(int=7)) is None
+
+
+# --- P2-1: the declaration ------------------------------------------------------------------
+
+
+async def test_a_member_claim_without_the_declaration_is_rejected(env: Env) -> None:
+    with pytest.raises(SubmissionRejected) as rejected:
+        await env.intake.accept(_submission(_typed_files(), declaration_accepted=False))
+
+    assert rejected.value.reasons == ["the declaration must be accepted"]
+    assert env.starter.started == {}
+
+
+async def test_a_hospital_request_needs_no_member_declaration(env: Env) -> None:
+    submission = await env.intake.accept(
+        _submission(_typed_files(), channel="hospital", declaration_accepted=False)
+    )
+
+    assert str(submission.claim_id) in env.starter.started
+
+
+# --- P2-1: the reconciler starts workflows that intake could not ---------------------------
+
+
+async def _workflow_id(env: Env, claim_id: UUID) -> str | None:
+    async with env.sessions() as session:
+        claim = await session.get(ClaimRow, claim_id)
+    assert claim is not None
+    return claim.workflow_id
+
+
+async def test_start_missing_workflows_starts_received_claims_without_a_workflow(
+    env: Env,
+) -> None:
+    env.starter.unavailable = True
+    stranded = await env.intake.accept(_submission(_typed_files()))
+    env.starter.unavailable = False
+    running = await env.intake.accept(_submission(_typed_files(), member_id="MOCK-M-000102-01"))
+
+    started = await env.intake.start_missing_workflows()
+
+    assert started == [stranded.claim_id]
+    assert env.starter.started[str(stranded.claim_id)] == (
+        stranded.submission_id,
+        RequestType.REIMBURSEMENT,
+    )
+    assert await _workflow_id(env, stranded.claim_id) == str(stranded.claim_id)
+    assert await _workflow_id(env, running.claim_id) == str(running.claim_id)
+    assert await env.intake.start_missing_workflows() == []  # nothing left to start
+
+
+async def test_a_refused_duplicate_start_is_ignored_and_the_workflow_recorded(env: Env) -> None:
+    env.starter.unavailable = True
+    claim = await env.intake.accept(_submission(_typed_files()))
+    env.starter.unavailable = False
+    # The workflow was started, but its ID never reached the claim row.
+    env.starter.started[str(claim.claim_id)] = (claim.submission_id, RequestType.REIMBURSEMENT)
+
+    assert await env.intake.start_missing_workflows() == [claim.claim_id]
+    assert await _workflow_id(env, claim.claim_id) == str(claim.claim_id)
+
+
+async def test_a_claim_past_received_is_left_alone(env: Env) -> None:
+    env.starter.unavailable = True
+    claim = await env.intake.accept(_submission(_typed_files()))
+    env.starter.unavailable = False
+    async with env.sessions.begin() as session:
+        row = await session.get(ClaimRow, claim.claim_id)
+        assert row is not None
+        row.status = "classification"
+
+    assert await env.intake.start_missing_workflows() == []
+    assert env.starter.started == {}
+
+
+async def test_a_failed_start_warns_once(env: Env) -> None:
+    env.starter.unavailable = True
+    claim = await env.intake.accept(_submission(_typed_files()))
+
+    assert await env.intake.start_missing_workflows() == []
+    stored = await env.intake.get(claim.submission_id)
+    assert stored is not None and len(stored.warnings) == 1

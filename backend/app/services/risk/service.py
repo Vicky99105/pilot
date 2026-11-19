@@ -17,9 +17,11 @@ from app.services.risk.contract import (
     HIGH_CLAIM_SHARE,
     REFER_AT,
     WEIGHTS,
+    InvalidVerdict,
     NotReadyForRisk,
     RiskHit,
     RiskReport,
+    Verdict,
 )
 from app.services.risk.prompts import PURPOSE, RiskExplanation, risk_messages
 from app.shared.types import Stage
@@ -90,6 +92,23 @@ class DefaultRiskService:
         )
         await self._records.append(
             claim_id, Stage.RISK, report.model_dump(mode="json"), created_by="code"
+        )
+        return report
+
+    async def record_verdict(
+        self, claim_id: UUID, verdict: Verdict, note: str, *, actor: str
+    ) -> RiskReport:
+        note = note.strip()
+        if not note:
+            raise InvalidVerdict("a verdict needs a note of what the investigator found")
+        latest = await self._records.latest(claim_id, Stage.RISK)
+        if latest is None:
+            raise InvalidVerdict(f"claim {claim_id} has no risk report to rule on")
+        report = RiskReport.model_validate(latest.payload).model_copy(
+            update={"verdict": verdict, "verdict_note": note, "verdict_by": actor}
+        )
+        await self._records.append(
+            claim_id, Stage.RISK, report.model_dump(mode="json"), created_by=actor
         )
         return report
 

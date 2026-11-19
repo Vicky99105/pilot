@@ -20,6 +20,7 @@ from app.services.digitisation.contract import (
     Bill,
     BillLine,
     CheckResult,
+    ChequeBank,
     ClaimedAmounts,
     ClaimRecord,
     Clinical,
@@ -98,10 +99,11 @@ def assemble(
     cheque = replies.get(DocType.CANCELLED_CHEQUE)
     if isinstance(cheque, CancelledChequeReply):
         read = _reader(docs[DocType.CANCELLED_CHEQUE])
-        record.bank = Bank(
+        record.bank = ChequeBank(
             account_number=read(cheque.account_number),
             ifsc=read(_upper(cheque.ifsc)),
             account_holder=read(cheque.account_holder),
+            bank_name=read(cheque.bank_name),
         )
     return record
 
@@ -145,6 +147,8 @@ def _read_discharge_summary(
     read = _reader(doc)
     record.clinical = Clinical(
         patient_name=read(r.patient_name),
+        admission_date=read(r.admission_date),
+        discharge_date=read(r.discharge_date),
         diagnoses=[read(d) for d in r.diagnoses],
         procedures=[read(p) for p in r.procedures],
         hospital_codes=[
@@ -214,7 +218,10 @@ def _read_bill(r: FinalBillReply, doc: ClassifiedDocument) -> Bill:
 # --- Consistency checks -------------------------------------------------------------------
 
 
-def failed_checks(record: ClaimRecord, form: ClaimForm | None) -> list[CheckResult]:
+def failed_checks(
+    record: ClaimRecord, form: ClaimForm | None, held: frozenset[DocType] = frozenset()
+) -> list[CheckResult]:
+    """held: the document types in any of the claim's document sets."""
     results = [
         _section_totals(record.bill),
         _grand_total(record.bill),
@@ -222,6 +229,11 @@ def failed_checks(record: ClaimRecord, form: ClaimForm | None) -> list[CheckResu
         _names_match(record),
         _form_matches(record, form) if form else None,
         _bank_matches(record),
+        _accident_evidence(record, held),
+        _dates_agree(record),
+        _ifsc_format(record),
+        _ifsc_bank_code(record),
+        _claimed_matches_bill(record),
     ]
     return [r for r in results if r is not None and not r.passed]
 
@@ -361,6 +373,198 @@ def _bank_matches(record: ClaimRecord) -> CheckResult | None:
         passed=not odd,
         detail="; ".join(f"bank.{n}: cheque {a} vs claim form {b}" for n, a, b in compared),
         fields=odd,
+    )
+
+
+# --- Cross-checks against independent evidence ---------------------------------------------
+# The model can be wrong at confidence 1.0, so a high-impact field is also compared with
+# evidence from another document.
+
+# Words that mean an injury or accident. "wound" is left out: surgical wounds are routine.
+_INJURY = re.compile(
+    r"\b(injur(?:y|ies|ed)|trauma(?:tic)?|accident(?:al)?|fractur(?:e|es|ed)|rta|"
+    r"road traffic|assault(?:ed)?|fell|fall from|burns|laceration|contusion|dislocation|"
+    r"(?:dog|snake|animal) bite)\b",
+    re.IGNORECASE,
+)
+# A negation earlier in the same clause: "No history of trauma".
+_NEGATED = re.compile(r"\b(no|not|nil|denies|denied|without|negative)\b", re.IGNORECASE)
+_CLAUSE_START = re.compile(r"[.;:\n]")
+
+
+def _injury_mentions(record: ClaimRecord) -> list[str]:
+    """Discharge summary diagnoses and facts that state an injury, quoted with their page."""
+    texts = [(d.value, d.source) for d in record.clinical.diagnoses if d.value]
+    texts += [(f.text, f.source) for f in record.clinical.facts]
+    found = []
+    for text, source in texts:
+        for match in _INJURY.finditer(text):
+            clause = _CLAUSE_START.split(text[: match.start()])[-1]
+            if not _NEGATED.search(clause):
+                page = f" (page {source.page})" if source else ""
+                found.append(f"{text!r}{page}")
+                break
+    return found
+
+
+def _accident_evidence(record: ClaimRecord, held: frozenset[DocType]) -> CheckResult | None:
+    """Part A's injury or accident tick against an FIR or MLC document and the discharge
+    summary's injury facts."""
+    accident = record.admission.accident.value
+    if accident is None:
+        return None
+    fir_mlc = DocType.FIR_MLC in held
+    injuries = _injury_mentions(record) if DocType.DISCHARGE_SUMMARY in record.documents else []
+    if accident:
+        passed = fir_mlc or bool(injuries)
+        evidence = "no FIR or MLC document and no injury in the discharge summary"
+    else:
+        passed = not fir_mlc and not injuries
+        evidence = "; ".join(
+            [*([f"a {DocType.FIR_MLC.value} document is attached"] if fir_mlc else []), *injuries]
+        )
+    return CheckResult(
+        check_id="accident_evidence",
+        passed=passed,
+        detail=f"Part A injury or accident: {'yes' if accident else 'no'}; "
+        + (evidence if not passed else "the documents agree"),
+        fields=[] if passed else ["admission.accident"],
+    )
+
+
+def _dates_agree(record: ClaimRecord) -> CheckResult | None:
+    """Admission and discharge dates on Part A against the discharge summary, and every bill
+    line date within the stay."""
+    admission, clinical = record.admission, record.clinical
+    problems: list[tuple[list[str], str]] = []
+    for name, part_a, summary in (
+        ("admission_date", admission.admission_date.value, clinical.admission_date.value),
+        ("discharge_date", admission.discharge_date.value, clinical.discharge_date.value),
+    ):
+        if part_a and summary and part_a != summary:
+            problems.append(
+                (
+                    [f"admission.{name}", f"clinical.{name}"],
+                    f"{name}: Part A {part_a} vs discharge summary {summary}",
+                )
+            )
+    start, end = admission.admission_date.value, admission.discharge_date.value
+    if start and end:
+        for i, line in enumerate(record.bill.lines):
+            day = line.date.value
+            if day and not start <= day <= end:
+                problems.append(
+                    (
+                        [f"bill.lines.{i}.date"],
+                        f"bill line {line.line_id} dated {day}, stay {start} to {end}",
+                    )
+                )
+    if not problems and not (start and end):
+        return None
+    return CheckResult(
+        check_id="dates_agree",
+        passed=not problems,
+        detail="; ".join(d for _, d in problems) or "dates agree across the documents",
+        fields=[p for paths, _ in problems for p in paths],
+    )
+
+
+IFSC_PATTERN = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
+_IFSC_PATHS = ("bank.ifsc", "claim_form_bank.ifsc")
+
+
+def _ifscs(record: ClaimRecord) -> list[tuple[str, str]]:
+    values = (record.bank.ifsc.value, record.claim_form_bank.ifsc.value)
+    return [(p, v.strip().upper()) for p, v in zip(_IFSC_PATHS, values, strict=True) if v]
+
+
+def _ifsc_format(record: ClaimRecord) -> CheckResult | None:
+    ifscs = _ifscs(record)
+    if not ifscs:
+        return None
+    bad = [(p, v) for p, v in ifscs if not IFSC_PATTERN.match(v)]
+    return CheckResult(
+        check_id="ifsc_format",
+        passed=not bad,
+        detail="; ".join(f"{p} {v} is not 4 letters, 0, then 6 characters" for p, v in bad)
+        or "every IFSC has the IFSC format",
+        fields=[p for p, _ in bad],
+    )
+
+
+# IFSC bank codes (the first 4 characters) of common banks, with the names a cheque prints.
+# A code not listed here is not judged.
+BANK_CODES: dict[str, tuple[str, ...]] = {
+    "SBIN": ("state bank of india", "sbi"),
+    "HDFC": ("hdfc bank",),
+    "ICIC": ("icici bank",),
+    "UTIB": ("axis bank",),
+    "PUNB": ("punjab national bank", "pnb"),
+    "BARB": ("bank of baroda",),
+    "CNRB": ("canara bank",),
+    "UBIN": ("union bank of india",),
+    "KKBK": ("kotak mahindra bank",),
+    "IDIB": ("indian bank",),
+    "BKID": ("bank of india",),
+    "YESB": ("yes bank",),
+    "INDB": ("indusind bank",),
+    "IOBA": ("indian overseas bank",),
+    "MAHB": ("bank of maharashtra",),
+    "CBIN": ("central bank of india",),
+    "UCBA": ("uco bank",),
+    "PSIB": ("punjab and sind bank",),
+    "FDRL": ("federal bank",),
+    "IDFB": ("idfc first bank",),
+}
+
+
+def _bank_words(name: str) -> str:
+    words = re.sub(r"[^a-z ]", " ", name.lower().replace("&", " and ")).split()
+    return " ".join(w for w in words if w not in {"the", "ltd", "limited"})
+
+
+def _ifsc_bank_code(record: ClaimRecord) -> CheckResult | None:
+    """The bank code of each IFSC against the bank name printed on the cheque."""
+    name = record.bank.bank_name.value
+    if not name:
+        return None
+    words = _bank_words(name)
+    judged = [(p, v) for p, v in _ifscs(record) if v[:4] in BANK_CODES]
+    if not judged:
+        return None
+    odd = [
+        (p, v)
+        for p, v in judged
+        if not any(words == a or words.startswith(a + " ") for a in BANK_CODES[v[:4]])
+    ]
+    return CheckResult(
+        check_id="ifsc_bank_code",
+        passed=not odd,
+        detail="; ".join(
+            f"{p} {v}: bank code {v[:4]} is {BANK_CODES[v[:4]][0].title()}, "
+            f"the cheque names {name!r}"
+            for p, v in odd
+        )
+        or "the IFSC bank codes match the cheque",
+        fields=[*(p for p, _ in odd), "bank.bank_name"] if odd else [],
+    )
+
+
+def _claimed_matches_bill(record: ClaimRecord) -> CheckResult | None:
+    """The hospital expenses claimed on Part A against the final bill's grand total."""
+    claimed = record.claimed
+    path, value = "claimed.hospital_expenses", claimed.hospital_expenses.value
+    if value is None:
+        path, value = "claimed.total", claimed.total.value
+    total = record.bill.grand_total.value
+    if value is None or total is None:
+        return None
+    passed = abs(value - total) <= SUM_TOLERANCE
+    return CheckResult(
+        check_id="claimed_matches_bill",
+        passed=passed,
+        detail=f"{path} {value:.2f} vs bill grand total {total:.2f}",
+        fields=[] if passed else [path, "bill.grand_total"],
     )
 
 

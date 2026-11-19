@@ -249,6 +249,7 @@ class Harness:
                     admission_date=date(2026, 11, 2),
                     discharge_date=date(2026, 11, 5),
                     claimed_amount=D(CLAIMED),
+                    declaration_accepted=True,
                 ),
                 files=[
                     UploadedFile(filename=f"{doc.value}.pdf", data=make_pdf(texts), slot=doc)

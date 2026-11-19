@@ -17,6 +17,7 @@ from app.services.knowledge_base.service import DefaultKnowledgeBase
 from app.services.medical_review.contract import (
     Citation,
     DocumentRequest,
+    InvalidOverrule,
     MedicalFindings,
     MedicalReviewService,
     NotReadyForMedicalReview,
@@ -338,3 +339,68 @@ async def test_query_items_are_only_documents_the_claim_does_not_have(env: Env) 
         bill = {"doc_type": held, "text": "Detailed itemized hospital bill"}
         with pytest.raises(ValidationError):
             schema.model_validate({**choose(k35_32()), "query_items": [bill]})
+
+
+# --- P2-1: a medical officer's overrule takes effect ---------------------------------------
+
+
+async def _reviewed_with_failed_wait(env: Env) -> tuple[MedicalReviewService, UUID]:
+    env.policies.policies = [
+        asha_policy(inception_date=date(2026, 10, 20), continuous_cover_start=date(2026, 10, 20))
+    ]
+    claim_id = await env.claim()
+    gateway = FakeModelGateway(
+        {"medical_rewrite_terms": [REWRITE], "medical_choose_codes": [choose(k35_32())]}
+    )
+    service = env.service(gateway)
+    await service.review(claim_id)
+    return service, claim_id
+
+
+async def test_findings_carry_ids_in_order(env: Env) -> None:
+    _, claim_id = await _reviewed_with_failed_wait(env)
+    stored = await StageRecordRepository(env.sessions).latest(claim_id, Stage.MEDICAL_REVIEW)
+    assert stored is not None
+    findings = MedicalFindings.model_validate(stored.payload).findings
+
+    assert [f.finding_id for f in findings] == list(range(1, len(findings) + 1))
+    assert all(not f.overruled for f in findings)
+
+
+async def test_overrule_writes_a_new_version_judged_by_a_person(env: Env) -> None:
+    service, claim_id = await _reviewed_with_failed_wait(env)
+    before = await StageRecordRepository(env.sessions).latest(claim_id, Stage.MEDICAL_REVIEW)
+    assert before is not None
+    [eligibility] = [
+        f
+        for f in MedicalFindings.model_validate(before.payload).findings
+        if f.kind == "eligibility"
+    ]
+
+    after = await service.overrule(
+        claim_id, [eligibility.finding_id], "Waiting period waived: portability", actor="user:x"
+    )
+
+    stored = await StageRecordRepository(env.sessions).latest(claim_id, Stage.MEDICAL_REVIEW)
+    assert stored is not None and stored.version == before.version + 1
+    assert stored.created_by == "user:x"
+    [overruled] = [f for f in after.findings if f.finding_id == eligibility.finding_id]
+    assert overruled.overruled is True and overruled.judged_by == "person"
+    assert overruled.overrule_reason == "Waiting period waived: portability"
+    assert after.adverse is False  # the only adverse finding no longer holds
+    # The rule the finding came from no longer fails adjudication.
+    [r5] = after.rule_results
+    assert (r5.rule_id, r5.passed, r5.judged_by) == ("R5", True, "person")
+    # A repeat review keeps the overruled version: its inputs did not change.
+    assert await service.review(claim_id) == after
+
+
+async def test_overrule_refuses_unknown_ids_and_a_blank_reason(env: Env) -> None:
+    service, claim_id = await _reviewed_with_failed_wait(env)
+
+    with pytest.raises(InvalidOverrule, match="99"):
+        await service.overrule(claim_id, [99], "reason", actor="user:x")
+    with pytest.raises(InvalidOverrule, match="reason"):
+        await service.overrule(claim_id, [1], "  ", actor="user:x")
+    with pytest.raises(InvalidOverrule, match="finding"):
+        await service.overrule(claim_id, [], "reason", actor="user:x")

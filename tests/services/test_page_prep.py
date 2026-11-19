@@ -24,6 +24,7 @@ FORM = ClaimForm(
     patient_name="Asha Verma",
     admission_date=date(2026, 11, 2),
     claimed_amount=Decimal("1000"),
+    declaration_accepted=True,
 )
 
 

@@ -18,6 +18,7 @@ from app.database.models import ModelCallRow
 from app.integrations.openai_compatible import (
     ChatResponse,
     OpenAICompatibleProvider,
+    ProviderQuotaExhausted,
     ProviderTransientError,
 )
 from app.services.file_store.contract import FileStore
@@ -25,6 +26,7 @@ from app.services.model_gateway._helpers import data_url, retry_instruction
 from app.services.model_gateway.contract import (
     Message,
     ModelOutputInvalid,
+    ModelQuotaExhausted,
     ModelRole,
     ModelUnavailable,
     T,
@@ -148,7 +150,11 @@ class DefaultModelGateway:
                     log, logged, image_keys, None, started, f"{type(exc).__name__}: {exc}"
                 )
                 if isinstance(exc, ProviderTransientError):
-                    raise ModelUnavailable(str(exc)) from exc
+                    raise ModelUnavailable(
+                        str(exc), retry_after_seconds=exc.retry_after_seconds
+                    ) from exc
+                if isinstance(exc, ProviderQuotaExhausted):
+                    raise ModelQuotaExhausted(f"{purpose}: {exc}") from exc
                 raise
             try:
                 result = schema.model_validate_json(reply.content)

@@ -36,6 +36,7 @@ export const REIMBURSEMENT_SLOTS: { slot: DocType; required: boolean; note?: str
   { slot: 'pharmacy_bill', required: false, note: 'If medicines were bought outside' },
   { slot: 'cancelled_cheque', required: true, note: 'For payment to your account' },
   { slot: 'kyc', required: false, note: 'Needed when the claim is Rs 1 lakh or more' },
+  { slot: 'fir_mlc', required: false, note: 'If the stay was due to an injury or accident' },
   { slot: 'other', required: false, note: 'Anything else that supports the claim' },
 ]
 

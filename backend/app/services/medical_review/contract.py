@@ -61,11 +61,15 @@ class VerifiedCode(BaseModel):
 
 
 class Finding(BaseModel):
+    finding_id: int = 0  # 1-based within the record; the service numbers the findings
     kind: FindingKind
     text: str
     severity: Severity
     citations: list[Citation]
-    judged_by: Literal["code", "model"]
+    judged_by: Literal["code", "model", "person"]  # "person" once a medical officer overrules
+    rule_id: str | None = None  # eligibility findings: the rule that failed
+    overruled: bool = False  # a medical officer ruled that the finding does not hold
+    overrule_reason: str | None = None
 
 
 class DroppedItem(BaseModel):
@@ -92,14 +96,27 @@ class MedicalFindings(BaseModel):
     lookups: list[LookupCall]  # every tool call of the run, in order
     dropped: list[DroppedItem]
     revisions: int  # how many times the model was sent back (at most 1)
-    adverse: bool  # True when any finding has severity "adverse"
+    adverse: bool  # True when any finding that is not overruled has severity "adverse"
 
 
 class NotReadyForMedicalReview(PermanentError):
     """The claim has no extracted record, no registration or no policy yet."""
 
 
+class InvalidOverrule(PermanentError):
+    """The overrule names no finding, an unknown finding, or gives no reason."""
+
+
 class MedicalReviewService(Protocol):
     async def review(self, claim_id: UUID) -> MedicalFindings:
         """Idempotent per (ClaimRecord version, RegistrationResult version)."""
+        ...
+
+    async def overrule(
+        self, claim_id: UUID, finding_ids: list[int], reason: str, *, actor: str
+    ) -> MedicalFindings:
+        """A medical officer rules that the named findings do not hold. Writes a new
+        MedicalFindings version: those findings are overruled and judged_by "person", and
+        the eligibility rule behind an overruled eligibility finding passes, judged by the
+        person. Adjudication ignores overruled findings."""
         ...

@@ -232,7 +232,7 @@ class Driver:
         if kind == "fix_fields":
             return {"action": "confirm", "fields": self._field_fixes(payload)}
         if kind == "investigate":
-            return {"action": "confirm", "verdict": "genuine", "note": "Acceptance run"}
+            return {"action": "cleared", "note": "Acceptance run"}
         if kind == "approve":
             return {"action": "approve"}
         if kind == "crc":
