@@ -5,6 +5,7 @@ import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID, uuid4
@@ -32,10 +33,19 @@ from app.services.model_gateway.contract import (
 MAX_ATTEMPTS = 2  # the first call plus one retry on a validation failure
 
 
+class ModelPricing(BaseModel):
+    """USD per million tokens, used when the provider does not report a cost itself."""
+
+    input_per_mtok: Decimal
+    output_per_mtok: Decimal
+
+
 class ProviderConfig(BaseModel):
     kind: Literal["openai_compatible"]
     base_url: str
     api_key_env: str
+    request_extras: dict[str, Any] = {}
+    pricing: dict[str, ModelPricing] = {}
 
 
 class RoleConfig(BaseModel):
@@ -179,11 +189,25 @@ class DefaultModelGateway:
             error=error,
             input_tokens=reply.input_tokens if reply else None,
             output_tokens=reply.output_tokens if reply else None,
-            cost=reply.cost if reply else None,
+            cost=self._cost(log, reply),
             latency_ms=int((time.monotonic() - started) * 1000),
         )
         async with self._sessions.begin() as session:
             session.add(row)
+
+    def _cost(self, log: "_CallLog", reply: ChatResponse | None) -> Decimal | None:
+        if reply is None:
+            return None
+        if reply.cost is not None:
+            return reply.cost
+        pricing = self._config.providers[log.provider].pricing.get(log.model)
+        if pricing is None or reply.input_tokens is None or reply.output_tokens is None:
+            return None
+        million = Decimal(1_000_000)
+        return (
+            reply.input_tokens * pricing.input_per_mtok
+            + reply.output_tokens * pricing.output_per_mtok
+        ) / million
 
 
 @dataclass(frozen=True)
@@ -213,6 +237,7 @@ def build_model_gateway(
             name=name,
             base_url=p.base_url,
             api_key=SecretStr(os.environ.get(p.api_key_env, "")),
+            extra_body=p.request_extras,
         )
         for name, p in config.providers.items()
     }

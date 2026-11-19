@@ -20,6 +20,7 @@ services:
       FILE_ENCRYPTION_KEY: ${FILE_ENCRYPTION_KEY:-bG9jYWwtZGV2LW9ubHktbm90LWEtcmVhbC1rZXktMDA=}
       # Empty by default: model calls fail with a clear error until a key is set.
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
       TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-claims}

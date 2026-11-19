@@ -1,6 +1,6 @@
 # Maps each model role to a provider and model. Switching provider or model is a change here.
-# Phase 1 tracer: every role uses one vision-capable OpenRouter model (a placeholder until the
-# Phase 3 evals pick a model per role).
+# Phase 1 tracer: every role uses one vision-capable model (a placeholder until the Phase 3
+# evals pick a model per role). Pilot data is mock data only.
 
 providers:
   openrouter:
@@ -8,21 +8,35 @@ providers:
     base_url: https://openrouter.ai/api/v1
     # Name of the environment variable that holds the key. The key itself is never stored here.
     api_key_env: OPENROUTER_API_KEY
+    # OpenRouter reports the cost of each call when asked.
+    request_extras:
+      usage: {include: true}
+    pricing:
+      google/gemini-2.5-flash: {input_per_mtok: "0.30", output_per_mtok: "2.50"}
+
+  gemini:
+    # Google's OpenAI-compatible endpoint for the Gemini API.
+    kind: openai_compatible
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    api_key_env: GEMINI_API_KEY
+    # Gemini does not return a cost, so cost is estimated from tokens at list price (USD).
+    pricing:
+      gemini-2.5-flash: {input_per_mtok: "0.30", output_per_mtok: "2.50"}
 
 roles:
   vision_classify:
-    provider: openrouter
-    model: google/gemini-2.5-flash
+    provider: gemini
+    model: gemini-2.5-flash
     params: {temperature: 0}
   vision_extract:
-    provider: openrouter
-    model: google/gemini-2.5-flash
+    provider: gemini
+    model: gemini-2.5-flash
     params: {temperature: 0}
   reasoning:
-    provider: openrouter
-    model: google/gemini-2.5-flash
+    provider: gemini
+    model: gemini-2.5-flash
     params: {temperature: 0}
   fast_text:
-    provider: openrouter
-    model: google/gemini-2.5-flash
+    provider: gemini
+    model: gemini-2.5-flash
     params: {temperature: 0}

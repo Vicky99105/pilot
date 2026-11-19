@@ -74,7 +74,27 @@ GatewayFactory = Callable[[list[httpx.Response]], tuple[ModelGateway, ScriptedTr
 
 @pytest.fixture
 def config() -> ModelsConfig:
-    return load_models_config(REPO_ROOT / "config" / "models.yaml")
+    """A test config, independent of which provider config/models.yaml currently selects."""
+    role = {"provider": "openrouter", "model": "google/gemini-2.5-flash", "params": {}}
+    return ModelsConfig.model_validate(
+        {
+            "providers": {
+                "openrouter": {
+                    "kind": "openai_compatible",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                    "request_extras": {"usage": {"include": True}},
+                    "pricing": {
+                        "google/gemini-2.5-flash": {
+                            "input_per_mtok": "0.30",
+                            "output_per_mtok": "2.50",
+                        }
+                    },
+                }
+            },
+            "roles": {r.value: role for r in ModelRole},
+        }
+    )
 
 
 @pytest.fixture
@@ -95,6 +115,7 @@ def make_gateway(
             base_url="https://openrouter.ai/api/v1",
             api_key=SecretStr(API_KEY),
             http=httpx.AsyncClient(transport=httpx.MockTransport(transport.handler)),
+            extra_body=config.providers["openrouter"].request_extras,
         )
         gateway = DefaultModelGateway(
             config=config,
@@ -114,11 +135,58 @@ async def _calls(sessions: async_sessionmaker[AsyncSession]) -> list[ModelCallRo
         )
 
 
-def test_models_config_maps_all_four_roles_to_openrouter(config: ModelsConfig) -> None:
-    assert set(config.roles) == set(ModelRole)
-    assert {r.provider for r in config.roles.values()} == {"openrouter"}
-    assert config.providers["openrouter"].base_url == "https://openrouter.ai/api/v1"
-    assert config.providers["openrouter"].api_key_env == "OPENROUTER_API_KEY"
+def test_repo_models_config_maps_every_role_to_a_configured_provider() -> None:
+    repo = load_models_config(REPO_ROOT / "config" / "models.yaml")
+    assert set(repo.roles) == set(ModelRole)
+    assert {r.provider for r in repo.roles.values()} <= set(repo.providers)
+    assert repo.providers["openrouter"].api_key_env == "OPENROUTER_API_KEY"
+    assert repo.providers["gemini"].api_key_env == "GEMINI_API_KEY"
+    for role in repo.roles.values():
+        assert role.model in repo.providers[role.provider].pricing, role.model
+
+
+async def test_provider_without_request_extras_sends_no_usage_field() -> None:
+    transport = ScriptedTransport([_ok('{"doc_type": "x", "confidence": 1}')])
+    provider = OpenAICompatibleProvider(
+        name="gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key=SecretStr(API_KEY),
+        http=httpx.AsyncClient(transport=httpx.MockTransport(transport.handler)),
+    )
+    await provider.chat_json(
+        model="gemini-2.5-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        schema_name="DocLabel",
+        json_schema=DocLabel.model_json_schema(),
+        params={},
+    )
+    body = transport.bodies()[0]
+    assert "usage" not in body
+    assert str(transport.requests[0].url) == (
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    )
+
+
+async def test_cost_is_estimated_from_pricing_when_provider_reports_none(
+    make_gateway: GatewayFactory, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    reply = httpx.Response(200, json=_completion('{"doc_type": "x", "confidence": 1}', cost=None))
+    gateway, transport = make_gateway([reply])
+
+    await gateway.structured(
+        ModelRole.FAST_TEXT,
+        [Message(role="user", content="hi")],
+        DocLabel,
+        claim_id=None,
+        purpose="p",
+    )
+
+    assert transport.bodies()[0]["usage"] == {"include": True}
+    [call] = await _calls(sessions)
+    # 120 input tokens at 0.30 per million plus 15 output tokens at 2.50 per million
+    # the cost column keeps 6 decimal places, so the stored value is within 0.000001 of it
+    assert call.cost is not None
+    assert abs(call.cost - Decimal("0.0000735")) <= Decimal("0.000001")
 
 
 async def test_structured_returns_parsed_output_and_logs_the_call(

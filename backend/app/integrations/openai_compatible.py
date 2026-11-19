@@ -34,11 +34,14 @@ class OpenAICompatibleProvider:
         api_key: SecretStr,
         http: httpx.AsyncClient | None = None,
         timeout_seconds: float = 120.0,
+        extra_body: dict[str, Any] | None = None,
     ) -> None:
         self.name = name
         self._url = base_url.rstrip("/") + "/chat/completions"
         self._api_key = api_key
         self._http = http or httpx.AsyncClient(timeout=timeout_seconds)
+        # Provider-specific request fields, for example OpenRouter's cost reporting.
+        self._extra_body = dict(extra_body or {})
 
     async def chat_json(
         self,
@@ -53,6 +56,7 @@ class OpenAICompatibleProvider:
         if not key:
             raise ProviderPermanentError(f"no API key configured for provider {self.name}")
         body = {
+            **self._extra_body,
             **params,
             "model": model,
             "messages": messages,
@@ -60,7 +64,6 @@ class OpenAICompatibleProvider:
                 "type": "json_schema",
                 "json_schema": {"name": schema_name, "schema": json_schema, "strict": False},
             },
-            "usage": {"include": True},  # OpenRouter: report cost in the response
         }
         try:
             response = await self._http.post(
