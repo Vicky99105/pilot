@@ -24,3 +24,8 @@ strict = true
 mypy_path = "backend"
 explicit_package_bases = true
 plugins = ["pydantic.mypy"]
+
+# pypdfium2 ships no type information. Only page_prep/_helpers.py imports it.
+[[tool.mypy.overrides]]
+module = ["pypdfium2", "pypdfium2.*"]
+ignore_missing_imports = true

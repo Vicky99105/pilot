@@ -26,6 +26,7 @@ class StageResult(BaseModel):
     claim_id: UUID
     stage: Stage
     needs_checkpoint: bool = False  # conditional checkpoints: unsure labels, adverse findings
+    checkpoint_payload: dict[str, Any] = {}  # what the person needs to see at the checkpoint
     draft: DraftDecision | None = None  # adjudication only
 
 
@@ -46,6 +47,15 @@ class EventInput(BaseModel):
     action: str
     actor: str = "workflow"
     detail: dict[str, Any] | None = None
+
+
+class CorrectionInput(BaseModel):
+    """A checkpoint outcome carrying a person's corrections for the stage's record."""
+
+    claim_id: UUID
+    stage: Stage
+    outcome: dict[str, Any]
+    actor: str
 
 
 class ClaimResult(BaseModel):

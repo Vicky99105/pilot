@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from app.config import Settings
 from app.services.file_store.contract import FileNotFound, FileStore, FileTampered
-from app.services.file_store.service import DefaultFileStore
+from app.services.file_store.service import DefaultFileStore, build_file_store
+from app.shared.errors import PermanentError
 from tests.fakes.file_store import FakeFileStore
 
 KEY = base64.b64encode(os.urandom(32)).decode()
@@ -83,3 +85,20 @@ async def test_fake_file_store_round_trip() -> None:
     key = await store.put(b"x", content_type="image/png")
 
     assert await store.get(key) == b"x"
+
+
+async def test_build_file_store_uses_the_key_from_settings(tmp_path: Path) -> None:
+    store = build_file_store(Settings(file_store_dir=tmp_path, file_encryption_key=KEY))
+
+    key = await store.put(b"bill", content_type="application/pdf")
+
+    assert await store.get(key) == b"bill"
+
+
+async def test_without_a_key_every_file_operation_fails_permanently() -> None:
+    store = build_file_store(Settings(file_encryption_key=None))
+
+    with pytest.raises(PermanentError, match="FILE_ENCRYPTION_KEY"):
+        await store.put(b"bill", content_type="application/pdf")
+    with pytest.raises(PermanentError, match="FILE_ENCRYPTION_KEY"):
+        await store.get("0" * 32)

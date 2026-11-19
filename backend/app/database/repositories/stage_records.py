@@ -34,6 +34,36 @@ def _to_record(row: StageRecordRow) -> StageRecord:
     )
 
 
+async def append_in_session(
+    session: AsyncSession,
+    claim_id: UUID,
+    stage: Stage,
+    payload: dict[str, Any],
+    *,
+    created_by: str,
+) -> StageRecord:
+    """Write the next version inside the caller's transaction. A concurrent writer for the
+    same stage fails on the (claim_id, stage, version) unique constraint instead of
+    overwriting."""
+    current = await session.scalar(
+        select(func.max(StageRecordRow.version)).where(
+            StageRecordRow.claim_id == claim_id, StageRecordRow.stage == stage.value
+        )
+    )
+    row = StageRecordRow(
+        id=uuid4(),
+        claim_id=claim_id,
+        stage=stage.value,
+        version=(current or 0) + 1,
+        payload=payload,
+        created_by=created_by,
+    )
+    session.add(row)
+    await session.flush()
+    await session.refresh(row)
+    return _to_record(row)
+
+
 class StageRecordRepository:
     def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
         self._sessions = sessions
@@ -41,26 +71,8 @@ class StageRecordRepository:
     async def append(
         self, claim_id: UUID, stage: Stage, payload: dict[str, Any], *, created_by: str
     ) -> StageRecord:
-        """Write the next version. A concurrent writer for the same stage fails on the
-        (claim_id, stage, version) unique constraint instead of overwriting."""
         async with self._sessions.begin() as session:
-            current = await session.scalar(
-                select(func.max(StageRecordRow.version)).where(
-                    StageRecordRow.claim_id == claim_id, StageRecordRow.stage == stage.value
-                )
-            )
-            row = StageRecordRow(
-                id=uuid4(),
-                claim_id=claim_id,
-                stage=stage.value,
-                version=(current or 0) + 1,
-                payload=payload,
-                created_by=created_by,
-            )
-            session.add(row)
-            await session.flush()
-            await session.refresh(row)
-            return _to_record(row)
+            return await append_in_session(session, claim_id, stage, payload, created_by=created_by)
 
     async def latest(self, claim_id: UUID, stage: Stage) -> StageRecord | None:
         async with self._sessions() as session:

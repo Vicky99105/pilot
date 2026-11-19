@@ -20,6 +20,11 @@ from app.workflows.claim_models import ClaimInput, ClaimResult, StageInput, Stag
 from app.workflows.claim_workflow import CHECKPOINT_SLA, ClaimWorkflow
 from app.workflows.worker import build_worker
 from tests.fakes.monitoring import FakeMonitoring
+from tests.fakes.stages import (
+    FakeClassificationService,
+    FakeDigitisationService,
+    FakeIntakeService,
+)
 from tests.fakes.tasks import FakeTaskService
 
 TASK_QUEUE = "test-claims"
@@ -82,9 +87,14 @@ async def _harness(activities_cls: type[ClaimActivities]) -> AsyncIterator[Harne
         data_converter=pydantic_data_converter
     ) as env:
         monitoring, tasks = FakeMonitoring(), FakeTaskService()
-        worker: Worker = build_worker(
-            env.client, TASK_QUEUE, claim_activities=activities_cls(monitoring, tasks)
+        activities = activities_cls(
+            monitoring,
+            tasks,
+            intake=FakeIntakeService(),
+            classification=FakeClassificationService(),
+            digitisation=FakeDigitisationService(),
         )
+        worker: Worker = build_worker(env.client, TASK_QUEUE, claim_activities=activities)
         async with worker:
             yield Harness(env, tasks, monitoring)
 

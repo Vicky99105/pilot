@@ -5,19 +5,34 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 
+import httpx
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from app.api.routes import health
 from app.api.routes import monitoring as monitoring_routes
+from app.api.routes import submissions as submission_routes
 from app.api.routes import tasks as task_routes
 from app.config import Settings
+from app.integrations.core.contract import PermissionService
+from app.integrations.core.http import HttpPermissionService
 from app.mock_core.router import router as mock_core_router
+from app.services.claims.contract import ClaimQueryService
+from app.services.claims.service import DefaultClaimQueryService
+from app.services.classification.service import DefaultClassificationService
+from app.services.digitisation.service import DefaultDigitisationService
+from app.services.file_store.contract import FileStore
+from app.services.file_store.service import build_file_store
 from app.services.health.contract import HealthService
 from app.services.health.service import DefaultHealthService
+from app.services.intake.contract import IntakeService
+from app.services.intake.service import DefaultIntakeService, DefaultWorkflowStarter
+from app.services.model_gateway.contract import ModelGateway
+from app.services.model_gateway.service import build_model_gateway
 from app.services.monitoring.contract import Monitoring
 from app.services.monitoring.service import DefaultMonitoring
+from app.services.page_prep.service import DefaultPagePreparer
 from app.services.tasks.contract import TaskService
 from app.services.tasks.service import DefaultTaskService, DefaultWorkflowSignaller
 from app.services.users.contract import UserService
@@ -34,6 +49,11 @@ def create_app(
     task_service: TaskService | None = None,
     monitoring: Monitoring | None = None,
     user_service: UserService | None = None,
+    intake_service: IntakeService | None = None,
+    claim_queries: ClaimQueryService | None = None,
+    file_store: FileStore | None = None,
+    permission_service: PermissionService | None = None,
+    model_gateway: ModelGateway | None = None,
 ) -> FastAPI:
     """Services passed in (tests) are used as given; the rest are built in the lifespan."""
     settings = settings or Settings()
@@ -54,7 +74,32 @@ def create_app(
             app.state.monitoring = DefaultMonitoring(sessions)
         if app.state.user_service is None:
             app.state.user_service = DefaultUserService(sessions)
-        activities = ClaimActivities(app.state.monitoring, app.state.task_service)
+        if app.state.file_store is None:
+            app.state.file_store = build_file_store(settings)
+        files: FileStore = app.state.file_store
+        core_http = httpx.AsyncClient(timeout=10.0)
+        if app.state.permission_service is None:
+            app.state.permission_service = HttpPermissionService(
+                settings.mock_core_base_url, core_http
+            )
+        if app.state.intake_service is None:
+            app.state.intake_service = DefaultIntakeService(
+                sessions, files, DefaultWorkflowStarter(settings)
+            )
+        if app.state.claim_queries is None:
+            app.state.claim_queries = DefaultClaimQueryService(sessions)
+        gateway = model_gateway or build_model_gateway(
+            config_path=settings.config_dir / "models.yaml", file_store=files, sessions=sessions
+        )
+        activities = ClaimActivities(
+            app.state.monitoring,
+            app.state.task_service,
+            intake=app.state.intake_service,
+            classification=DefaultClassificationService(
+                sessions, files, gateway, DefaultPagePreparer(sessions, files)
+            ),
+            digitisation=DefaultDigitisationService(sessions, files, gateway),
+        )
         worker_task = asyncio.create_task(
             run_worker_forever(settings, activities), name="temporal-worker"
         )
@@ -64,6 +109,7 @@ def create_app(
             worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
+            await core_http.aclose()
             await _dispose(engine, mock_core_engine)
 
     app = FastAPI(title="ConsintIQ Claims Pilot", lifespan=lifespan)
@@ -71,9 +117,14 @@ def create_app(
     app.state.task_service = task_service
     app.state.monitoring = monitoring
     app.state.user_service = user_service
+    app.state.intake_service = intake_service
+    app.state.claim_queries = claim_queries
+    app.state.file_store = file_store
+    app.state.permission_service = permission_service
     app.include_router(health.router)
     app.include_router(task_routes.router)
     app.include_router(monitoring_routes.router)
+    app.include_router(submission_routes.router)
     app.include_router(mock_core_router, prefix="/mock-core")
 
     # Mounted last so API routes take precedence over static files.

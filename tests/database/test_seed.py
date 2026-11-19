@@ -1,7 +1,7 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import HospitalRow, UserRoleRow, UserRow
+from app.database.models import DocumentChecklistRow, HospitalRow, UserRoleRow, UserRow
 from app.database.seed import seed_claims_db
 from app.shared.seed_ids import DOCTOR_USER_ID, OPS_USER_ID
 
@@ -19,6 +19,7 @@ async def test_seed_is_idempotent_and_creates_five_users_and_hospitals(
 
     assert await _count(sessions, UserRow) == 5
     assert await _count(sessions, HospitalRow) == 5
+    assert await _count(sessions, DocumentChecklistRow) == 10
 
 
 async def test_seed_gives_ops_and_doctor_their_roles(

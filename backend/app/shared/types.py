@@ -48,6 +48,22 @@ class RequestType(StrEnum):
     CANCELLATION = "cancellation"
 
 
+class DocType(StrEnum):
+    """Document types a page can be labelled with. Checklists and slots use the same values."""
+
+    CLAIM_FORM_PART_A = "claim_form_part_a"
+    CLAIM_FORM_PART_B = "claim_form_part_b"
+    FINAL_BILL = "final_bill"
+    PAYMENT_RECEIPT = "payment_receipt"
+    DISCHARGE_SUMMARY = "discharge_summary"
+    INVESTIGATION_REPORT = "investigation_report"
+    PRESCRIPTION = "prescription"
+    PHARMACY_BILL = "pharmacy_bill"
+    CANCELLED_CHEQUE = "cancelled_cheque"
+    KYC = "kyc"
+    OTHER = "other"
+
+
 class Stage(StrEnum):
     INTAKE = "intake"
     CLASSIFICATION = "classification"

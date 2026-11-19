@@ -12,6 +12,7 @@ from uuid import UUID
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from app.shared.types import Role, Stage
@@ -19,6 +20,7 @@ with workflow.unsafe.imports_passed_through():
     from app.workflows.claim_models import (
         ClaimInput,
         ClaimResult,
+        CorrectionInput,
         DraftDecision,
         EventInput,
         OpenTaskInput,
@@ -81,6 +83,9 @@ CRC = Checkpoint("crc", Role.CRC_REVIEWER, "Approve rejection or partial")
 QUERY_NO_REPLY = Checkpoint("query_no_reply", Role.CLAIMS_OPERATOR, "Handle query with no reply")
 RELEASE_PAYMENT = Checkpoint("release_payment", Role.FINANCE, "Release payment")
 
+# Stages whose checkpoint outcome can carry corrections ("labels" or "fields").
+CORRECTABLE = {Stage.CLASSIFICATION, Stage.DIGITISATION}
+
 CONDITIONAL = {
     Stage.CLASSIFICATION: FIX_LABELS,
     Stage.DIGITISATION: FIX_FIELDS,
@@ -120,7 +125,9 @@ class ClaimWorkflow:
         self._followups: list[str] = []
         self._held = False
         self._claim_id: UUID | None = None
+        self._submission_id: UUID | None = None
         self._draft: DraftDecision | None = None
+        self._last_task_id = ""
 
     @workflow.signal
     def task_completed(self, task_id: str, outcome: dict[str, Any]) -> None:
@@ -140,6 +147,7 @@ class ClaimWorkflow:
 
     @workflow.run
     async def run(self, claim: ClaimInput) -> ClaimResult:
+        self._submission_id = claim.submission_id
         intake = await workflow.execute_activity_method(
             ClaimActivities.intake,
             claim,
@@ -158,7 +166,11 @@ class ClaimWorkflow:
                     continue  # resume at the stage that raised the query
             target = None
             for checkpoint in checkpoints_after(stage, result, self._draft):
-                outcome = await self._checkpoint(stage, checkpoint)
+                outcome = await self._checkpoint(stage, checkpoint, result.checkpoint_payload)
+                if stage in CORRECTABLE:
+                    outcome = await self._corrected(
+                        stage, checkpoint, outcome, result.checkpoint_payload
+                    )
                 target = send_back_target(outcome, PIPELINE[: i + 1])
                 if target is not None:
                     break
@@ -173,13 +185,13 @@ class ClaimWorkflow:
     async def _run_stage(self, stage: Stage, submission_id: str | None = None) -> StageResult:
         await workflow.wait_condition(lambda: not self._held)
         assert self._claim_id is not None
+        if submission_id is not None:
+            submission: UUID | None = UUID(submission_id)
+        else:  # classification reads the claim's own submission unless a reply is given
+            submission = self._submission_id if stage is Stage.CLASSIFICATION else None
         return await workflow.execute_activity_method(
             STAGE_ACTIVITIES[stage],
-            StageInput(
-                claim_id=self._claim_id,
-                stage=stage,
-                submission_id=UUID(submission_id) if submission_id else None,
-            ),
+            StageInput(claim_id=self._claim_id, stage=stage, submission_id=submission),
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
@@ -200,7 +212,41 @@ class ClaimWorkflow:
         await self._run_stage(Stage.CLASSIFICATION, submission_id=reply)
         await self._run_stage(Stage.DIGITISATION, submission_id=reply)
 
-    async def _checkpoint(self, stage: Stage, checkpoint: Checkpoint) -> dict[str, Any]:
+    async def _corrected(
+        self,
+        stage: Stage,
+        checkpoint: Checkpoint,
+        outcome: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply a person's corrections as a new stage record. Corrections the service
+        refuses send the same checkpoint back to the queue with the reason."""
+        while outcome.get("labels") or outcome.get("fields"):
+            assert self._claim_id is not None
+            try:
+                await workflow.execute_activity_method(
+                    ClaimActivities.apply_corrections,
+                    CorrectionInput(
+                        claim_id=self._claim_id,
+                        stage=stage,
+                        outcome=outcome,
+                        actor=f"task:{self._last_task_id}",
+                    ),
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                return outcome
+            except ActivityError as err:
+                reason = str(err.cause) if err.cause else str(err)
+                await self._event(stage, "corrections_rejected", {"reason": reason})
+                outcome = await self._checkpoint(
+                    stage, checkpoint, {**payload, "correction_error": reason}
+                )
+        return outcome
+
+    async def _checkpoint(
+        self, stage: Stage, checkpoint: Checkpoint, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         assert self._claim_id is not None
         task_id = await workflow.execute_activity_method(
             ClaimActivities.open_task,
@@ -211,13 +257,13 @@ class ClaimWorkflow:
                 kind=checkpoint.kind,
                 role=checkpoint.role,
                 title=checkpoint.title,
-                payload={"stage": stage.value},
+                payload={"stage": stage.value, **(payload or {})},
                 deadline=workflow.now() + CHECKPOINT_SLA,
             ),
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )
-        key = str(task_id)
+        key = self._last_task_id = str(task_id)
         try:
             await workflow.wait_condition(lambda: key in self._outcomes, timeout=CHECKPOINT_SLA)
         except TimeoutError:

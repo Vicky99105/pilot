@@ -93,12 +93,26 @@ class UserRoleRow(Base):
 
 class SubmissionRow(Base):
     __tablename__ = "submissions"
+    __table_args__ = (
+        Index("ix_submissions_dedupe", "member_id", "admission_date", "files_digest"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     request_type: Mapped[str] = mapped_column(String(30))
     submitted_by: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("users.id"))
     parent_claim_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("claims.id"))
+    # The claim this submission belongs to: its own new claim, the parent, or the claim of
+    # the earlier submission it duplicates.
+    claim_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("claims.id"), index=True)
+    channel: Mapped[str | None] = mapped_column(String(20))  # member, hospital
     form: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict)
+    # Duplicate detection: same member, same admission date, same set of file hashes.
+    member_id: Mapped[str | None] = mapped_column(String(50))
+    admission_date: Mapped[date | None] = mapped_column(Date)
+    files_digest: Mapped[str | None] = mapped_column(String(64))
+    duplicate_of: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("submissions.id"))
+    missing_documents: Mapped[list[str]] = mapped_column(JsonType, default=list)
+    warnings: Mapped[list[str]] = mapped_column(JsonType, default=list)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
@@ -107,6 +121,8 @@ class FileRow(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     submission_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("submissions.id"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)  # upload order, 0-based
+    filename: Mapped[str | None] = mapped_column(String(255))
     sha256: Mapped[str] = mapped_column(String(64), index=True)
     slot_hint: Mapped[str | None] = mapped_column(String(60))
     mime: Mapped[str] = mapped_column(String(100))
@@ -139,6 +155,7 @@ class PageRow(Base):
     text_layer: Mapped[str | None] = mapped_column(Text)
     doc_type: Mapped[str | None] = mapped_column(String(60))
     confidence: Mapped[float | None]
+    quality_warning: Mapped[str | None] = mapped_column(Text)
     document_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("documents.id"))
 
 
@@ -304,6 +321,8 @@ class DocumentChecklistRow(Base):
     request_type: Mapped[str] = mapped_column(String(30))
     doc_type: Mapped[str] = mapped_column(String(60))
     required: Mapped[bool] = mapped_column(Boolean)
+    # When set, the document is required only at or above this claimed amount (rupees).
+    mandatory_from_amount: Mapped[Decimal | None] = mapped_column(Money)
     notes: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))

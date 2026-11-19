@@ -1,6 +1,7 @@
-"""Seed the claims database with the Phase 1 users and mock hospitals.
+"""Seed the claims database with the Phase 1 users, mock hospitals and document checklists.
 
-Idempotent: rows are merged by primary key, so running it twice changes nothing.
+Idempotent: rows are merged by primary key (checklists by request type and document type),
+so running it twice changes nothing.
 Run inside the app container: python -m app.database.seed
 """
 
@@ -9,10 +10,11 @@ from datetime import date
 from decimal import Decimal
 from typing import TypeVar
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings
-from app.database.models import HospitalRow, UserRoleRow, UserRow
+from app.database.models import DocumentChecklistRow, HospitalRow, UserRoleRow, UserRow
 from app.shared.seed_ids import (
     DOCTOR_USER_ID,
     FINANCE_USER_ID,
@@ -23,7 +25,7 @@ from app.shared.seed_ids import (
     MEMBER_USER_ID,
     OPS_USER_ID,
 )
-from app.shared.types import Role
+from app.shared.types import DocType, RequestType, Role
 
 RowT = TypeVar("RowT", UserRow, UserRoleRow, HospitalRow)
 
@@ -90,6 +92,22 @@ HOSPITALS = [
 ]
 
 
+# Reimbursement checklist: (document, required, required only from this claimed amount, note).
+# Documents marked not required are asked for only when they apply to the claim.
+REIMBURSEMENT_CHECKLIST: list[tuple[DocType, bool, Decimal | None, str | None]] = [
+    (DocType.CLAIM_FORM_PART_A, True, None, None),
+    (DocType.CLAIM_FORM_PART_B, True, None, "Filled and sealed by the hospital"),
+    (DocType.FINAL_BILL, True, None, "Itemised final bill"),
+    (DocType.PAYMENT_RECEIPT, True, None, None),
+    (DocType.DISCHARGE_SUMMARY, True, None, None),
+    (DocType.INVESTIGATION_REPORT, False, None, "When investigations were billed"),
+    (DocType.PRESCRIPTION, False, None, "When pharmacy was bought outside the hospital"),
+    (DocType.PHARMACY_BILL, False, None, "When pharmacy was bought outside the hospital"),
+    (DocType.CANCELLED_CHEQUE, True, None, "For payment to the member's account"),
+    (DocType.KYC, True, Decimal("100000.00"), "Mandatory only when the claim is Rs 1 lakh or more"),
+]
+
+
 async def seed_claims_db(sessions: async_sessionmaker[AsyncSession]) -> None:
     async with sessions.begin() as session:
         for user in USERS:
@@ -99,6 +117,29 @@ async def seed_claims_db(sessions: async_sessionmaker[AsyncSession]) -> None:
             await session.merge(_copy(role))
         for hospital in HOSPITALS:
             await session.merge(_copy(hospital))
+        await _seed_checklist(session, RequestType.REIMBURSEMENT, REIMBURSEMENT_CHECKLIST)
+
+
+async def _seed_checklist(
+    session: AsyncSession,
+    request_type: RequestType,
+    items: list[tuple[DocType, bool, Decimal | None, str | None]],
+) -> None:
+    existing = {
+        row.doc_type: row
+        for row in await session.scalars(
+            select(DocumentChecklistRow).where(
+                DocumentChecklistRow.request_type == request_type.value
+            )
+        )
+    }
+    for doc_type, required, from_amount, notes in items:
+        row = existing.get(doc_type.value) or DocumentChecklistRow(
+            request_type=request_type.value, doc_type=doc_type.value
+        )
+        row.required, row.mandatory_from_amount, row.notes = required, from_amount, notes
+        row.source, row.source_version = SOURCE, SOURCE_VERSION
+        session.add(row)
 
 
 def _copy(row: RowT) -> RowT:
@@ -114,7 +155,10 @@ async def main() -> None:
         await seed_claims_db(async_sessionmaker(engine, expire_on_commit=False))
     finally:
         await engine.dispose()
-    print(f"Seeded {len(USERS)} users, {len(ROLES)} roles, {len(HOSPITALS)} hospitals")
+    print(
+        f"Seeded {len(USERS)} users, {len(ROLES)} roles, {len(HOSPITALS)} hospitals, "
+        f"{len(REIMBURSEMENT_CHECKLIST)} reimbursement checklist items"
+    )
 
 
 if __name__ == "__main__":

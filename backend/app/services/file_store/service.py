@@ -11,7 +11,9 @@ from pathlib import Path
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from app.services.file_store.contract import FileNotFound, FileTampered
+from app.config import Settings
+from app.services.file_store.contract import FileNotFound, FileStore, FileTampered
+from app.shared.errors import PermanentError
 
 _KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _FORMAT_VERSION = b"\x01"
@@ -68,3 +70,27 @@ class DefaultFileStore:
         tmp = path.with_suffix(".tmp")
         tmp.write_bytes(blob)
         tmp.replace(path)  # atomic: readers never see a partial file
+
+
+class FileStoreNotConfigured(PermanentError):
+    """FILE_ENCRYPTION_KEY is not set, so no file can be stored or read."""
+
+
+class UnconfiguredFileStore:
+    """Stands in when no encryption key is set: the app starts, and every file operation
+    fails with a clear, permanent error."""
+
+    async def put(self, data: bytes, *, content_type: str) -> str:
+        raise FileStoreNotConfigured("FILE_ENCRYPTION_KEY is not set")
+
+    async def get(self, key: str) -> bytes:
+        raise FileStoreNotConfigured("FILE_ENCRYPTION_KEY is not set")
+
+
+def build_file_store(settings: Settings) -> FileStore:
+    if settings.file_encryption_key is None:
+        return UnconfiguredFileStore()
+    return DefaultFileStore(
+        root=settings.file_store_dir,
+        encryption_key=settings.file_encryption_key.get_secret_value(),
+    )
