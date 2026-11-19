@@ -506,9 +506,36 @@ def score(claim_id: str, truth: dict[str, Any], driver: Driver, api: Api) -> dic
                 "family_ok": code.startswith(truth["expected"]["icd_family"]),
             }
         )
+    procedures = []
+    for built in medical.get("procedure_codes", []):
+        steps = built.get("steps", [])
+        validated = calls.get(built.get("validate_call_id"))
+        procedures.append(
+            {
+                "code": built["code"]["code"],
+                "display": built["code"].get("display"),
+                "version": built["code"].get("version"),
+                "phrase": built.get("phrase"),
+                "steps": [
+                    f"{s['position']}:{s['value']} {s['label']} ({s['chosen_by']}, "
+                    f"call {s['lookup_call_id']})"
+                    for s in steps
+                ],
+                "every_step_offered": all(
+                    s["prefix"] + s["value"]
+                    in calls.get(s["lookup_call_id"], {}).get("returned_codes", [])
+                    for s in steps
+                ),
+                "validated": bool(
+                    validated and built["code"]["code"] in validated.get("returned_codes", [])
+                ),
+                "family_ok": built["code"]["code"].startswith(truth["expected"]["pcs_family"]),
+            }
+        )
     report["medical"] = {
         "runs": len(medical_history),
         "codes": codes,
+        "procedures": procedures,
         "findings": [(f["kind"], f["severity"], f["text"]) for f in medical.get("findings", [])],
         "query_items": medical.get("query_items", []),
         "dropped": medical.get("dropped", []),
@@ -680,6 +707,12 @@ def markdown(report: dict[str, Any], outcome: str, wall: float) -> str:
         out.append(
             f"- ICD {c['code']} ({c['display']}): from lookup {c['from_lookup']} via "
             f"{c['lookup']}; K35 family {c['family_ok']}"
+        )
+    for p in r["medical"]["procedures"]:
+        out.append(
+            f"- PCS {p['code']} ({p['display']}, {p['version']}) for {p['phrase']!r}: every step "
+            f"offered by pcs_options {p['every_step_offered']}, validated {p['validated']}, "
+            f"0DTJ family {p['family_ok']}; steps {p['steps']}"
         )
     out.append(
         f"- Medical findings: {r['medical']['findings']}; query items "

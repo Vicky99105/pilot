@@ -1,13 +1,17 @@
 """Medical review graph (LangGraph).
 
-rewrite_terms -> lookup -> choose_codes -> hospital_codes -> length_of_stay ->
-pre_existing -> validate -> (choose_codes once more, or end)
+rewrite_terms -> lookup -> code_procedures -> choose_codes -> hospital_codes ->
+length_of_stay -> pre_existing -> validate -> (choose_codes once more, or end)
 
 The model rewrites diagnosis phrases into index terms and chooses codes from the lookup
 results. Code runs every lookup and every check. The validator accepts a code only if a
 lookup in this run returned it and it is billable, and a finding only if it has a valid
 citation. Rejected items go back to the model once; what is still wrong is dropped with
 the reason.
+
+Procedures are coded in ICD-10-PCS by a constrained builder: at each of the seven positions
+the reply schema is the list of values the PCS tables allow after the code built so far, so
+every code it builds is valid. Code takes a position itself when only one value is allowed.
 """
 
 from typing import Any, TypedDict
@@ -16,6 +20,7 @@ from uuid import UUID
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.medical_case import (
+    CaseFact,
     CaseFile,
     compare_hospital_codes,
     length_of_stay,
@@ -24,33 +29,54 @@ from app.agents.medical_case import (
 )
 from app.agents.prompts import (
     CHOOSE_PURPOSE,
+    NO_PROCEDURE,
+    PCS_PURPOSE,
     REWRITE_PURPOSE,
     ChooseCodesReply,
+    TermRewrite,
     TermRewriteReply,
     choose_messages,
     choose_schema,
+    pcs_choice,
+    pcs_step_messages,
+    pcs_step_schema,
     rewrite_messages,
     to_citation,
 )
-from app.agents.tools import IcdLookupLedger
-from app.services.knowledge_base.contract import IcdTabularEntry, KnowledgeBase
+from app.agents.tools import IcdLookupLedger, index_code
+from app.services.knowledge_base.contract import (
+    ICD10PCS,
+    PCS_LENGTH,
+    IcdTabularEntry,
+    IndexName,
+    KnowledgeBase,
+    PcsOption,
+)
 from app.services.medical_review.contract import (
+    Citation,
     DocumentRequest,
     DroppedItem,
     Finding,
     LookupCall,
+    PcsStep,
     VerifiedCode,
+    VerifiedProcedure,
 )
 from app.services.model_gateway.contract import ModelGateway, ModelRole
-from app.shared.types import DocType
+from app.shared.types import Code, DocType
 
 MAX_REVISIONS = 1
+MAX_PROCEDURES = 3
+# A code the index gives that is not billable is opened up to this many billable codes
+# below it, so the model can pick one.
+MAX_BELOW = 20
 NOT_RETURNED = "not returned by any lookup in this run"
 NO_CITATION = "no valid citation"
 
 
 class MedicalGraphResult(TypedDict):
     verified_codes: list[VerifiedCode]
+    procedure_codes: list[VerifiedProcedure]
     findings: list[Finding]
     query_items: list[DocumentRequest]
     lookups: list[LookupCall]
@@ -58,9 +84,21 @@ class MedicalGraphResult(TypedDict):
     revisions: int
 
 
+def _queries(item: TermRewrite) -> tuple[str, list[str], IndexName]:
+    """The main term with every modifier, then with each modifier on its own."""
+    main = " ".join(item.main_term.split())
+    modifiers = [" ".join(m.split()) for m in item.modifiers if m.strip()]
+    queries = [" ".join([main, *modifiers])]
+    if len(modifiers) > 1:
+        queries += [f"{main} {m}" for m in modifiers]
+    return main, queries, item.index
+
+
 class _State(TypedDict, total=False):
     case: CaseFile
-    terms: list[str]
+    terms: list[tuple[str, list[str], IndexName]]  # (main term, queries, index)
+    procedure_codes: list[VerifiedProcedure]
+    procedure_dropped: list[DroppedItem]
     candidates: list[IcdTabularEntry]
     proposal: ChooseCodesReply
     code_findings: dict[str, list[Finding]]  # per check node, so a re-run replaces its own
@@ -75,7 +113,7 @@ class _State(TypedDict, total=False):
 async def run_medical_review(
     case: CaseFile, *, gateway: ModelGateway, kb: KnowledgeBase, claim_id: UUID
 ) -> MedicalGraphResult:
-    ledger = IcdLookupLedger(kb)
+    ledger = IcdLookupLedger(kb, as_of=case.admission_date)
 
     async def rewrite_terms(state: _State) -> dict[str, Any]:
         reply = await gateway.structured(
@@ -85,20 +123,109 @@ async def run_medical_review(
             claim_id=claim_id,
             purpose=REWRITE_PURPOSE,
         )
-        terms = [t.strip() for item in reply.items for t in item.index_terms if t.strip()]
-        return {"terms": list(dict.fromkeys(terms))}
+        return {"terms": [_queries(item) for item in reply.items if item.main_term.strip()]}
 
     async def lookup(state: _State) -> dict[str, Any]:
         codes: list[str] = []
-        for term in state["terms"]:
-            hits = await ledger.search_icd_index(term)
-            codes.extend(h.code for h in hits if h.code)
-        candidates = []
+        searched: set[tuple[str, IndexName]] = set()
+        for main, queries, index in state["terms"]:
+            found: list[str] = []
+            for query in [*queries, main]:
+                if (query.lower(), index) in searched:
+                    continue
+                if query == main and found:
+                    break  # the main term alone only when nothing more specific matched
+                searched.add((query.lower(), index))
+                hits = await ledger.search_icd_index(query, index)
+                found += [index_code(h.code) for h in hits if h.code]
+            codes += found
+        candidates: list[IcdTabularEntry] = []
         for code in dict.fromkeys(codes):
             entry = await ledger.get_icd_tabular(code)
-            if entry is not None:
-                candidates.append(entry)
-        return {"candidates": candidates}
+            if entry is None:
+                continue
+            candidates.append(entry)
+            if not entry.billable:
+                candidates += await _billable_below(entry)
+        unique_candidates = list({c.code.code: c for c in candidates}.values())
+        return {"candidates": unique_candidates}
+
+    async def _billable_below(entry: IcdTabularEntry) -> list[IcdTabularEntry]:
+        """Billable codes below a code that is not billable, breadth first, up to MAX_BELOW.
+        Each is a tabular lookup, so each is in the ledger."""
+        found: list[IcdTabularEntry] = []
+        queue = list(entry.children)
+        while queue and len(found) < MAX_BELOW:
+            child = await ledger.get_icd_tabular(queue.pop(0))
+            if child is None:
+                continue
+            if child.billable:
+                found.append(child)
+            else:
+                queue += child.children
+        return found
+
+    async def code_procedures(state: _State) -> dict[str, Any]:
+        coded: list[VerifiedProcedure] = []
+        dropped: list[DroppedItem] = []
+        phrases = list({p.text.strip().lower(): p for p in state["case"].procedures}.values())
+        for procedure in phrases[:MAX_PROCEDURES]:
+            outcome = await _build_pcs(procedure)
+            if isinstance(outcome, VerifiedProcedure):
+                coded.append(outcome)
+            elif outcome is not None:
+                dropped.append(DroppedItem(item="procedure", detail=procedure.text, reason=outcome))
+        return {"procedure_codes": coded, "procedure_dropped": dropped}
+
+    async def _build_pcs(procedure: CaseFact) -> VerifiedProcedure | str | None:
+        """The procedure's PCS code, or why there is none (None when no PCS tables are
+        loaded)."""
+        documented = [f.text for f in case.facts if f.kind == "procedure"]
+        steps: list[PcsStep] = []
+        built: list[tuple[PcsOption, str]] = []
+        prefix = ""
+        while len(prefix) < PCS_LENGTH:
+            options, call = await ledger.pcs_options(prefix)
+            if not options:
+                return None if not prefix else f"no PCS table continues {prefix}"
+            first = not prefix
+            if len(options) == 1 and not first:
+                chosen, by = options[0], "code"
+            else:
+                reply = await gateway.structured(
+                    ModelRole.REASONING,
+                    pcs_step_messages(procedure.text, documented, built, options),
+                    pcs_step_schema(options, may_stop=first),
+                    claim_id=claim_id,
+                    purpose=PCS_PURPOSE,
+                )
+                if reply.value == NO_PROCEDURE:
+                    return "no procedure was performed"
+                chosen = next(o for o in options if pcs_choice(o) == reply.value)
+                by = "model"
+            steps.append(
+                PcsStep(
+                    position=chosen.position,
+                    prefix=prefix,
+                    value=chosen.value,
+                    label=chosen.label,
+                    lookup_call_id=call.call_id,
+                    chosen_by=by,
+                )
+            )
+            built.append((chosen, by))
+            prefix += chosen.value
+        valid, check = await ledger.pcs_validate(prefix)
+        if not valid:  # cannot happen when every step came from pcs_options
+            return f"{prefix} failed pcs_validate"
+        entry = await ledger.get_icd_tabular(prefix, system=ICD10PCS)
+        return VerifiedProcedure(
+            code=entry.code if entry else Code(system=ICD10PCS, version="", code=prefix),
+            phrase=procedure.text,
+            steps=steps,
+            validate_call_id=check.call_id,
+            citations=[Citation(page=procedure.source)] if procedure.source else [],
+        )
 
     async def choose_codes(state: _State) -> dict[str, Any]:
         reply = await gateway.structured(
@@ -206,7 +333,7 @@ async def run_medical_review(
             "verified_codes": verified,
             "findings": findings,
             "query_items": requests,
-            "dropped": [item for item, _ in rejected],
+            "dropped": [*state.get("procedure_dropped", []), *(item for item, _ in rejected)],
         }
 
     def after_validate(state: _State) -> str:
@@ -236,6 +363,7 @@ async def run_medical_review(
     graph = StateGraph(_State)
     graph.add_node("rewrite_terms", rewrite_terms)
     graph.add_node("lookup", lookup)
+    graph.add_node("code_procedures", code_procedures)
     graph.add_node("choose_codes", choose_codes)
     graph.add_node("hospital_codes", hospital_codes)
     graph.add_node("length_of_stay", stay)
@@ -243,7 +371,8 @@ async def run_medical_review(
     graph.add_node("validate", validate)
     graph.add_edge(START, "rewrite_terms")
     graph.add_edge("rewrite_terms", "lookup")
-    graph.add_edge("lookup", "choose_codes")
+    graph.add_edge("lookup", "code_procedures")
+    graph.add_edge("code_procedures", "choose_codes")
     graph.add_edge("choose_codes", "hospital_codes")
     graph.add_edge("hospital_codes", "length_of_stay")
     graph.add_edge("length_of_stay", "pre_existing")
@@ -253,6 +382,7 @@ async def run_medical_review(
     final = await graph.compile().ainvoke({"case": case})
     return MedicalGraphResult(
         verified_codes=final["verified_codes"],
+        procedure_codes=final.get("procedure_codes", []),
         findings=final["findings"],
         query_items=final["query_items"],
         lookups=list(ledger.calls),

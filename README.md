@@ -62,7 +62,20 @@ curl -k -H 'X-User-Id: 00000000-0000-4000-8000-000000000003' https://localhost/a
 The compose file sets the project name `claims-pilot`. Do not pass `-p`: another
 project name starts a second stack with its own containers and volumes.
 
-Both seeds are idempotent. Phase 1 has no real auth: the `X-User-Id` header picks a
+Load the ICD-10-CM and ICD-10-PCS FY2027 release (the four CMS archives, kept in the
+gitignored `.local/kb_sources/icd-2027/`). The archives are mounted read-only into a one-off
+app container; they are never part of the image. Each load replaces that code set in one
+transaction and prints file hashes, row counts, checks and a 20-row spot check:
+
+```bash
+for system in icd10cm icd10pcs; do
+  docker compose -f deploy/docker-compose.yml run --rm --no-deps \
+    -v "$PWD/.local/kb_sources/icd-2027:/kb_sources/icd-2027:ro" \
+    app python -m app.knowledge.load "$system" --source-dir /kb_sources/icd-2027
+done
+```
+
+Both seeds and both loads are idempotent. Phase 1 has no real auth: the `X-User-Id` header picks a
 seeded user (IDs in `backend/app/shared/seed_ids.py`): `...0001` member, `...0002`
 hospital, `...0003` ops, `...0004` doctor (approver up to Rs 1 lakh, CRC), `...0005`
 finance, `...0006` senior approver (no limit).

@@ -1,10 +1,12 @@
 """Seed the claims database: Phase 1 users, mock hospitals, document checklists, policy
-clauses, non-payable items and the ICD-10-CM fixture slice.
+clauses and non-payable items.
+
+ICD codes are not seeded: the full CMS release is loaded with python -m app.knowledge.load.
+The hand-made ICD-10-CM fixture (seed_icd_fixture) is for unit tests only.
 
 Idempotent: rows are merged by primary key or natural key (checklists by request type and
-document type, clauses by product and clause, non-payable items by list and number, ICD
-tabular rows by code). ICD index rows have no natural key, so the fixture's index rows are
-replaced as a set. Running it twice changes nothing.
+document type, clauses by product and clause, non-payable items by list and number).
+Running it twice changes nothing.
 Run inside the app container: python -m app.database.seed
 """
 
@@ -13,24 +15,19 @@ from datetime import date
 from decimal import Decimal
 from typing import TypeVar
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings
 from app.database.models import (
     DocumentChecklistRow,
     HospitalRow,
-    IcdIndexRow,
-    IcdTabularRow,
     NonPayableItemRow,
     PolicyClauseRow,
     UserRoleRow,
     UserRow,
 )
-from app.database.seed_icd_fixture import INDEX as ICD_INDEX
-from app.database.seed_icd_fixture import TABULAR as ICD_TABULAR
 from app.database.seed_knowledge import NON_PAYABLE_ITEMS, POLICY_CLAUSES
-from app.services.knowledge_base.contract import ICD10CM, ICD10CM_FIXTURE_VERSION
 from app.shared.seed_ids import (
     DOCTOR_USER_ID,
     FINANCE_USER_ID,
@@ -147,7 +144,6 @@ async def seed_claims_db(sessions: async_sessionmaker[AsyncSession]) -> None:
         await _seed_checklist(session, RequestType.REIMBURSEMENT, REIMBURSEMENT_CHECKLIST)
         await _seed_clauses(session)
         await _seed_non_payable(session)
-        await _seed_icd_fixture(session)
 
 
 async def _seed_clauses(session: AsyncSession) -> None:
@@ -178,43 +174,6 @@ async def _seed_non_payable(session: AsyncSession) -> None:
         row.item, row.category, row.condition = item, category, condition
         row.source, row.source_version = FIXTURE, SOURCE_VERSION
         session.add(row)
-
-
-async def _seed_icd_fixture(session: AsyncSession) -> None:
-    existing = {
-        row.code: row
-        for row in await session.scalars(
-            select(IcdTabularRow).where(
-                IcdTabularRow.system == ICD10CM, IcdTabularRow.version == ICD10CM_FIXTURE_VERSION
-            )
-        )
-    }
-    for code, title, billable, notes in ICD_TABULAR:
-        row = existing.get(code) or IcdTabularRow(
-            system=ICD10CM, version=ICD10CM_FIXTURE_VERSION, code=code
-        )
-        row.title, row.billable, row.notes = title, billable, notes
-        row.source, row.source_version = FIXTURE, SOURCE_VERSION
-        session.add(row)
-    await session.execute(
-        delete(IcdIndexRow).where(
-            IcdIndexRow.system == ICD10CM,
-            IcdIndexRow.version == ICD10CM_FIXTURE_VERSION,
-            IcdIndexRow.source == FIXTURE,
-        )
-    )
-    session.add_all(
-        IcdIndexRow(
-            system=ICD10CM,
-            version=ICD10CM_FIXTURE_VERSION,
-            term=term,
-            path=path,
-            code=code,
-            source=FIXTURE,
-            source_version=SOURCE_VERSION,
-        )
-        for term, path, code in ICD_INDEX
-    )
 
 
 async def _seed_checklist(
@@ -255,8 +214,7 @@ async def main() -> None:
     print(
         f"Seeded {len(USERS)} users, {len(ROLES)} roles, {len(HOSPITALS)} hospitals, "
         f"{len(REIMBURSEMENT_CHECKLIST)} reimbursement checklist items, "
-        f"{len(POLICY_CLAUSES)} policy clauses, {len(NON_PAYABLE_ITEMS)} non-payable items, "
-        f"{len(ICD_TABULAR)} ICD-10-CM fixture codes, {len(ICD_INDEX)} ICD index rows"
+        f"{len(POLICY_CLAUSES)} policy clauses, {len(NON_PAYABLE_ITEMS)} non-payable items"
     )
 
 

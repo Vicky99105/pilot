@@ -15,13 +15,20 @@ from pydantic import BaseModel, Field, WithJsonSchema, create_model
 
 from app.agents.medical_case import CaseFile
 from app.services.adjudication.contract import Decision
-from app.services.knowledge_base.contract import IcdTabularEntry, PolicyClause
+from app.services.knowledge_base.contract import (
+    IcdTabularEntry,
+    IndexName,
+    PcsOption,
+    PolicyClause,
+)
 from app.services.medical_review.contract import CLAUSE_PREFIX, ICD_PREFIX, Citation, Severity
 from app.services.model_gateway.contract import Message
 from app.shared.types import PageRef
 
 REWRITE_PURPOSE = "medical_rewrite_terms"
 CHOOSE_PURPOSE = "medical_choose_codes"
+PCS_PURPOSE = "medical_pcs_step"
+NO_PROCEDURE = "none: no procedure was performed"
 DECIDE_PURPOSE = "adjudication_decide"
 PAGE_PREFIX = "page:"
 
@@ -81,8 +88,13 @@ def citation_keys(case: CaseFile, candidates: list[IcdTabularEntry]) -> list[str
 
 
 class TermRewrite(BaseModel):
+    """One diagnosis as the Alphabetic Index reads it. Code builds the searches: the main
+    term with all modifiers, then with each modifier, then alone if nothing matched."""
+
     phrase: str  # the diagnosis as written
-    index_terms: list[str]  # main term first, then modifiers, e.g. "appendicitis acute"
+    main_term: str  # the condition noun, e.g. "appendicitis"
+    modifiers: list[str] = []  # the words that qualify it, e.g. ["acute", "suppurative"]
+    index: IndexName = "diseases"  # the index or table the terms are looked up in
 
 
 class TermRewriteReply(BaseModel):
@@ -170,9 +182,11 @@ def rewrite_messages(case: CaseFile) -> list[Message]:
             role="system",
             content=(
                 "You prepare ICD-10-CM Alphabetic Index searches for a medical coder. For each "
-                "diagnosis phrase, give one to three index terms: the main term (the condition "
-                "noun, such as 'appendicitis') followed by the modifiers written in the phrase, "
-                "in American spelling (localized, not localised)."
+                "diagnosis phrase, give the main term (the condition noun, such as "
+                "'appendicitis') and the modifiers written in the phrase, in American spelling "
+                "(localized, not localised). Set index to the drug, "
+                "neoplasm or external cause table when the phrase is a poisoning or drug "
+                "effect, a neoplasm, or the cause of an injury."
             ),
         ),
         Message(role="user", content=f"Diagnosis phrases:\n{_json(phrases)}"),
@@ -223,6 +237,62 @@ def choose_messages(
             )
         )
     return messages
+
+
+# --- Medical review: ICD-10-PCS builder ---------------------------------------------------
+
+
+class PcsStepReply(BaseModel):
+    value: str  # "<character>: <label>", one of the options
+
+
+def pcs_choice(option: PcsOption) -> str:
+    return f"{option.value}: {option.label}"
+
+
+def pcs_step_schema(options: list[PcsOption], *, may_stop: bool) -> type[PcsStepReply]:
+    """The reply for one step: exactly the valid values for the next character, and the
+    stop value only when the step may say that no procedure was performed."""
+    values = [pcs_choice(o) for o in options] + ([NO_PROCEDURE] if may_stop else [])
+    return closed_schema(PcsStepReply, "PcsStepReply", value=(one_of(values), ...))
+
+
+def pcs_step_messages(
+    phrase: str,
+    facts: list[str],
+    built: list[tuple[PcsOption, str]],
+    options: list[PcsOption],
+) -> list[Message]:
+    """built: the options already taken, each with how it was chosen."""
+    nxt = options[0]
+    view = {
+        "procedure": phrase,
+        "documented": facts,
+        "code_so_far": [
+            {"position": o.position, "axis": o.axis, "value": pcs_choice(o)} for o, _ in built
+        ],
+        "next": {"position": nxt.position, "axis": nxt.axis},
+        "options": [
+            {
+                "value": pcs_choice(o),
+                **({"definition": o.definition} if o.definition else {}),
+                **({"explanation": o.explanation} if o.explanation else {}),
+                **({"includes": o.includes} if o.includes else {}),
+            }
+            for o in options
+        ],
+    }
+    return [
+        Message(
+            role="system",
+            content=(
+                "You build an ICD-10-PCS code for one procedure, one character at a time. "
+                "Choose the option for the next character that the documented procedure "
+                "supports."
+            ),
+        ),
+        Message(role="user", content=_json(view)),
+    ]
 
 
 # --- Adjudication ---------------------------------------------------------------------------

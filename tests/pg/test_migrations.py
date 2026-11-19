@@ -36,7 +36,7 @@ def test_upgrade_from_empty_then_downgrade_to_base_then_upgrade_again(
 
     command.upgrade(config, "head")
     assert model_tables <= _tables(empty_database)
-    assert "ix_icd_index_path_trgm" in _indexes(empty_database)
+    assert "ix_icd_index_search_trgm" in _indexes(empty_database)
 
     command.downgrade(config, "base")
     assert _tables(empty_database) <= {"alembic_version"}

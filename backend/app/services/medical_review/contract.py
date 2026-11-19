@@ -1,9 +1,12 @@
 """Contract for medical review: verify the diagnosis codes against the knowledge base, check
 the clinical facts, and re-run the eligibility rule the verified facts can change (R5).
 
-Two guarantees hold for every MedicalFindings:
+These guarantees hold for every MedicalFindings:
 - Every verified code was returned by a knowledge-base lookup during the run that produced
   it, and names that lookup.
+- Every procedure code was built one character at a time, each character chosen from the
+  values a pcs_options lookup gave for the code built so far, and the full code passed
+  pcs_validate. Each step names its lookup.
 - Every finding cites a page of the claim or a clause or ICD reference. Uncited items go back
   to the model once, then are dropped with the reason recorded.
 - Every query item names one of MEDICAL_DOCUMENTS that the claim does not hold and the
@@ -24,7 +27,7 @@ Severity = Literal["info", "query", "adverse"]
 FindingKind = Literal[
     "coding", "hospital_codes", "length_of_stay", "pre_existing", "eligibility", "clinical"
 ]
-LookupTool = Literal["search_icd_index", "get_icd_tabular"]
+LookupTool = Literal["search_icd_index", "get_icd_tabular", "pcs_options", "pcs_validate"]
 
 # The documents medical review may ask the claimant for. A query item also excludes any of
 # these the claim already holds or the claimant already answered.
@@ -60,6 +63,23 @@ class VerifiedCode(BaseModel):
     rationale: str
 
 
+class PcsStep(BaseModel):
+    position: int  # 1 to 7
+    prefix: str  # the code built before this step
+    value: str  # the character chosen
+    label: str
+    lookup_call_id: int  # the pcs_options call that offered the value
+    chosen_by: Literal["code", "model"]  # code when only one value was valid
+
+
+class VerifiedProcedure(BaseModel):
+    code: Code  # ICD-10-PCS
+    phrase: str  # the procedure as written in the claim
+    steps: list[PcsStep]
+    validate_call_id: int  # the pcs_validate call that accepted the code
+    citations: list[Citation]
+
+
 class Finding(BaseModel):
     finding_id: int = 0  # 1-based within the record; the service numbers the findings
     kind: FindingKind
@@ -73,8 +93,8 @@ class Finding(BaseModel):
 
 
 class DroppedItem(BaseModel):
-    item: Literal["code", "finding", "query_item"]
-    detail: str  # the code, the finding text, or the query item
+    item: Literal["code", "finding", "query_item", "procedure"]
+    detail: str  # the code, the finding text, the query item, or the procedure
     reason: str
 
 
@@ -90,6 +110,7 @@ class MedicalFindings(BaseModel):
     digitisation_version: int  # the ClaimRecord version reviewed
     registration_version: int  # the RegistrationResult version used
     verified_codes: list[VerifiedCode]
+    procedure_codes: list[VerifiedProcedure] = []
     findings: list[Finding]
     query_items: list[DocumentRequest]  # the documents to ask the claimant for
     rule_results: list[RuleResult]  # eligibility rules re-run on the verified facts

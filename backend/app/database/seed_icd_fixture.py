@@ -8,9 +8,18 @@ because their fifth and sixth characters changed across recent releases.
 The index rows are our own simplified main term and sub-term paths pointing at those codes,
 not a copy of the CMS Alphabetic Index. The notes are short summaries in our own words.
 
-The full CMS index and tabular load is Phase 2, pending download approval. Rows are marked
-source="fixture" so that load can replace them.
+For unit tests only: the running system loads the full CMS release (app.knowledge.load),
+which removes any rows marked source="fixture".
 """
+
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.database.models import IcdIndexRow, IcdTabularRow
+from app.services.knowledge_base.contract import ICD10CM, ICD10CM_FIXTURE_VERSION
+
+FIXTURE = "fixture"
+FIXTURE_SOURCE_VERSION = "2026-11-19"
 
 # (code, title, billable, notes). notes keys: includes, excludes1, excludes2, code_first,
 # use_additional.
@@ -163,3 +172,46 @@ INDEX: list[tuple[str, str, str]] = [
     ("Long-term drug therapy", "Long-term drug therapy > insulin", "Z79.4"),
     ("Long-term drug therapy", "Long-term drug therapy > oral hypoglycemic", "Z79.84"),
 ]
+
+
+async def seed_icd_fixture(sessions: async_sessionmaker[AsyncSession]) -> None:
+    """Write the fixture codes and index rows. Idempotent: tabular rows are merged by code
+    and the fixture's index rows are replaced as a set."""
+    async with sessions.begin() as session:
+        existing = {
+            row.code: row
+            for row in await session.scalars(
+                select(IcdTabularRow).where(
+                    IcdTabularRow.system == ICD10CM,
+                    IcdTabularRow.version == ICD10CM_FIXTURE_VERSION,
+                )
+            )
+        }
+        for code, title, billable, notes in TABULAR:
+            row = existing.get(code) or IcdTabularRow(
+                system=ICD10CM, version=ICD10CM_FIXTURE_VERSION, code=code
+            )
+            row.title, row.billable, row.notes = title, billable, notes
+            row.source, row.source_version = FIXTURE, FIXTURE_SOURCE_VERSION
+            session.add(row)
+        await session.execute(
+            delete(IcdIndexRow).where(
+                IcdIndexRow.system == ICD10CM,
+                IcdIndexRow.version == ICD10CM_FIXTURE_VERSION,
+                IcdIndexRow.source == FIXTURE,
+            )
+        )
+        session.add_all(
+            IcdIndexRow(
+                system=ICD10CM,
+                version=ICD10CM_FIXTURE_VERSION,
+                index_name="diseases",
+                term=term,
+                path=path,
+                search_text=path,
+                code=code,
+                source=FIXTURE,
+                source_version=FIXTURE_SOURCE_VERSION,
+            )
+            for term, path, code in INDEX
+        )

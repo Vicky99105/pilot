@@ -25,6 +25,7 @@ from app.config import Settings
 from app.database.models import ClaimRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
+from app.database.seed_icd_fixture import seed_icd_fixture
 from app.integrations.core.contract import MemberPolicy
 from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
@@ -64,7 +65,7 @@ from tests.fakes.notifications import FakeNotificationService
 from tests.fakes.tasks import FakeTaskService
 from tests.services.claim_builders import DIAGNOSIS
 from tests.services.test_digitisation import CHEQUE, PART_A, line, section, v
-from tests.services.test_medical_review import APPENDIX_TERM
+from tests.services.test_medical_review import APPENDIX_ITEM
 from tests.services.test_registration import asha_policy
 
 TASK_QUEUE = "test-claims-end-to-end"
@@ -118,7 +119,7 @@ UPLOADS = [
     (DocType.FINAL_BILL, ["FINAL BILL page 1", "FINAL BILL page 2"]),
     (DocType.CANCELLED_CHEQUE, ["CHEQUE"]),
 ]
-REWRITE = {"items": [{"phrase": DIAGNOSIS, "index_terms": [APPENDIX_TERM]}]}
+REWRITE = {"items": [{**APPENDIX_ITEM, "phrase": DIAGNOSIS}]}
 CHOOSE = {
     "codes": [
         {
@@ -282,6 +283,7 @@ class Harness:
 @pytest.fixture
 async def harness(sessions: async_sessionmaker[AsyncSession]) -> AsyncIterator[Harness]:
     await seed_claims_db(sessions)
+    await seed_icd_fixture(sessions)
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:

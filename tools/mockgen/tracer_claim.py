@@ -479,6 +479,8 @@ def ground_truth(claim: TracerClaim, rules: RulesEngine, files: dict[str, Any]) 
                 "query_items": ["payment receipt"],
                 "final_draft": "partial",
                 "icd_family": "K35",
+                # Resection of the appendix; the approach and qualifier are the builder's call.
+                "pcs_family": "0DTJ",
                 "letters": ["query", "partial"],
                 "approver_band": "approver" if sheet["payable"] <= 100000 else "senior_approver",
                 "crc_required": True,

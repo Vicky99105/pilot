@@ -300,32 +300,47 @@ class ModelCallRow(Base):
 
 
 class IcdIndexRow(Base):
+    """One entry of an ICD-10-CM alphabetic index: the disease index, the external cause
+    index, or one cell of the drug or neoplasm table."""
+
     __tablename__ = "icd_index"
     __table_args__ = (
         Index("ix_icd_index_term", "system", "version", "term"),
-        # Trigram index for ILIKE '%word%' search on Postgres (pg_trgm, migration 0005).
+        # Trigram index for ILIKE '%word%' search on Postgres (pg_trgm).
         Index(
-            "ix_icd_index_path_trgm",
-            "path",
+            "ix_icd_index_search_trgm",
+            "search_text",
             postgresql_using="gin",
-            postgresql_ops={"path": "gin_trgm_ops"},
+            postgresql_ops={"search_text": "gin_trgm_ops"},
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     system: Mapped[str] = mapped_column(String(30))
     version: Mapped[str] = mapped_column(String(20))
+    # diseases, external_causes, drugs or neoplasms
+    index_name: Mapped[str] = mapped_column(String(20), default="diseases")
     term: Mapped[str] = mapped_column(Text)
     path: Mapped[str] = mapped_column(Text)  # full index path, e.g. "Pneumonia > lobar"
-    code: Mapped[str | None] = mapped_column(String(10))
+    # The path plus every nonessential modifier along it; the column search runs on.
+    search_text: Mapped[str] = mapped_column(Text, default="")
+    table_column: Mapped[str | None] = mapped_column(Text)  # drug and neoplasm tables only
+    code: Mapped[str | None] = mapped_column(String(10))  # as written, e.g. "H93.29-"
+    manifestation: Mapped[str | None] = mapped_column(Text)
     see: Mapped[str | None] = mapped_column(Text)
+    see_also: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))
 
 
 class IcdTabularRow(Base):
+    """One code of a code set (ICD-10-CM or ICD-10-PCS) with its title and notes."""
+
     __tablename__ = "icd_tabular"
-    __table_args__ = (UniqueConstraint("system", "version", "code"),)
+    __table_args__ = (
+        UniqueConstraint("system", "version", "code"),
+        Index("ix_icd_tabular_parent", "system", "version", "parent"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     system: Mapped[str] = mapped_column(String(30))
@@ -334,6 +349,84 @@ class IcdTabularRow(Base):
     title: Mapped[str] = mapped_column(Text)
     billable: Mapped[bool] = mapped_column(Boolean)
     notes: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict)  # includes, excludes
+    parent: Mapped[str | None] = mapped_column(String(10))  # the next shorter code
+    chapter: Mapped[str | None] = mapped_column(Text)
+    section: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class KbSourceLoadRow(Base):
+    """One source file loaded into the knowledge base: what it was, its hash, and the code
+    version it carries with the dates that version is in force."""
+
+    __tablename__ = "kb_source_loads"
+    __table_args__ = (Index("ix_kb_source_loads_system", "system", "version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    system: Mapped[str] = mapped_column(String(30))
+    version: Mapped[str] = mapped_column(String(20))
+    effective_from: Mapped[date] = mapped_column(Date)
+    effective_to: Mapped[date] = mapped_column(Date)
+    file_name: Mapped[str] = mapped_column(Text)  # the downloaded archive
+    member: Mapped[str] = mapped_column(Text)  # the file inside it
+    sha256: Mapped[str] = mapped_column(String(64))  # of the downloaded archive
+    rows: Mapped[int] = mapped_column(Integer)
+    loaded_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class PcsTableRow(Base):
+    """One ICD-10-PCS table: the first three characters and their labels."""
+
+    __tablename__ = "pcs_tables"
+    __table_args__ = (UniqueConstraint("system", "version", "code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    system: Mapped[str] = mapped_column(String(30))
+    version: Mapped[str] = mapped_column(String(20))
+    code: Mapped[str] = mapped_column(String(3))  # e.g. "0DT"
+    # [[axis title, character, label], ...] for positions 1 to 3
+    axes: Mapped[list[Any]] = mapped_column(JsonType)
+    operation_definition: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class PcsRowRow(Base):
+    """One row of a PCS table: every combination of its positions 4 to 7 values is a valid
+    code."""
+
+    __tablename__ = "pcs_rows"
+    __table_args__ = (Index("ix_pcs_rows_table", "system", "version", "table_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    system: Mapped[str] = mapped_column(String(30))
+    version: Mapped[str] = mapped_column(String(20))
+    table_code: Mapped[str] = mapped_column(String(3))
+    row_number: Mapped[int] = mapped_column(Integer)  # 1-based within the table
+    # [[axis title, [[character, label], ...]], ...] for positions 4 to 7
+    axes: Mapped[list[Any]] = mapped_column(JsonType)
+    codes: Mapped[int] = mapped_column(Integer)  # how many codes the row makes
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class PcsDefinitionRow(Base):
+    """A PCS definition: the meaning of one value of one axis within a section."""
+
+    __tablename__ = "pcs_definitions"
+    __table_args__ = (Index("ix_pcs_definitions_axis", "system", "version", "section", "pos"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    system: Mapped[str] = mapped_column(String(30))
+    version: Mapped[str] = mapped_column(String(20))
+    section: Mapped[str] = mapped_column(String(1))
+    pos: Mapped[int] = mapped_column(Integer)
+    axis: Mapped[str] = mapped_column(Text)  # e.g. "Operation", "Approach"
+    label: Mapped[str] = mapped_column(Text)  # the value's label, e.g. "Resection"
+    definition: Mapped[str | None] = mapped_column(Text)
+    explanation: Mapped[str | None] = mapped_column(Text)
+    includes: Mapped[list[str]] = mapped_column(JsonType, default=list)
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))
 

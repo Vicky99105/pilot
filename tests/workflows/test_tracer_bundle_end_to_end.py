@@ -20,6 +20,7 @@ from temporalio.testing import WorkflowEnvironment
 
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
+from app.database.seed_icd_fixture import seed_icd_fixture
 from app.services.intake.contract import ClaimForm, SubmissionInput, UploadedFile
 from app.shared.seed_ids import DOCTOR_USER_ID, FINANCE_USER_ID, MEMBER_USER_ID, OPS_USER_ID
 from app.shared.types import DocType, RequestType, Stage
@@ -117,7 +118,9 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
         "bank_name": v(gen.BANK),
     }
     labels = [{"doc_type": d, "confidence": 0.96} for d in truth["files"]["merged_pages"]]
-    rewrite = {"items": [{"phrase": gen.DIAGNOSIS, "index_terms": ["appendicitis acute"]}]}
+    rewrite = {
+        "items": [{"phrase": gen.DIAGNOSIS, "main_term": "appendicitis", "modifiers": ["acute"]}]
+    }
     choose = {
         "codes": [
             {
@@ -167,6 +170,7 @@ async def run(
 ) -> AsyncIterator[tuple[Harness, dict[str, Any], Path]]:
     truth = gen.generate(tmp_path, ADMITTED)
     await seed_claims_db(sessions)
+    await seed_icd_fixture(sessions)
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:

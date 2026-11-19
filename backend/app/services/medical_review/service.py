@@ -110,6 +110,7 @@ class DefaultMedicalReviewService:
             digitisation_version=digitised.version,
             registration_version=registered.version,
             verified_codes=result["verified_codes"],
+            procedure_codes=result["procedure_codes"],
             findings=findings,
             query_items=query_items,
             rule_results=rule_results,
@@ -220,6 +221,11 @@ def _case_file(record: ClaimRecord, policy: MemberPolicy, clause_refs: list[str]
     ]
     seen = {d.text.strip().lower() for d in diagnoses}
     diagnoses += [f for f in facts if f.kind == "diagnosis" and f.text.strip().lower() not in seen]
+    procedures = [
+        CaseFact(kind="procedure", text=p.value, source=p.source)
+        for p in clinical.procedures
+        if p.value
+    ] or [f for f in facts if f.kind == "procedure"]
     admission = record.admission
     date_sources = [
         s for s in (admission.admission_date.source, admission.discharge_date.source) if s
@@ -232,6 +238,7 @@ def _case_file(record: ClaimRecord, policy: MemberPolicy, clause_refs: list[str]
     pages += [PageRef(document_id=doc, page=1) for doc in record.documents.values()]
     return CaseFile(
         diagnoses=diagnoses,
+        procedures=unique(procedures),
         facts=facts,
         hospital_codes=clinical.hospital_codes,
         admission_date=admission.admission_date.value,

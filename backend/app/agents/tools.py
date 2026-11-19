@@ -1,6 +1,7 @@
 """Read-only tools the agents use. Each tool records what it returned, so validators can
 check that the model only used what a tool gave it."""
 
+from datetime import date
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -8,9 +9,12 @@ from pydantic import BaseModel
 
 from app.database.repositories.stage_records import StageRecordRepository
 from app.services.knowledge_base.contract import (
+    ICD10CM,
     IcdIndexHit,
     IcdTabularEntry,
+    IndexName,
     KnowledgeBase,
+    PcsOption,
     PolicyClause,
 )
 from app.services.medical_review.contract import LookupCall
@@ -19,28 +23,46 @@ from app.shared.types import Stage
 # --- Medical review: ICD lookups --------------------------------------------------------
 
 
+def index_code(code: str) -> str:
+    """An index code as a tabular code: "K35.89-" becomes "K35.89"."""
+    return code.strip().upper().rstrip("-").rstrip(".")
+
+
 class IcdLookupLedger:
     """Wraps the knowledge base for one run and records every call and the codes it
-    returned. Only codes in the ledger may be submitted."""
+    returned. Only codes in the ledger may be submitted. Every lookup reads the code version
+    in force on as_of, the claim's admission date."""
 
-    def __init__(self, kb: KnowledgeBase) -> None:
+    def __init__(self, kb: KnowledgeBase, *, as_of: date | None = None) -> None:
         self._kb = kb
+        self._as_of = as_of
         self.calls: list[LookupCall] = []
-        self._tabular: dict[str, IcdTabularEntry | None] = {}
+        self._tabular: dict[tuple[str, str], IcdTabularEntry | None] = {}
 
-    async def search_icd_index(self, term: str) -> list[IcdIndexHit]:
-        hits = await self._kb.search_icd_index(term)
-        codes = list(dict.fromkeys(h.code for h in hits if h.code))
+    async def search_icd_index(self, term: str, index: IndexName = "diseases") -> list[IcdIndexHit]:
+        hits = await self._kb.search_icd_index(term, index, as_of=self._as_of)
+        codes = list(dict.fromkeys(index_code(h.code) for h in hits if h.code))
         self._record("search_icd_index", term, codes)
         return hits
 
-    async def get_icd_tabular(self, code: str) -> IcdTabularEntry | None:
+    async def get_icd_tabular(self, code: str, *, system: str = ICD10CM) -> IcdTabularEntry | None:
+        """The entry, recorded as returning the code and the codes one level below it."""
         key = code.strip().upper()
-        if key not in self._tabular:
-            entry = await self._kb.get_icd_tabular(key)
-            self._tabular[key] = entry
-            self._record("get_icd_tabular", key, [entry.code.code] if entry else [])
-        return self._tabular[key]
+        if (system, key) not in self._tabular:
+            entry = await self._kb.get_icd_tabular(key, system=system, as_of=self._as_of)
+            self._tabular[(system, key)] = entry
+            returned = [entry.code.code, *entry.children] if entry else []
+            self._record("get_icd_tabular", key, returned)
+        return self._tabular[(system, key)]
+
+    async def pcs_options(self, prefix: str) -> tuple[list[PcsOption], LookupCall]:
+        options = await self._kb.pcs_options(prefix, as_of=self._as_of)
+        call = self._record("pcs_options", prefix, [prefix + o.value for o in options])
+        return options, call
+
+    async def pcs_validate(self, code: str) -> tuple[bool, LookupCall]:
+        valid = await self._kb.pcs_validate(code, as_of=self._as_of)
+        return valid, self._record("pcs_validate", code, [code] if valid else [])
 
     def returned_by(self, code: str) -> LookupCall | None:
         """The first call that returned the code, preferring an index search."""
@@ -50,16 +72,16 @@ class IcdLookupLedger:
         first = searches or found
         return first[0] if first else None
 
-    def tabular(self, code: str) -> IcdTabularEntry | None:
+    def tabular(self, code: str, *, system: str = ICD10CM) -> IcdTabularEntry | None:
         """A tabular entry already fetched in this run; never a new lookup."""
-        return self._tabular.get(code.strip().upper())
+        return self._tabular.get((system, code.strip().upper()))
 
-    def _record(self, tool: Any, argument: str, codes: list[str]) -> None:
-        self.calls.append(
-            LookupCall(
-                call_id=len(self.calls) + 1, tool=tool, argument=argument, returned_codes=codes
-            )
+    def _record(self, tool: Any, argument: str, codes: list[str]) -> LookupCall:
+        call = LookupCall(
+            call_id=len(self.calls) + 1, tool=tool, argument=argument, returned_codes=codes
         )
+        self.calls.append(call)
+        return call
 
 
 # --- Adjudication: clauses and stage results --------------------------------------------

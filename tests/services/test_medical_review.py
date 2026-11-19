@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
+from app.database.seed_icd_fixture import seed_icd_fixture
 from app.services.knowledge_base.service import DefaultKnowledgeBase
 from app.services.medical_review.contract import (
     Citation,
@@ -41,7 +42,13 @@ from tests.services.claim_builders import (
 from tests.services.test_registration import asha_policy
 
 APPENDIX_TERM = "appendicitis acute perforation localized peritonitis"
-REWRITE = {"items": [{"phrase": DIAGNOSIS, "index_terms": [APPENDIX_TERM]}]}
+# The first query the graph builds from this item is APPENDIX_TERM.
+APPENDIX_ITEM = {
+    "phrase": DIAGNOSIS,
+    "main_term": "appendicitis",
+    "modifiers": ["acute", "perforation", "localized peritonitis"],
+}
+REWRITE = {"items": [APPENDIX_ITEM]}
 
 
 def cite(n: int) -> str:
@@ -104,6 +111,7 @@ class Env:
 @pytest.fixture
 async def env(sessions: async_sessionmaker[AsyncSession]) -> Env:
     await seed_claims_db(sessions)
+    await seed_icd_fixture(sessions)
     return Env(sessions, FakePolicyService([asha_policy()]))
 
 
@@ -197,8 +205,8 @@ async def test_a_history_older_than_the_policy_is_an_adverse_pre_existing_findin
     claim_id = await env.claim(ClaimSpec(clinical=appendicitis(diabetes)))
     rewrite = {
         "items": [
-            {"phrase": DIAGNOSIS, "index_terms": [APPENDIX_TERM]},
-            {"phrase": diabetes.text, "index_terms": ["diabetes type 2"]},
+            APPENDIX_ITEM,
+            {"phrase": diabetes.text, "main_term": "diabetes", "modifiers": ["type 2"]},
         ]
     }
     e11 = {"code": "E11.9", "phrase": diabetes.text, "citations": [cite(1)], "rationale": "T2DM"}

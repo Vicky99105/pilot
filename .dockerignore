@@ -11,3 +11,5 @@ docs/
 **/.mypy_cache/
 **/.ruff_cache/
 .DS_Store
+# Downloaded sources and acceptance runs: mounted at run time, never built in.
+.local/

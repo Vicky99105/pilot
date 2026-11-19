@@ -284,6 +284,7 @@ class ClaimActivities:
             inp,
             {
                 "verified_codes": [v.code.code for v in findings.verified_codes],
+                "procedure_codes": [p.code.code for p in findings.procedure_codes],
                 "adverse": findings.adverse,
                 "findings": len(findings.findings),
                 "dropped": len(findings.dropped),

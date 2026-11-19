@@ -44,6 +44,7 @@ class CaseFile(BaseModel):
     """Everything the medical review graph may read."""
 
     diagnoses: list[CaseFact]  # each diagnosis phrase as written, with its page
+    procedures: list[CaseFact] = []  # each procedure phrase as written, with its page
     facts: list[CaseFact]  # every page-tagged clinical fact
     hospital_codes: list[Code]  # as the hospital wrote them; unverified
     admission_date: date | None
