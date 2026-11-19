@@ -4,6 +4,7 @@ scan and corrections. Pure functions: no I/O."""
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
@@ -25,18 +26,24 @@ from app.services.digitisation.contract import (
     ClaimRecord,
     Clinical,
     ClinicalFact,
+    EnhancementDetails,
+    EstimateHead,
     HospitalDetails,
     Identity,
     InvalidCorrection,
+    PreAuthDetails,
     SectionTotal,
 )
 from app.services.digitisation.prompts import (
     BillLineReply,
     CancelledChequeReply,
     DischargeSummaryReply,
+    EnhancementReply,
+    EstimateHeadReply,
     Extracted,
     FinalBillReply,
     PartAReply,
+    PreAuthFormReply,
 )
 from app.services.intake.contract import ClaimForm
 from app.shared.types import Code, DocType, Field, PageRef
@@ -96,6 +103,29 @@ def assemble(
     bill = replies.get(DocType.FINAL_BILL)
     if isinstance(bill, FinalBillReply):
         record.bill = _read_bill(bill, docs[DocType.FINAL_BILL])
+    part_c = replies.get(DocType.PREAUTH_FORM)
+    if isinstance(part_c, PreAuthFormReply):
+        _read_part_c(record, part_c, docs[DocType.PREAUTH_FORM])
+    interim = replies.get(DocType.INTERIM_BILL)
+    if isinstance(interim, FinalBillReply):
+        record.interim_bill = _read_bill(interim, docs[DocType.INTERIM_BILL])
+    extra = replies.get(DocType.ENHANCEMENT_REQUEST)
+    if isinstance(extra, EnhancementReply):
+        doc = docs[DocType.ENHANCEMENT_REQUEST]
+        read = _reader(doc)
+        record.enhancements = [
+            EnhancementDetails(
+                document_id=doc.document_id,
+                extra_amount=read(extra.extra_amount),
+                reason=read(extra.reason),
+                extra_days=read(extra.extra_days),
+                revised_discharge_date=read(extra.revised_discharge_date),
+                estimate=_estimate(extra.estimate, doc),
+                interim_bill_total=record.interim_bill.grand_total
+                if isinstance(interim, FinalBillReply)
+                else Field(value=None, confidence=1.0),  # no interim bill came with it
+            )
+        ]
     cheque = replies.get(DocType.CANCELLED_CHEQUE)
     if isinstance(cheque, CancelledChequeReply):
         read = _reader(docs[DocType.CANCELLED_CHEQUE])
@@ -106,6 +136,91 @@ def assemble(
             bank_name=read(cheque.bank_name),
         )
     return record
+
+
+def _estimate(heads: list[EstimateHeadReply], doc: ClassifiedDocument) -> list[EstimateHead]:
+    def cell(h: EstimateHeadReply, value: Any) -> Field[Any]:
+        return Field(
+            value=_money(value), confidence=_clamp(h.confidence), source=_page_ref(doc, h.page)
+        )
+
+    return [
+        EstimateHead(head=cell(h, h.head), days=cell(h, h.days), amount=cell(h, h.amount))
+        for h in heads
+    ]
+
+
+def _read_part_c(record: ClaimRecord, r: PreAuthFormReply, doc: ClassifiedDocument) -> None:
+    """Part C is the source of identity, hospital, admission and clinical on a cashless claim,
+    until the discharge bundle replaces clinical."""
+    read = _reader(doc)
+    record.identity = Identity(
+        patient_name=read(r.patient_name),
+        policy_number=read(r.policy_number),
+        member_id=read(r.member_id),
+        date_of_birth=read(r.date_of_birth),
+        gender=read(r.gender),
+    )
+    record.hospital = HospitalDetails(name=read(r.hospital_name), city=read(r.hospital_city))
+    not_yet: Field[Any] = Field(
+        value=None, confidence=1.0
+    )  # no discharge before the discharge request
+    record.admission = Admission(
+        admission_date=read(r.admission_date),
+        discharge_date=not_yet,
+        accident=read(r.hospitalisation_due_to_injury),
+    )
+    codes = [
+        Code(system="ICD-10", version="as-written", code=r.icd_code_written.value.strip())
+        if r.icd_code_written.value
+        else None,
+        Code(system="ICD-10-PCS", version="as-written", code=r.pcs_code_written.value.strip())
+        if r.pcs_code_written.value
+        else None,
+    ]
+    complaints = r.presenting_complaints
+    record.clinical = Clinical(
+        patient_name=read(r.patient_name),
+        admission_date=read(r.admission_date),
+        discharge_date=not_yet,
+        diagnoses=[read(r.provisional_diagnosis)] if r.provisional_diagnosis.value else [],
+        procedures=[read(r.proposed_treatment)] if r.proposed_treatment.value else [],
+        hospital_codes=[c for c in codes if c is not None],
+        facts=[
+            ClinicalFact(
+                kind="finding",
+                text=complaints.value,
+                confidence=_clamp(complaints.confidence),
+                source=_page_ref(doc, complaints.page),
+            )
+        ]
+        if complaints.value
+        else [],
+    )
+    record.preauth = PreAuthDetails(
+        rohini_id=read(r.rohini_id),
+        treating_doctor=read(r.treating_doctor),
+        doctor_registration_number=read(r.doctor_registration_number),
+        presenting_complaints=read(r.presenting_complaints),
+        provisional_diagnosis=read(r.provisional_diagnosis),
+        icd_code_written=read(r.icd_code_written),
+        proposed_treatment=read(r.proposed_treatment),
+        pcs_code_written=read(r.pcs_code_written),
+        admission_type=read(r.admission_type),
+        expected_stay_days=read(r.expected_stay_days),
+        room_type=read(r.room_type),
+        estimate=_estimate(r.estimate, doc),
+        estimate_total=read(r.estimate_total),
+    )
+
+
+def fill_stay(record: ClaimRecord) -> None:
+    """The discharge summary fills stay dates no form supplied: on a cashless claim Part C
+    has no discharge date, and the summary arrives with the discharge request."""
+    if record.admission.admission_date.value is None:
+        record.admission.admission_date = record.clinical.admission_date
+    if record.admission.discharge_date.value is None:
+        record.admission.discharge_date = record.clinical.discharge_date
 
 
 def _upper(x: Extracted[str]) -> Extracted[str]:
@@ -219,10 +334,18 @@ def _read_bill(r: FinalBillReply, doc: ClassifiedDocument) -> Bill:
 
 
 def failed_checks(
-    record: ClaimRecord, form: ClaimForm | None, held: frozenset[DocType] = frozenset()
+    record: ClaimRecord,
+    form: ClaimForm | None,
+    held: frozenset[DocType] = frozenset(),
+    requested_on: date | None = None,
 ) -> list[CheckResult]:
-    """held: the document types in any of the claim's document sets."""
+    """held: the document types in any of the claim's document sets. requested_on: the day
+    the claim was opened, for the pre-auth date check."""
     results = [
+        _estimate_total(record.preauth),
+        _enhancement_totals(record),
+        _preauth_dates(record, requested_on),
+        _rohini_matches(record, form),
         _section_totals(record.bill),
         _grand_total(record.bill),
         _dates_in_order(record.admission),
@@ -236,6 +359,79 @@ def failed_checks(
         _claimed_matches_bill(record),
     ]
     return [r for r in results if r is not None and not r.passed]
+
+
+def _estimate_total(preauth: PreAuthDetails) -> CheckResult | None:
+    total = preauth.estimate_total.value
+    amounts = [h.amount.value for h in preauth.estimate if h.amount.value is not None]
+    if total is None or not amounts:
+        return None
+    heads = sum(amounts, Decimal("0"))
+    passed = abs(heads - total) <= SUM_TOLERANCE
+    return CheckResult(
+        check_id="preauth_estimate_total",
+        passed=passed,
+        detail=f"estimate heads sum to {heads:.2f}, estimate total {total:.2f}",
+        fields=[] if passed else ["preauth.estimate_total"],
+    )
+
+
+def _enhancement_totals(record: ClaimRecord) -> CheckResult | None:
+    problems: list[tuple[str, str]] = []
+    for i, extra in enumerate(record.enhancements):
+        total = extra.extra_amount.value
+        amounts = [h.amount.value for h in extra.estimate if h.amount.value is not None]
+        heads = sum(amounts, Decimal("0"))
+        if total is not None and amounts and abs(heads - total) > SUM_TOLERANCE:
+            problems.append(
+                (f"enhancements.{i}.extra_amount", f"heads sum to {heads:.2f}, asked {total:.2f}")
+            )
+    if not record.enhancements:
+        return None
+    return CheckResult(
+        check_id="enhancement_total",
+        passed=not problems,
+        detail="; ".join(d for _, d in problems) or "enhancement heads match their amounts",
+        fields=[p for p, _ in problems],
+    )
+
+
+def _preauth_dates(record: ClaimRecord, requested_on: date | None) -> CheckResult | None:
+    """A stay is at least a day; an emergency admission cannot start after the request."""
+    preauth = record.preauth
+    if preauth.estimate_total.value is None and not preauth.estimate:
+        return None
+    problems: list[tuple[str, str]] = []
+    days = preauth.expected_stay_days.value
+    if days is not None and days < 1:
+        problems.append(("preauth.expected_stay_days", f"expected stay {days} days"))
+    admitted = record.admission.admission_date.value
+    emergency = (preauth.admission_type.value or "").strip().lower() == "emergency"
+    if admitted and requested_on and emergency and admitted > requested_on:
+        problems.append(
+            ("admission.admission_date", f"emergency admission {admitted} after {requested_on}")
+        )
+    return CheckResult(
+        check_id="preauth_dates",
+        passed=not problems,
+        detail="; ".join(d for _, d in problems) or "pre-auth dates are consistent",
+        fields=[p for p, _ in problems],
+    )
+
+
+def _rohini_matches(record: ClaimRecord, form: ClaimForm | None) -> CheckResult | None:
+    """The ROHINI ID on Part C against the hospital whose login submitted the request."""
+    written = record.preauth.rohini_id.value
+    login = form.hospital_id if form else None
+    if not written or not login:
+        return None
+    passed = _ident(written) == _ident(login)
+    return CheckResult(
+        check_id="preauth_rohini_matches",
+        passed=passed,
+        detail=f"Part C ROHINI {written} vs submitting hospital {login}",
+        fields=[] if passed else ["preauth.rohini_id"],
+    )
 
 
 def _head(text: str | None) -> str:
@@ -582,11 +778,15 @@ def _fields(value: Any, path: str) -> Iterator[tuple[str, Field[Any]]]:
             yield from _fields(item, f"{path}.{i}")
 
 
-def low_confidence_fields(record: ClaimRecord) -> list[str]:
+def low_confidence_fields(record: ClaimRecord, sections: set[str] | None = None) -> list[str]:
+    """Paths of fields below the confidence bar. With sections, only those sections are
+    scanned: a cashless request supplies only some documents, and the others are not
+    missing."""
     return [
         path
         for path, field in _fields(record, "")
-        if field.confidence < (LOW_CONFIDENCE_HANDWRITTEN if field.handwritten else LOW_CONFIDENCE)
+        if (sections is None or path.split(".", 1)[0] in sections)
+        and field.confidence < (LOW_CONFIDENCE_HANDWRITTEN if field.handwritten else LOW_CONFIDENCE)
     ]
 
 

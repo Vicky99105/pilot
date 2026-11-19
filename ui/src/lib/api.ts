@@ -31,6 +31,7 @@ export type Stage =
   | 'risk'
   | 'adjudication'
   | 'decision'
+  | 'authorisation'
   | 'communication'
   | 'query'
   | 'settlement'
@@ -49,6 +50,9 @@ export const DOC_TYPES = [
   'cancelled_cheque',
   'kyc',
   'fir_mlc',
+  'preauth_form',
+  'enhancement_request',
+  'interim_bill',
   'other',
 ] as const
 export type DocType = (typeof DOC_TYPES)[number]
@@ -61,6 +65,9 @@ export type RequestType =
   | 'query_reply'
   | 'reconsideration'
   | 'cancellation'
+
+/** The requests a hospital sends on a claim its pre-auth opened. */
+export type LaterRequestType = 'enhancement' | 'discharge' | 'cancellation'
 
 export type User = {
   id: Uuid
@@ -115,9 +122,18 @@ export type Submission = {
   missing_documents: DocType[]
   warnings: string[]
   deadline: IsoDateTime | null
+  clock_deadline: IsoDateTime | null
   duplicate_of: Uuid | null
   workflow_id: string | null
   created_at: IsoDateTime
+}
+
+/** One document a request needs, in checklist order. */
+export type ChecklistItem = {
+  doc_type: DocType
+  required: boolean
+  mandatory_from_amount: Money | null
+  notes: string | null
 }
 
 export type ClaimSummary = {
@@ -168,6 +184,22 @@ export type OpenQueryView = {
   reply_url: string
 }
 
+/** One cashless authorisation: what the request added and the total approved. */
+export type AuthorisationView = {
+  request_type: RequestType
+  status: 'awaiting_discharge' | 'final' | 'rejected' | 'cancelled' | string
+  approved_now: Money
+  approved_total: Money
+  authorised_at: IsoDateTime
+}
+
+export type OriginalsStatus = {
+  claim_id: Uuid
+  due_at: IsoDateTime
+  received_at: IsoDateTime | null
+  received_by: Uuid | null
+}
+
 export type ClaimDetail = ClaimSummary & {
   policy_number: string | null
   member_id: string | null
@@ -177,6 +209,12 @@ export type ClaimDetail = ClaimSummary & {
   submissions: SubmissionView[]
   letters: LetterView[]
   open_query: OpenQueryView | null
+  // Cashless claims only; empty or null otherwise.
+  current_request: RequestType | null
+  clock_deadline: IsoDateTime | null
+  authorisations: AuthorisationView[]
+  originals_due_at: IsoDateTime | null
+  originals_received_at: IsoDateTime | null
 }
 
 // --- Review area -----------------------------------------------------------------------
@@ -315,7 +353,7 @@ function json(body: unknown): RequestInit {
 /** A file part: its field name is the slot (a document type) or "merged". */
 export type UploadPart = { slot: DocType | 'merged'; file: File }
 
-function multipart(parts: UploadPart[], form?: SubmissionForm): FormData {
+function multipart(parts: UploadPart[], form?: SubmissionForm | { request_type: LaterRequestType }): FormData {
   const data = new FormData()
   if (form) data.append('form', JSON.stringify(form))
   for (const part of parts) data.append(part.slot, part.file, part.file.name)
@@ -336,6 +374,15 @@ export const api = {
       method: 'POST',
       body: multipart(parts),
     }),
+
+  checklist: (requestType: RequestType) => request<ChecklistItem[]>(`/api/checklists/${requestType}`),
+  sendRequest: (claimId: Uuid, requestType: LaterRequestType, parts: UploadPart[]) =>
+    request<Submission>(`/api/claims/${claimId}/requests`, {
+      method: 'POST',
+      body: multipart(parts, { request_type: requestType }),
+    }),
+  markOriginalsReceived: (claimId: Uuid) =>
+    request<OriginalsStatus>(`/api/claims/${claimId}/originals-received`, { method: 'POST' }),
 
   queue: () => request<Task[]>('/api/tasks/queue'),
   takeNext: () => request<Task | null>('/api/tasks/next', { method: 'POST' }),

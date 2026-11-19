@@ -134,6 +134,15 @@ _AGREEMENTS = [
      "CGHS non-NABH rates, city tier X"),
 ]  # fmt: skip
 
+# The account each hospital's cashless claims are paid to: (account number, IFSC). Synthetic.
+_PAYEES = [
+    ("50200011223344", "HDFC0001234"),
+    ("39120045678901", "ICIC0003912"),
+    ("10234567890", "SBIN0004567"),
+    ("60123498765", "MAHB0000456"),
+    ("91802033344455", "UTIB0002211"),
+]
+
 AGREEMENTS = [
     HospitalAgreementRow(
         hospital_id=rohini,
@@ -143,12 +152,16 @@ AGREEMENTS = [
         non_package_discount_percent=Decimal(discount),
         valid_from=valid_from,
         note=note,
+        payee_name=name,
+        payee_account_number=account,
+        payee_ifsc=ifsc,
         source=SOURCE,
         source_version=SOURCE_VERSION,
     )
-    for rohini, (scheme, accreditation, ward, discount, valid_from, note) in zip(
-        HOSPITAL_ROHINI_IDS, _AGREEMENTS, strict=True
-    )
+    for rohini, (scheme, accreditation, ward, discount, valid_from, note), (account, ifsc), (
+        name,
+        *_,
+    ) in zip(HOSPITAL_ROHINI_IDS, _AGREEMENTS, _PAYEES, _HOSPITALS, strict=True)
 ]
 
 # Our own crosswalk for the packages the mock claims use: (scheme, package, ICD-10-CM
@@ -179,6 +192,32 @@ REIMBURSEMENT_CHECKLIST: list[tuple[DocType, bool, Decimal | None, str | None]] 
 ]
 
 
+# Cashless checklists, one per request the network hospital sends on the admission.
+PREAUTH_CHECKLIST: list[tuple[DocType, bool, Decimal | None, str | None]] = [
+    (DocType.PREAUTH_FORM, True, None, "Part C, signed by the treating doctor"),
+    (DocType.INVESTIGATION_REPORT, True, None, "Reports that support the provisional diagnosis"),
+    (DocType.KYC, False, None, "Photo ID of the patient"),
+]
+ENHANCEMENT_CHECKLIST: list[tuple[DocType, bool, Decimal | None, str | None]] = [
+    (DocType.ENHANCEMENT_REQUEST, True, None, "The extra amount, by head, and the reason"),
+    (DocType.INTERIM_BILL, True, None, "The running bill to date"),
+    (DocType.INVESTIGATION_REPORT, False, None, "Reports that support the reason"),
+]
+DISCHARGE_CHECKLIST: list[tuple[DocType, bool, Decimal | None, str | None]] = [
+    (DocType.FINAL_BILL, True, None, "Itemised final bill"),
+    (DocType.DISCHARGE_SUMMARY, True, None, None),
+    (DocType.OT_NOTES, False, None, "When a surgery was done"),
+    (DocType.INVESTIGATION_REPORT, False, None, "Reports, including histopathology"),
+    (DocType.PHARMACY_BILL, False, None, "When pharmacy is billed separately"),
+]
+CHECKLISTS = {
+    RequestType.REIMBURSEMENT: REIMBURSEMENT_CHECKLIST,
+    RequestType.PREAUTH: PREAUTH_CHECKLIST,
+    RequestType.ENHANCEMENT: ENHANCEMENT_CHECKLIST,
+    RequestType.DISCHARGE: DISCHARGE_CHECKLIST,
+}
+
+
 async def seed_claims_db(sessions: async_sessionmaker[AsyncSession]) -> None:
     async with sessions.begin() as session:
         for user in USERS:
@@ -191,7 +230,8 @@ async def seed_claims_db(sessions: async_sessionmaker[AsyncSession]) -> None:
         await session.flush()
         await _seed_agreements(session)
         await _seed_crosswalk(session)
-        await _seed_checklist(session, RequestType.REIMBURSEMENT, REIMBURSEMENT_CHECKLIST)
+        for request_type, items in CHECKLISTS.items():
+            await _seed_checklist(session, request_type, items)
         await _seed_clauses(session)
         await _seed_non_payable(session)
 
@@ -206,7 +246,8 @@ async def _seed_agreements(session: AsyncSession) -> None:
             hospital_id=agreement.hospital_id, valid_from=agreement.valid_from
         )
         for column in ("scheme", "accreditation", "package_ward", "note", "source",
-                       "source_version", "non_package_discount_percent"):  # fmt: skip
+                       "source_version", "non_package_discount_percent", "payee_name",
+                       "payee_account_number", "payee_ifsc"):  # fmt: skip
             setattr(row, column, getattr(agreement, column))
         session.add(row)
 
@@ -303,7 +344,7 @@ async def main() -> None:
     print(
         f"Seeded {len(USERS)} users, {len(ROLES)} roles, {len(HOSPITALS)} hospitals, "
         f"{len(AGREEMENTS)} hospital agreements, {len(PACKAGE_CROSSWALK)} crosswalk rows, "
-        f"{len(REIMBURSEMENT_CHECKLIST)} reimbursement checklist items, "
+        f"{sum(len(c) for c in CHECKLISTS.values())} checklist items, "
         f"{len(POLICY_CLAUSES)} policy clauses, {len(NON_PAYABLE_ITEMS)} non-payable items"
     )
 

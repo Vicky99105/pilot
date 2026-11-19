@@ -215,3 +215,48 @@ async def test_seed_dates_follow_the_seed_day_and_a_reseed_stays_idempotent(
     assert (later - recent.inception_date).days == 18
     assert recent.policy_start <= later <= recent.policy_end
     assert len(payments) == 6  # one per policy, whatever the number of seeds
+
+
+async def test_adjust_sets_an_active_block_and_is_idempotent_on_key(core: Core) -> None:
+    """An enhancement raises the block; a pre-auth approved below its estimate lowers it."""
+    before = await core.policy.find_member(policy_number=MEMBER_POLICY_NUMBER, member_id=None)
+    block = await core.money.block_sum_insured(
+        policy_number=MEMBER_POLICY_NUMBER,
+        member_id=MEMBER_MEMBER_ID,
+        amount=Decimal("30000"),
+        idempotency_key="adj-b",
+    )
+
+    raised = await core.money.adjust_block(
+        block_id=block.block_id, amount=Decimal("37000.00"), idempotency_key="adj-1"
+    )
+    again = await core.money.adjust_block(
+        block_id=block.block_id, amount=Decimal("37000.00"), idempotency_key="adj-1"
+    )
+    lowered = await core.money.adjust_block(
+        block_id=block.block_id, amount=Decimal("33000.00"), idempotency_key="adj-2"
+    )
+
+    after = await core.policy.find_member(policy_number=MEMBER_POLICY_NUMBER, member_id=None)
+    assert before is not None and after is not None
+    assert (raised.block_id, raised.amount) == (block.block_id, Decimal("37000.00"))
+    assert again == raised
+    assert lowered.amount == Decimal("33000.00")
+    assert after.blocked - before.blocked == Decimal("33000.00")
+
+
+async def test_adjust_above_the_available_sum_insured_is_refused(core: Core) -> None:
+    block = await core.money.block_sum_insured(
+        policy_number=MEMBER_POLICY_NUMBER,
+        member_id=MEMBER_MEMBER_ID,
+        amount=Decimal("1000"),
+        idempotency_key="adj-c",
+    )
+    with pytest.raises(InsufficientSumInsured):
+        await core.money.adjust_block(
+            block_id=block.block_id, amount=Decimal("99000000"), idempotency_key="adj-3"
+        )
+    with pytest.raises(BlockNotFound):
+        await core.money.adjust_block(
+            block_id=str(uuid4()), amount=Decimal("1"), idempotency_key="adj-4"
+        )

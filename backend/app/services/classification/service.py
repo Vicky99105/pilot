@@ -210,9 +210,13 @@ class DefaultClassificationService:
     async def _checklist(
         session: AsyncSession, claim_id: UUID, submission_id: UUID
     ) -> tuple[list[DocType], list[DocType]]:
-        """The claim's checklist; follow-up submissions are checked against it too."""
+        """The claim's checklist; query replies are checked against it too. A later
+        cashless request (an enhancement, the discharge) has a checklist of its own."""
         claim = await session.get(ClaimRow, claim_id)
         submission = await session.get(SubmissionRow, submission_id)
         assert claim is not None and submission is not None
         amount = Decimal(str(submission.form.get("claimed_amount", "0")))
-        return await checklist(session, RequestType(claim.request_type), amount)
+        request = RequestType(submission.request_type)
+        if request not in (RequestType.ENHANCEMENT, RequestType.DISCHARGE):
+            request = RequestType(claim.request_type)
+        return await checklist(session, request, amount)

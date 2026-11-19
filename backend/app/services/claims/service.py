@@ -5,9 +5,19 @@ from uuid import UUID
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import ClaimRow, FileRow, LetterRow, PageRow, QueryRow, SubmissionRow
+from app.database.models import (
+    ClaimRow,
+    DocumentChecklistRow,
+    FileRow,
+    LetterRow,
+    PageRow,
+    QueryRow,
+    SubmissionRow,
+)
 from app.database.repositories.stage_records import StageRecordRepository
 from app.services.claims.contract import (
+    AuthorisationView,
+    ChecklistItem,
     ClaimDetail,
     ClaimPage,
     ClaimPageDocument,
@@ -82,7 +92,22 @@ class DefaultClaimQueryService:
                 .limit(1)
             )
         first = next((s for s in submissions if s.id == claim.submission_id), None)
+        authorised = await StageRecordRepository(self._sessions).history(
+            claim_id, Stage.AUTHORISATION
+        )
         return ClaimDetail(
+            current_request=RequestType(claim.current_request) if claim.current_request else None,
+            # The clock runs until the current request is authorised.
+            clock_deadline=claim.deadline
+            if claim.current_request
+            and not any(r.payload.get("request_type") == claim.current_request for r in authorised)
+            else None,
+            authorisations=[
+                AuthorisationView.model_validate(r.payload, from_attributes=False)
+                for r in authorised
+            ],
+            originals_due_at=claim.originals_due_at,
+            originals_received_at=claim.originals_received_at,
             **_summary(claim, first).model_dump(),
             policy_number=claim.policy_number,
             member_id=claim.member_id,
@@ -169,6 +194,23 @@ class DefaultClaimQueryService:
                 for d in doc_set.documents
             ],
         )
+
+    async def checklist(self, request_type: RequestType) -> list[ChecklistItem]:
+        async with self._sessions() as session:
+            rows = await session.scalars(
+                select(DocumentChecklistRow)
+                .where(DocumentChecklistRow.request_type == request_type.value)
+                .order_by(DocumentChecklistRow.id)
+            )
+            return [
+                ChecklistItem(
+                    doc_type=DocType(r.doc_type),
+                    required=r.required,
+                    mandatory_from_amount=r.mandatory_from_amount,
+                    notes=r.notes,
+                )
+                for r in rows
+            ]
 
     async def stored_file(self, storage_key: str) -> StoredFile | None:
         async with self._sessions() as session:

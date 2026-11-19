@@ -116,6 +116,8 @@ class SubmissionRow(Base):
     duplicate_of: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("submissions.id"))
     missing_documents: Mapped[list[str]] = mapped_column(JsonType, default=list)
     warnings: Mapped[list[str]] = mapped_column(JsonType, default=list)
+    # The clock of a cashless request: 1 hour for a pre-auth or enhancement, 3 for a discharge.
+    clock_deadline: Mapped[datetime | None] = mapped_column(UTCDateTime)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
@@ -184,6 +186,12 @@ class ClaimRow(Base):
     workflow_id: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    # Cashless claims: the request the workflow is processing, and the hospital's originals.
+    current_request: Mapped[str | None] = mapped_column(String(30))
+    current_submission_id: Mapped[UUID | None] = mapped_column(Uuid)
+    originals_due_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    originals_received_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    originals_received_by: Mapped[UUID | None] = mapped_column(Uuid)
 
 
 class StageRecordRow(Base):
@@ -718,6 +726,10 @@ class HospitalAgreementRow(Base):
     valid_from: Mapped[date] = mapped_column(Date)
     valid_to: Mapped[date | None] = mapped_column(Date)
     note: Mapped[str | None] = mapped_column(Text)
+    # The account a cashless claim is paid to.
+    payee_name: Mapped[str | None] = mapped_column(String(200))
+    payee_account_number: Mapped[str | None] = mapped_column(String(18))
+    payee_ifsc: Mapped[str | None] = mapped_column(String(11))
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))
 

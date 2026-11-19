@@ -18,12 +18,15 @@ LOW_CONFIDENCE = 0.85
 LOW_CONFIDENCE_HANDWRITTEN = 0.92
 SUM_TOLERANCE = Decimal("1.00")  # rupees
 
-# The document types the tracer extracts. Other types are classified but not read.
+# The document types digitisation reads. Other types are classified but not read.
 EXTRACTED_TYPES = (
     DocType.CLAIM_FORM_PART_A,
     DocType.DISCHARGE_SUMMARY,
     DocType.FINAL_BILL,
     DocType.CANCELLED_CHEQUE,
+    DocType.PREAUTH_FORM,
+    DocType.ENHANCEMENT_REQUEST,
+    DocType.INTERIM_BILL,
 )
 
 
@@ -113,6 +116,40 @@ class ChequeBank(Bank):  # the cheque also prints the bank's name; Part A has no
     bank_name: Field[str] = missing()
 
 
+class EstimateHead(BaseModel):
+    """One head of a cashless cost estimate, as written."""
+
+    head: Field[str]  # e.g. "Room rent", "OT charges"
+    days: Field[Decimal] = missing()  # room and ICU heads, when the days are written
+    amount: Field[Decimal]
+
+
+class PreAuthDetails(BaseModel):  # from the pre-auth form, Part C
+    rohini_id: Field[str] = missing()
+    treating_doctor: Field[str] = missing()
+    doctor_registration_number: Field[str] = missing()
+    presenting_complaints: Field[str] = missing()
+    provisional_diagnosis: Field[str] = missing()
+    icd_code_written: Field[str] = missing()
+    proposed_treatment: Field[str] = missing()
+    pcs_code_written: Field[str] = missing()
+    admission_type: Field[str] = missing()  # emergency or planned, as ticked
+    expected_stay_days: Field[int] = missing()
+    room_type: Field[str] = missing()
+    estimate: list[EstimateHead] = []
+    estimate_total: Field[Decimal] = missing()
+
+
+class EnhancementDetails(BaseModel):  # from an enhancement request and its interim bill
+    document_id: UUID | None = None  # the enhancement request read
+    extra_amount: Field[Decimal] = missing()
+    reason: Field[str] = missing()
+    extra_days: Field[int] = missing()
+    revised_discharge_date: Field[date] = missing()
+    estimate: list[EstimateHead] = []  # the extra amount by head
+    interim_bill_total: Field[Decimal] = missing()
+
+
 class CheckResult(BaseModel):
     check_id: str
     passed: bool
@@ -132,6 +169,9 @@ class ClaimRecord(BaseModel):
     bill: Bill = Bill()
     bank: ChequeBank = ChequeBank()  # from the cancelled cheque
     claim_form_bank: Bank = Bank()  # as typed on claim form Part A
+    preauth: PreAuthDetails = PreAuthDetails()  # cashless: Part C
+    enhancements: list[EnhancementDetails] = []  # cashless: one per enhancement, in order
+    interim_bill: Bill = Bill()  # cashless: the latest interim bill
     failed_checks: list[CheckResult] = []
     low_confidence_fields: list[str] = []  # dotted paths
     corrected_fields: list[str] = []  # dotted paths a person has set

@@ -15,6 +15,7 @@ from temporalio.exceptions import ApplicationError
 
 from app.services.adjudication.contract import AdjudicationService
 from app.services.bill_review.contract import BillReviewService, LineEdit
+from app.services.cashless.contract import CashlessRequest, CashlessService
 from app.services.classification.contract import ClassificationService
 from app.services.communication.contract import CommunicationService
 from app.services.decision.contract import ApproverOutcome, CrcOutcome, DecisionService
@@ -31,6 +32,7 @@ from app.services.tasks.contract import TaskService
 from app.shared.errors import PermanentError
 from app.shared.types import DocType, Stage
 from app.workflows.claim_models import (
+    CashlessStepInput,
     ClaimInput,
     CorrectionInput,
     DecisionStep,
@@ -79,6 +81,7 @@ class ClaimActivities:
         communication: CommunicationService,
         query: QueryService,
         settlement: SettlementService,
+        cashless: CashlessService,
     ) -> None:
         self._monitoring = monitoring
         self._tasks = tasks
@@ -94,6 +97,7 @@ class ClaimActivities:
         self._communication = communication
         self._query = query
         self._settlement = settlement
+        self._cashless = cashless
 
     async def _run(self, claim_id: UUID, stage: Stage, call: Awaitable[R]) -> R:
         """Run a stage's service call. A permanent failure is recorded as an event, so it
@@ -465,6 +469,69 @@ class ClaimActivities:
             },
         )
 
+    @activity.defn(name="begin_request")
+    async def begin_request(self, inp: CashlessStepInput) -> CashlessRequest:
+        """Make the follow-up the claim's current cashless request, with its clock."""
+        request = await self._run(
+            inp.claim_id,
+            Stage.INTAKE,
+            self._cashless.begin_request(inp.claim_id, inp.submission_id),
+        )
+        await self._event(
+            StageInput(claim_id=inp.claim_id, stage=Stage.INTAKE),
+            "request_started",
+            {
+                "request_type": request.request_type.value,
+                "submission_id": str(request.submission_id),
+                "clock_deadline": request.clock_deadline.isoformat()
+                if request.clock_deadline
+                else None,
+            },
+        )
+        return request
+
+    @activity.defn(name="authorisation")
+    async def authorisation(self, inp: StageInput) -> StageResult:
+        """After the decision of a cashless request: the approved total and its block."""
+        authorised = await self._run(
+            inp.claim_id, inp.stage, self._cashless.authorise(inp.claim_id)
+        )
+        await self._stage_done(
+            inp,
+            {
+                "request_type": authorised.request_type.value,
+                "approved_now": str(authorised.approved_now),
+                "approved_total": str(authorised.approved_total),
+                "blocked": str(authorised.blocked),
+                "status": authorised.status,
+            },
+        )
+        return StageResult(
+            claim_id=inp.claim_id, stage=inp.stage, closed=authorised.status == "rejected"
+        )
+
+    @activity.defn(name="await_discharge")
+    async def await_discharge(self, inp: StageInput) -> None:
+        """The event first: Monitoring keeps the status at the event's stage, and the
+        status the claim waits in is awaiting_discharge."""
+        await self._event(inp, "awaiting_discharge")
+        await self._run(
+            inp.claim_id, inp.stage, self._cashless.mark_awaiting_discharge(inp.claim_id)
+        )
+
+    @activity.defn(name="cancel_request")
+    async def cancel_request(self, inp: CashlessStepInput) -> None:
+        cancelled = await self._run(
+            inp.claim_id, Stage.SETTLEMENT, self._cashless.cancel(inp.claim_id, inp.submission_id)
+        )
+        at = StageInput(claim_id=inp.claim_id, stage=Stage.SETTLEMENT)
+        await self._event(
+            at,
+            "request_cancelled",
+            {"released_block": cancelled.block_id, "submission_id": str(inp.submission_id)},
+        )
+        await self._event(at, "claim_closed", {"closed_at": str(cancelled.authorised_at)})
+
     @activity.defn(name="query")
     async def query(self, inp: StageInput) -> QueryRaised:
         items = await self._run(
@@ -659,6 +726,9 @@ class ClaimActivities:
             "query_overdue",
             "query_reply",
             "settle",
+            "begin_request",
+            "await_discharge",
+            "cancel_request",
         ]
         return [getattr(self, n) for n in names]
 

@@ -44,6 +44,7 @@ from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.stages import (
     FakeAdjudicationService,
     FakeBillReviewService,
+    FakeCashlessService,
     FakeClassificationService,
     FakeCommunicationService,
     FakeDecisionService,
@@ -142,6 +143,7 @@ async def harness(sessions: async_sessionmaker[AsyncSession]) -> AsyncIterator[H
             communication=FakeCommunicationService(),
             query=FakeQueryService(),
             settlement=FakeSettlementService(),
+            cashless=FakeCashlessService(),
         )
         async with build_worker(env.client, TASK_QUEUE, claim_activities=activities):
             yield Harness(env, sessions, starter, intake)

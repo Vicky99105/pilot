@@ -47,3 +47,14 @@ export function slotParts(files: SlotFiles): UploadPart[] {
     (list ?? []).map((file) => ({ slot: slot as DocType, file })),
   )
 }
+
+export type UploadValue = { mode: 'slots' | 'merged'; slots: SlotFiles; merged: File[] }
+
+export const EMPTY_UPLOADS: UploadValue = { mode: 'slots', slots: {}, merged: [] }
+
+/** The file parts to send: the slot files, or the one merged PDF. */
+export function uploadParts(value: UploadValue): UploadPart[] {
+  return value.mode === 'merged'
+    ? value.merged.map((file) => ({ slot: 'merged' as const, file }))
+    : slotParts(value.slots)
+}

@@ -16,6 +16,7 @@ from app.agents.medical_case import (
     CaseFile,
     DocumentOption,
     Statement,
+    documents_section,
     history_pages,
     pre_existing_onsets,
     stg_key,
@@ -64,6 +65,9 @@ PMJAY = "PMJAY"
 # The guideline sections the review reads: what the treatment needs and what a claim must
 # hold. Pre-auth and doctor-qualification sections are for other stages.
 REVIEW_SECTIONS = ("clinical_pointers", "claim_checks", "claim_documents", "tms_rules", "alos")
+# A cashless request before discharge (no final bill yet) is checked against the pre-auth
+# documents instead of the documents a claim needs at discharge.
+PREAUTH_SECTIONS = ("clinical_pointers", "preauth_checks", "preauth_documents", "tms_rules", "alos")
 # Mandatory claim documents of a guideline, mapped to the document type that holds each.
 # Checked in order; an item that names none of these is not a document a query can ask for.
 _GUIDELINE_DOCUMENTS: list[tuple[str, DocType]] = [
@@ -153,7 +157,7 @@ class DefaultMedicalReviewService:
         held = await self._held_doc_types(claim_id)
         case = _case_file(record, policy, await self._clause_refs(policy.product_uin))
         case.verified_codes = [v.code.code for v in coding.verified_codes]
-        guideline = await self._guideline(case, sheet)
+        guideline = await self._guideline(case, sheet, preauth=not record.bill.lines)
         loaded = case.guideline if case.guideline_code else None
         missing = _mandatory_missing(loaded or {}, held)
         if guideline is not None:
@@ -295,7 +299,9 @@ class DefaultMedicalReviewService:
             )
         return policy
 
-    async def _guideline(self, case: CaseFile, sheet: DeductionSheet) -> GuidelineUsed | None:
+    async def _guideline(
+        self, case: CaseFile, sheet: DeductionSheet, *, preauth: bool = False
+    ) -> GuidelineUsed | None:
         """The first mapped package with a guideline or a length-of-stay norm: its HBP code
         from our crosswalk (a PM-JAY package is its own), its guideline sections, and the
         norm by the package code, then the HBP code, then the package name."""
@@ -313,8 +319,9 @@ class DefaultMedicalReviewService:
         )
         sections = await self._kb.get_guideline(code) if code else []
         read: dict[str, list[str]] = {}
+        wanted = PREAUTH_SECTIONS if preauth else REVIEW_SECTIONS
         for section in sections:
-            if section.section in REVIEW_SECTIONS:
+            if section.section in wanted:
                 read.setdefault(section.section, [])
                 read[section.section] += [
                     i for i in section.items if i not in read[section.section]
@@ -438,17 +445,12 @@ def _clean(item: str) -> str:
     return text[:1].upper() + text[1:] if text else item
 
 
-def _documents_section(guideline: dict[str, list[str]]) -> str:
-    """The guideline section that lists the mandatory claim documents."""
-    return "claim_documents" if guideline.get("claim_documents") else "claim_checks"
-
-
 def _mandatory_missing(
     guideline: dict[str, list[str]], held: set[DocType]
 ) -> list[tuple[str, DocType]]:
     """The guideline's mandatory claim documents whose document type the claim does not
     hold: (document name, type)."""
-    items = guideline.get(_documents_section(guideline)) or []
+    items = guideline.get(documents_section(guideline)) or []
     missing = []
     for item in items:
         doc_type = guideline_doc_type(item)
@@ -483,7 +485,7 @@ def _still_missing(
     that the claim still does not hold. The approver weighs it; no second query asks."""
     if case.guideline_code is None:
         return []
-    ref = stg_key(case.guideline_code, _documents_section(case.guideline))
+    ref = stg_key(case.guideline_code, documents_section(case.guideline))
     return [
         Finding(
             kind="documents",

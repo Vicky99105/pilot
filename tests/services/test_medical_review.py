@@ -33,7 +33,7 @@ from app.services.medical_review.service import (
 )
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.service import DefaultRulesEngine
-from app.shared.types import DocType, Stage
+from app.shared.types import DocType, RequestType, Stage
 from tests.database.factories import add_claim
 from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.file_store import FakeFileStore
@@ -439,16 +439,75 @@ async def test_uncited_findings_are_sent_back_once_then_dropped(env: Env) -> Non
 
 async def test_findings_may_cite_the_packages_guideline(env: Env) -> None:
     claim_id = await env.coded()
-    finding = {"text": "No histopathology on file", "severity": "query",
-               "citations": ["stg:SG017B:claim_documents"]}  # fmt: skip
+    finding = {"text": "Pain shifted to the right iliac fossa", "severity": "info",
+               "citations": ["stg:SG017B:clinical_pointers"]}  # fmt: skip
     gateway = FakeModelGateway({"medical_findings": [{"findings": [finding]}]})
 
     findings = await env.service(gateway).review(claim_id)
 
     [kept] = [f for f in findings.findings if f.judged_by == "model"]
-    assert kept.citations == [Citation(ref="stg:SG017B:claim_documents")]
+    assert kept.citations == [Citation(ref="stg:SG017B:clinical_pointers")]
     cites = enum_at(gateway.calls[-1].schema, "findings", "citations")
-    assert "stg:SG017B:claim_documents" in cites and "stg:SG017B:doctor_qualification" not in cites
+    assert "stg:SG017B:clinical_pointers" in cites
+    assert "stg:SG017B:doctor_qualification" not in cites
+
+
+# --- Document findings are code-only ------------------------------------------------------
+
+
+async def test_the_findings_reply_has_no_document_kind(env: Env) -> None:
+    """Whether a document is held is decided in code. The model's finding kinds are a
+    closed enum without "documents", so it cannot write a document-presence finding."""
+    claim_id = await env.coded()
+    gateway = FakeModelGateway({"medical_findings": [NO_FINDINGS]})
+
+    await env.service(gateway).review(claim_id)
+
+    schema = gateway.calls[-1].schema
+    assert schema is not None
+    kinds = enum_at(schema, "findings", "kind")
+    assert "documents" not in kinds and kinds == ["clinical", "coding"]
+    bad = {"kind": "documents", "text": "OT notes missing", "severity": "query",
+           "citations": [cite(1)]}  # fmt: skip
+    with pytest.raises(ValidationError):
+        schema.model_validate({"findings": [bad]})
+
+
+async def test_the_findings_call_never_sees_the_guidelines_document_list(env: Env) -> None:
+    """The model is not given the mandatory document list, so it has no document-missing
+    wording path: neither the guideline's documents section nor a citation of it."""
+    claim_id = await env.coded()
+    await env.held(claim_id, "discharge_summary", "final_bill")
+    gateway = FakeModelGateway({"medical_findings": [NO_FINDINGS]})
+
+    await env.service(gateway).review(claim_id)
+
+    call = gateway.calls[-1]
+    text = "\n".join(m.content for m in call.messages or [] if isinstance(m.content, str))
+    assert "claim_documents" not in text
+    assert SG017B_CLAIM_DOCUMENTS[1] not in text
+    assert "documents_that_may_be_requested" not in text
+    cites = enum_at(call.schema, "findings", "citations")
+    assert "stg:SG017B:claim_documents" not in cites
+    assert "stg:SG017B:clinical_pointers" in cites
+
+
+async def test_a_held_document_never_gets_a_document_finding(env: Env) -> None:
+    """The live failure: OT notes were held, yet a finding said they were missing. Code
+    alone writes document findings, from the guideline's mandatory list against the held
+    types; the model's findings are "clinical" or "coding"."""
+    claim_id = await env.coded()
+    await env.held(claim_id, "discharge_summary", "ot_notes", "final_bill")
+    note = {"kind": "clinical", "text": "Perforation seen on CT", "severity": "info",
+            "citations": [cite(2)]}  # fmt: skip
+    gateway = FakeModelGateway({"medical_findings": [{"findings": [note], "query_items": []}]})
+
+    findings = await env.service(gateway).review(claim_id)
+
+    assert all(f.kind != "documents" for f in findings.findings)
+    assert [(f.kind, f.judged_by) for f in findings.findings if f.text == note["text"]] == [
+        ("clinical", "model")
+    ]
 
 
 async def test_a_cited_reason_for_the_long_stay_clears_the_stay_finding(env: Env) -> None:
@@ -647,3 +706,27 @@ async def test_overrule_refuses_unknown_ids_and_a_blank_reason(env: Env) -> None
         await service.overrule(claim_id, [1], "  ", actor="user:x")
     with pytest.raises(InvalidOverrule, match="finding"):
         await service.overrule(claim_id, [], "reason", actor="user:x")
+
+
+# --- P2-5: the pre-auth reads the guideline's pre-auth documents ---------------------------
+
+
+async def test_a_preauth_checks_the_guidelines_preauth_documents(env: Env) -> None:
+    """A cashless claim before discharge has no final bill. Its mandatory list is the
+    guideline's pre-auth documents, not the claim documents a discharge needs, so the
+    missing histopathology and operative notes are not asked for at pre-auth."""
+    spec = ClaimSpec(request_type=RequestType.PREAUTH, lines=[])
+    claim_id = await env.coded(spec)
+    await env.held(claim_id, "preauth_form")
+    gateway = FakeModelGateway({"medical_findings": [NO_FINDINGS]})
+
+    findings = await env.service(gateway).review(claim_id)
+
+    assert findings.guideline is not None
+    assert "preauth_documents" in findings.guideline.sections
+    assert "claim_documents" not in findings.guideline.sections
+    assert findings.guideline.mandatory_missing == ["USG abdomen report"]
+    assert enum_at(gateway.calls[-1].schema, "query_items") == ["USG abdomen report"]
+    text = "\n".join(m.content for m in gateway.calls[-1].messages or [] if
+                     isinstance(m.content, str))  # fmt: skip
+    assert "preauth_documents" not in text  # a document list is never shown to the model

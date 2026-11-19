@@ -28,7 +28,8 @@ async def test_seed_is_idempotent_and_creates_six_users_and_five_hospitals(
 
     assert await _count(sessions, UserRow) == 6
     assert await _count(sessions, HospitalRow) == 5
-    assert await _count(sessions, DocumentChecklistRow) == 11  # with the FIR or MLC (P2-1)
+    # Reimbursement 11 (with the FIR or MLC, P2-1); pre-auth 3, enhancement 3, discharge 5.
+    assert await _count(sessions, DocumentChecklistRow) == 22
 
 
 async def test_seed_gives_ops_and_doctor_their_roles(

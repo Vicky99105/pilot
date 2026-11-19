@@ -62,6 +62,11 @@ class ReleaseRequest(BaseModel):
     idempotency_key: str
 
 
+class AdjustRequest(BaseModel):
+    amount: Decimal
+    idempotency_key: str
+
+
 class PaymentRequest(BaseModel):
     payee: Payee
     amount: Decimal
@@ -155,6 +160,32 @@ async def block_sum_insured(body: BlockRequest, sessions: Sessions) -> dict[str,
         return ref.model_dump(mode="json")
 
     return await _idempotent(sessions, body.idempotency_key, "block", perform)
+
+
+@router.post("/blocks/{block_id}/adjust", response_model=BlockRef)
+async def adjust_block(block_id: str, body: AdjustRequest, sessions: Sessions) -> dict[str, Any]:
+    async def perform(session: AsyncSession) -> dict[str, Any]:
+        try:
+            block = await session.get(McBlock, UUID(block_id), with_for_update=True)
+        except ValueError:
+            block = None
+        if block is None:
+            raise HTTPException(404, "block not found")
+        if block.status != "active":
+            raise HTTPException(422, f"block is {block.status}")
+        policy = await session.get(McPolicy, block.policy_number, with_for_update=True)
+        assert policy is not None
+        amount = body.amount.quantize(CENT)
+        available = policy.sum_insured + policy.cumulative_bonus - policy.utilised - policy.blocked
+        change = amount - block.amount
+        if amount <= 0 or change > available:
+            raise HTTPException(409, f"insufficient sum insured: available {available}")
+        policy.blocked += change
+        block.amount = amount
+        ref = BlockRef(block_id=block_id, amount=amount, available_after=available - change)
+        return ref.model_dump(mode="json")
+
+    return await _idempotent(sessions, body.idempotency_key, "adjust", perform)
 
 
 @router.post("/blocks/{block_id}/release")

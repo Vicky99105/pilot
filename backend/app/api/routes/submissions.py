@@ -3,12 +3,13 @@
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from starlette.datastructures import FormData, UploadFile
 
-from app.api.deps import Claims, CurrentUser, Files, Intake, Permissions, Queries
+from app.api.deps import Cashless, Claims, CurrentUser, Files, Intake, Permissions, Queries
 from app.integrations.core.contract import PermissionService
-from app.services.claims.contract import ClaimDetail, ClaimSummary
+from app.services.cashless.contract import NoOriginalsDue, OriginalsStatus
+from app.services.claims.contract import ChecklistItem, ClaimDetail, ClaimSummary
 from app.services.intake.contract import (
     ClaimForm,
     Submission,
@@ -17,12 +18,22 @@ from app.services.intake.contract import (
     UploadedFile,
 )
 from app.services.users.contract import STAFF_ROLES, User
-from app.shared.types import DocType, RequestType
+from app.shared.types import DocType, RequestType, Role
 
 router = APIRouter(prefix="/api", tags=["submit"])
 
 MERGED_FIELD = "merged"  # the multipart field name for one merged PDF
 SLOTS = {d.value for d in DocType}
+
+
+# The requests a hospital sends on a claim its pre-auth opened.
+LATER_REQUESTS = (RequestType.ENHANCEMENT, RequestType.DISCHARGE, RequestType.CANCELLATION)
+
+
+class CashlessRequestForm(BaseModel):
+    """The multipart "form" part of a later cashless request."""
+
+    request_type: RequestType
 
 
 class SubmissionForm(ClaimForm):
@@ -70,6 +81,8 @@ async def submit(
         form = SubmissionForm.model_validate_json(raw)
     except ValidationError as exc:
         raise HTTPException(422, exc.errors(include_url=False, include_context=False)) from None
+    if user.kind == "hospital" and form.hospital_id is None:
+        form.hospital_id = user.hospital_id  # the hospital login's ROHINI ID
     if not await can_see(
         user, permissions, policy_number=form.policy_number, hospital_id=form.hospital_id
     ):
@@ -126,6 +139,72 @@ async def reply_to_query(
         )
     except SubmissionRejected as exc:
         raise HTTPException(422, exc.reasons) from None
+
+
+@router.post("/claims/{claim_id}/requests", status_code=201, response_model=Submission)
+async def send_request(
+    claim_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    intake: Intake,
+    claims: Claims,
+    permissions: Permissions,
+) -> Submission:
+    """Multipart: a "form" part with {"request_type": "enhancement" | "discharge" |
+    "cancellation"}, then the files by slot or "merged". The request joins the claim its
+    pre-auth opened, and the claim's workflow gets the followup_received signal."""
+    if user.kind != "hospital":
+        raise HTTPException(403, "only hospitals send cashless requests")
+    parts = await request.form()
+    raw = parts.get("form")
+    if not isinstance(raw, str):
+        raise HTTPException(422, 'missing "form" part with the request type as JSON')
+    try:
+        form = CashlessRequestForm.model_validate_json(raw)
+    except ValidationError as exc:
+        raise HTTPException(422, exc.errors(include_url=False, include_context=False)) from None
+    if form.request_type not in LATER_REQUESTS:
+        raise HTTPException(422, f"request_type must be one of {[r.value for r in LATER_REQUESTS]}")
+    detail = await claims.get(claim_id)
+    if detail is None or not await can_see(
+        user, permissions, policy_number=detail.policy_number, hospital_id=detail.hospital_id
+    ):
+        raise HTTPException(404, "claim not found")
+    if detail.request_type is not RequestType.PREAUTH:
+        raise HTTPException(409, "only a claim a pre-auth opened takes cashless requests")
+    if detail.status == "closed":
+        raise HTTPException(409, "the claim is closed")
+    files = await _uploads(parts)
+    try:
+        return await intake.accept_followup(
+            claim_id,
+            submitted_by=user.id,
+            channel="hospital",
+            files=files,
+            request_type=form.request_type,
+        )
+    except SubmissionRejected as exc:
+        raise HTTPException(422, exc.reasons) from None
+
+
+@router.get("/checklists/{request_type}", response_model=list[ChecklistItem])
+async def get_checklist(
+    request_type: RequestType, user: CurrentUser, claims: Claims
+) -> list[ChecklistItem]:
+    return await claims.checklist(request_type)
+
+
+@router.post("/claims/{claim_id}/originals-received", response_model=OriginalsStatus)
+async def originals_received(
+    claim_id: UUID, user: CurrentUser, cashless: Cashless
+) -> OriginalsStatus:
+    """A claims operator records that the hospital's original documents arrived."""
+    if Role.CLAIMS_OPERATOR not in user.roles:
+        raise HTTPException(403, "a claims operator marks originals received")
+    try:
+        return await cashless.mark_originals_received(claim_id, user.id)
+    except NoOriginalsDue as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @router.get("/claims/mine", response_model=list[ClaimSummary])

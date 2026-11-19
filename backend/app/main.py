@@ -25,6 +25,8 @@ from app.integrations.core.http import (
 from app.mock_core.router import router as mock_core_router
 from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
+from app.services.cashless.contract import CashlessService
+from app.services.cashless.service import DefaultCashlessService
 from app.services.claims.contract import ClaimQueryService
 from app.services.claims.service import DefaultClaimQueryService
 from app.services.classification.service import DefaultClassificationService
@@ -75,6 +77,7 @@ def create_app(
     model_gateway: ModelGateway | None = None,
     query_service: QueryService | None = None,
     notification_service: NotificationService | None = None,
+    cashless_service: CashlessService | None = None,
 ) -> FastAPI:
     """Services passed in (tests) are used as given; the rest are built in the lifespan."""
     settings = settings or Settings()
@@ -118,6 +121,8 @@ def create_app(
         policies = HttpPolicyService(settings.mock_core_base_url, core_http)
         money = HttpMoneyService(settings.mock_core_base_url, core_http)
         notifications = notification_service or build_notification_service(settings)
+        if app.state.cashless_service is None:
+            app.state.cashless_service = DefaultCashlessService(sessions, money)
         communication = DefaultCommunicationService(sessions, files, gateway, notifications)
         if app.state.query_service is None:
             app.state.query_service = DefaultQueryService(
@@ -147,6 +152,7 @@ def create_app(
             communication=communication,
             query=app.state.query_service,
             settlement=DefaultSettlementService(sessions, money),
+            cashless=app.state.cashless_service,
         )
         worker_task = asyncio.create_task(
             run_worker_forever(settings, activities), name="temporal-worker"
@@ -170,6 +176,7 @@ def create_app(
     app.state.file_store = file_store
     app.state.permission_service = permission_service
     app.state.query_service = query_service
+    app.state.cashless_service = cashless_service
     app.state.mock_core_admin_enabled = settings.mock_core_admin_enabled
     app.include_router(health.router)
     app.include_router(task_routes.router)

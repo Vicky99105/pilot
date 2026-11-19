@@ -38,7 +38,7 @@ from app.shared.types import DocType, RuleResult, Stage
 MAX_REVISIONS = 1
 ZERO = Decimal("0.00")
 # Claim-level rules whose one deduction bill review spreads over the lines in proportion.
-SPREAD_RULES = {"R16", "R17", "R19", "R20"}
+SPREAD_RULES = {"R16", "R17", "R19", "R20", "R26"}
 PAID: tuple[Decision, ...] = ("approve", "partial")
 
 

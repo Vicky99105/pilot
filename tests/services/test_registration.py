@@ -25,7 +25,7 @@ from app.services.registration.contract import (
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import HOSPITAL_ROHINI_IDS, PRODUCT_UIN
-from app.shared.types import RuleResult, Stage
+from app.shared.types import RequestType, RuleResult, Stage
 from tests.database.factories import add_claim
 from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.services.claim_builders import MEMBER, POLICY, ClaimSpec, add_digitised_claim
@@ -329,3 +329,31 @@ async def test_register_needs_a_digitised_claim(env: Env) -> None:
         await env.service.register(await add_claim(env.sessions))
     with pytest.raises(NotDigitised):
         await env.service.register(uuid4())
+
+
+# --- P2-5: cashless ------------------------------------------------------------------------
+
+
+async def test_a_cashless_claim_keeps_its_block_across_requests(env: Env) -> None:
+    """A pre-auth blocks its estimate; a later request (an enhancement, the discharge) is a
+    new record version, and registration keeps the block rather than re-blocking. The
+    authorisation sets the block's amount."""
+    spec = ClaimSpec(request_type=RequestType.PREAUTH, lines=[])
+    claim_id = await env.claim(spec)
+    records = StageRecordRepository(env.sessions)
+    record = await records.latest(claim_id, Stage.DIGITISATION)
+    assert record is not None
+    payload = record.payload | {"preauth": {"estimate_total": {"value": "30000.00",
+                                                                "confidence": 0.99}}}  # fmt: skip
+    payload["claimed"] = {}
+    payload["bill"] = {}
+    await records.append(claim_id, Stage.DIGITISATION, payload, created_by="test")
+    first = await env.service.register(claim_id)
+    await records.append(claim_id, Stage.DIGITISATION, payload, created_by="test")
+
+    second = await env.service.register(claim_id)
+
+    assert first.block_amount == D("30000.00")  # the pre-auth estimate
+    assert first.block_ref is not None and len(env.money.blocks) == 1
+    assert second.block_ref == first.block_ref
+    assert env.money.releases == {}

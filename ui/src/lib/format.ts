@@ -59,6 +59,9 @@ const DOC_LABELS: Record<DocType, string> = {
   cancelled_cheque: 'Cancelled cheque',
   kyc: 'KYC document',
   fir_mlc: 'FIR or medico-legal certificate',
+  preauth_form: 'Pre-auth form (Part C)',
+  enhancement_request: 'Enhancement request',
+  interim_bill: 'Interim bill',
   other: 'Other',
 }
 

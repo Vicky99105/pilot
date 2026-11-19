@@ -91,6 +91,23 @@ def document_requests(options: list[DocumentOption]) -> list[DocumentRequest]:
     return [DocumentRequest(doc_type=t, text="; ".join(names)) for t, names in labels.items()]
 
 
+def documents_section(guideline: dict[str, list[str]]) -> str:
+    """The guideline section that lists the mandatory documents: the pre-auth documents
+    when the review read them (a cashless request before discharge), else the claim
+    documents, else the claim checks."""
+    for section in ("preauth_documents", "claim_documents"):
+        if guideline.get(section):
+            return section
+    return "claim_checks"
+
+
+def model_sections(case: "CaseFile") -> dict[str, list[str]]:
+    """The guideline sections a model call may read and cite: every section except the
+    mandatory document list, whose presence checks code makes."""
+    hidden = documents_section(case.guideline)
+    return {name: items for name, items in case.guideline.items() if name != hidden}
+
+
 def stg_key(code: str, section: str) -> str:
     return f"{STG_PREFIX}{code}:{section}"
 

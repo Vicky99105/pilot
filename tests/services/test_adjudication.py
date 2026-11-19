@@ -456,3 +456,42 @@ async def test_one_reason_naming_a_spread_rule_explains_every_line_it_spread_ove
 
     assert (draft.self_check_errors, draft.guardrail_passed) == ([], True)
     assert draft.amount == sheet.payable
+
+
+async def test_one_reason_naming_r26_explains_every_line_it_spread_over(env: Env) -> None:
+    """R26 (the final bill against the approved pre-auth) is a claim-level rule spread over
+    the lines like R20, so one reason naming it explains them all (P2-5)."""
+    spec = ClaimSpec(request_type=RequestType.DISCHARGE)
+    claim_id = await add_digitised_claim(env.sessions, spec)
+    rules = DefaultRulesEngine(Settings().config_dir / "products")
+    await DefaultRegistrationService(
+        env.sessions, env.policies, FakeMoneyService(), rules
+    ).register(claim_id)
+    await add_reference_rows(env.sessions)
+    await add_coding(env.sessions, claim_id, procedures=LAP)
+    bill = DefaultBillReviewService(
+        env.sessions,
+        rules,
+        FakeModelGateway({"bill_package_choice": [{"procedure_1": "AG095"}]}),
+        DefaultKnowledgeBase(env.sessions),
+    )
+    sheet = await bill.review(claim_id)
+    # The same spread, as R26 took it: every deducted line names R26.
+    held = sheet.model_dump(mode="json")
+    for line in held["lines"]:
+        if line["rule_id"] == "R20":
+            line["rule_id"], line["clause_ref"] = "R26", "PREAUTH"
+    for result in held["rule_results"]:
+        if result["rule_id"] == "R20":
+            result["rule_id"], result["clause_ref"] = "R26", "PREAUTH"
+    records = StageRecordRepository(env.sessions)
+    await records.append(claim_id, Stage.BILL_REVIEW, held, created_by="test")
+    await add_medical(env.sessions, claim_id)
+    held_r26 = {"text": "Held to the approved pre-auth", "clause_ref": "PREAUTH",
+                "rule_id": "R26", "line_id": None}  # fmt: skip
+    reply = {"decision": "partial", "reasons": [held_r26], "summary": "Pre-auth limit."}
+    gateway = FakeModelGateway({"adjudication_decide": [reply]})
+
+    draft = await env.service(gateway).draft(claim_id)
+
+    assert (draft.self_check_errors, draft.guardrail_passed) == ([], True)

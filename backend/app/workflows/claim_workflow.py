@@ -8,8 +8,18 @@ failed payee checks) sends the same checkpoint back to the queue with the reason
 
 Order at the end: decision (approver, then CRC for a partial or reject), communication,
 then settlement: payee checks, the finance release, then payment, block release, closure.
+
+A cashless claim (opened by a pre-auth) is one workflow for the admission. Each request
+(the pre-auth, then any enhancement, then the discharge) runs the review stages, then the
+authorisation (the approved total and its block) and its letter; between requests the claim
+waits in awaiting_discharge for the hospital's next upload (followup_received). Only the
+discharge goes on to settlement. A cancellation releases the block and closes the claim.
+Each request has a clock (1 hour, or 3 for a discharge): its checkpoint tasks take the clock
+as their deadline, and a missed clock is recorded as clock_breached. Nothing is approved
+because a clock passed.
 """
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -22,9 +32,11 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
-    from app.shared.types import Role, Stage
+    from app.services.cashless.contract import CashlessRequest
+    from app.shared.types import RequestType, Role, Stage
     from app.workflows.claim_activities import MODEL_UNAVAILABLE, ClaimActivities
     from app.workflows.claim_models import (
+        CashlessStepInput,
         ClaimInput,
         ClaimResult,
         CorrectionInput,
@@ -68,6 +80,12 @@ PIPELINE = [
     Stage.COMMUNICATION,
     Stage.SETTLEMENT,
 ]
+# A cashless request before the discharge: the review, the authorisation and its letter.
+CASHLESS_REVIEW = [*PIPELINE[: PIPELINE.index(Stage.DECISION) + 1], Stage.AUTHORISATION,
+                   Stage.COMMUNICATION]  # fmt: skip
+# The discharge: the same, then settlement to the hospital.
+CASHLESS_DISCHARGE = [*CASHLESS_REVIEW, Stage.SETTLEMENT]
+
 # Stages whose activity calls a model, directly or through a service.
 MODEL_STAGES = {
     Stage.CLASSIFICATION,
@@ -97,6 +115,7 @@ STAGE_ACTIVITIES = {
     Stage.COMMUNICATION: ClaimActivities.communication,
     Stage.SETTLEMENT: ClaimActivities.settlement,
     Stage.MONITORING: ClaimActivities.monitoring,
+    Stage.AUTHORISATION: ClaimActivities.authorisation,
 }
 
 
@@ -177,6 +196,9 @@ class ClaimWorkflow:
         self._submission_id: UUID | None = None
         self._final: FinalDecision | None = None
         self._last_task_id = ""
+        self._clock: datetime | None = None  # the current cashless request's deadline
+        self._answered = 0  # cashless requests answered (authorised and lettered)
+        self._closed = False  # a rejected pre-auth closed the claim
 
     @workflow.signal
     def task_completed(self, task_id: str, outcome: dict[str, Any]) -> None:
@@ -204,28 +226,100 @@ class ClaimWorkflow:
             retry_policy=RETRY,
         )
         claim_id = self._claim_id = intake.claim_id
+        if claim.request_type is RequestType.PREAUTH:
+            await self._cashless()
+        else:
+            await self._pipeline(PIPELINE)
+        await self._run_stage(Stage.MONITORING)
+        return ClaimResult(claim_id=claim_id, status="closed", draft=self._final)
+
+    async def _pipeline(self, pipeline: list[Stage]) -> None:
+        """Run the stages in order, with the query loop after adjudication and send-backs
+        to an earlier stage."""
         i = 0
-        while i < len(PIPELINE):
-            stage = PIPELINE[i]
+        while i < len(pipeline):
+            stage = pipeline[i]
             if stage is Stage.DECISION:
                 target = await self._decide()
             elif stage is Stage.SETTLEMENT:
-                target = await self._settle(PIPELINE[: i + 1])
+                target = await self._settle(pipeline[: i + 1])
             else:
                 result = await self._run_stage(stage)
                 if stage is Stage.ADJUDICATION and result.draft == "query":
                     resume = await self._query_loop()
                     if resume is not None:
-                        i = PIPELINE.index(resume)
+                        i = pipeline.index(resume)
                         continue
-                target = await self._checkpoints(stage, result, PIPELINE[: i + 1])
+                if stage is Stage.AUTHORISATION:
+                    self._closed = result.closed
+                if stage is Stage.COMMUNICATION and self._clock is not None:
+                    self._answered += 1  # the request is answered: its clock stops
+                target = await self._checkpoints(stage, result, pipeline[: i + 1])
             if target is not None:
                 await self._event(stage, "sent_back", {"to": target.value})
-                i = PIPELINE.index(target)
+                i = pipeline.index(target)
                 continue
             i += 1
-        await self._run_stage(Stage.MONITORING)
-        return ClaimResult(claim_id=claim_id, status="closed", draft=self._final)
+
+    async def _cashless(self) -> None:
+        """The admission's requests, one after another, until the discharge settles, a
+        cancellation closes the claim, or a rejected pre-auth closes it."""
+        assert self._claim_id is not None and self._submission_id is not None
+        submission_id: UUID | None = self._submission_id
+        while submission_id is not None:
+            request: CashlessRequest = await workflow.execute_activity_method(
+                ClaimActivities.begin_request,
+                CashlessStepInput(claim_id=self._claim_id, submission_id=submission_id),
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+            if request.request_type is RequestType.CANCELLATION:
+                await workflow.execute_activity_method(
+                    ClaimActivities.cancel_request,
+                    CashlessStepInput(claim_id=self._claim_id, submission_id=submission_id),
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                return
+            discharge = request.request_type is RequestType.DISCHARGE
+            self._submission_id = submission_id  # classification reads this request's files
+            self._clock = request.clock_deadline
+            watch = asyncio.create_task(self._watch_clock(request, self._answered))
+            await self._pipeline(CASHLESS_DISCHARGE if discharge else CASHLESS_REVIEW)
+            self._clock = None
+            await watch
+            if discharge or self._closed:
+                return
+            await workflow.execute_activity_method(
+                ClaimActivities.await_discharge,
+                StageInput(claim_id=self._claim_id, stage=Stage.AUTHORISATION),
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=RETRY,
+            )
+            submission_id = await self._next_followup(until=None)
+
+    async def _watch_clock(self, request: CashlessRequest, answered: int) -> None:
+        """Record clock_breached when the request's clock passes before it is answered.
+        The record is the only effect: a person still decides."""
+        if request.clock_deadline is None:
+            return
+        left = request.clock_deadline - workflow.now()
+        try:
+            if left <= timedelta(0):
+                raise TimeoutError
+            await workflow.wait_condition(lambda: self._answered > answered, timeout=left)
+        except TimeoutError:
+            if self._answered > answered:
+                return
+            await self._event(
+                Stage.MONITORING,
+                "clock_breached",
+                {
+                    "request_type": request.request_type.value,
+                    "submission_id": str(request.submission_id),
+                    "clock_deadline": request.clock_deadline.isoformat(),
+                },
+            )
 
     async def _checkpoints(
         self, stage: Stage, result: StageResult, reachable: list[Stage]
@@ -415,9 +509,12 @@ class ClaimWorkflow:
             await self._event(Stage.QUERY, "query_extended")
             reminders = []  # the claimant was reminded already
 
-    async def _next_followup(self, *, until: datetime) -> UUID | None:
-        """The next unused follow-up, waiting for one until the given time."""
-        timeout = until - workflow.now()
+    async def _next_followup(self, *, until: datetime | None) -> UUID | None:
+        """The next unused follow-up, waiting for one until the given time (or for as long
+        as it takes, with no time given)."""
+        if until is None:
+            await workflow.wait_condition(lambda: len(self._followups) > self._followups_used)
+        timeout = until - workflow.now() if until is not None else timedelta(0)
         if timeout > timedelta(0):
             try:
                 await workflow.wait_condition(
@@ -515,7 +612,7 @@ class ClaimWorkflow:
                 role=checkpoint.role,
                 title=checkpoint.title,
                 payload={"stage": stage.value, **(payload or {})},
-                deadline=workflow.now() + CHECKPOINT_SLA,
+                deadline=self._deadline(),
                 authority_amount=authority_amount,
             ),
             start_to_close_timeout=ACTIVITY_TIMEOUT,
@@ -534,6 +631,12 @@ class ClaimWorkflow:
             stage, "checkpoint_completed", {"task_id": key, "kind": checkpoint.kind, **outcome}
         )
         return outcome
+
+    def _deadline(self) -> datetime:
+        """A task's deadline: the cashless request's clock while one runs, so queues order
+        its tasks by time left; else the checkpoint SLA."""
+        sla = workflow.now() + CHECKPOINT_SLA
+        return min(sla, self._clock) if self._clock is not None else sla
 
     async def _event(self, stage: Stage, action: str, detail: dict[str, Any] | None = None) -> None:
         assert self._claim_id is not None

@@ -1,6 +1,7 @@
 """Default settlement: payee checks, then (after the finance release) the payment instruction,
 the block release and the claim's closure, through the MoneyService contract."""
 
+import re
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
@@ -9,7 +10,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import ClaimRow, UserRoleRow, utcnow
+from app.database.models import ClaimRow, HospitalAgreementRow, UserRoleRow, utcnow
 from app.database.repositories.stage_records import StageRecordRepository, append_in_session
 from app.integrations.core.contract import MoneyService, Payee
 from app.services.decision.contract import PAID, DecisionRecord
@@ -18,12 +19,14 @@ from app.services.intake.contract import ClaimForm
 from app.services.registration.contract import RegistrationResult
 from app.services.settlement._helpers import digits, payee_checks
 from app.services.settlement.contract import (
+    IFSC_PATTERN,
     NotReadyForSettlement,
+    PayeeCheck,
     PayeeCheckFailed,
     PaymentNotReleased,
     SettlementRecord,
 )
-from app.shared.types import Role, Stage
+from app.shared.types import CASHLESS_REQUESTS, RequestType, Role, Stage
 
 ZERO = Decimal("0.00")
 CLOSED = "closed"
@@ -47,8 +50,13 @@ class DefaultSettlementService:
         if stored is not None:
             return stored
         registration = await self._registration(claim_id)
-        payee, checks = None, []
-        if decision.final_decision in PAID:
+        payee: Payee | None = None
+        checks: list[PayeeCheck] = []
+        claim = await self._claim(claim_id)
+        cashless = RequestType(claim.request_type) in CASHLESS_REQUESTS
+        if decision.final_decision in PAID and cashless:
+            payee, checks = await self._hospital_payee(claim)
+        elif decision.final_decision in PAID:
             record = await self._claim_record(claim_id)
             checks = payee_checks(
                 record.bank,
@@ -73,7 +81,7 @@ class DefaultSettlementService:
             status="awaiting_release",
             released_by=None,
             payment_ref=None,
-            block_id=registration.block_ref.block_id if registration.block_ref else None,
+            block_id=await self._block_id(claim_id, registration),
             utilised=ZERO,
             released=ZERO,
             closed_at=None,
@@ -107,13 +115,15 @@ class DefaultSettlementService:
             )
         utilised = checked.paid_amount if paid else ZERO
         released, closed_at = ZERO, self._now()
-        if registration.block_ref is not None:
+        block = await self._block(claim_id, registration)
+        if block is not None:
+            block_id, blocked = block
             await self._money.release_block(
-                block_id=registration.block_ref.block_id,
+                block_id=block_id,
                 utilised=utilised,
                 idempotency_key=f"{claim_id}release{checked.decision_version}",
             )
-            released = registration.block_ref.amount - utilised
+            released = blocked - utilised
         settled = checked.model_copy(
             update={
                 "status": "settled",
@@ -136,6 +146,58 @@ class DefaultSettlementService:
                 created_by=f"user:{released_by}" if paid else "code",
             )
         return settled
+
+    async def _claim(self, claim_id: UUID) -> ClaimRow:
+        async with self._sessions() as session:
+            claim = await session.get(ClaimRow, claim_id)
+        if claim is None:
+            raise NotReadyForSettlement(f"claim {claim_id} not found")
+        return claim
+
+    async def _block(
+        self, claim_id: UUID, registration: RegistrationResult
+    ) -> tuple[str, Decimal] | None:
+        """The block to release: as the last cashless authorisation left it (an enhancement
+        raises it), else as registration made it."""
+        authorised = await self._records.latest(claim_id, Stage.AUTHORISATION)
+        if authorised is not None and authorised.payload.get("block_id"):
+            payload = authorised.payload
+            return str(payload["block_id"]), Decimal(str(payload["blocked"]))
+        if registration.block_ref is None:
+            return None
+        return registration.block_ref.block_id, registration.block_ref.amount
+
+    async def _block_id(self, claim_id: UUID, registration: RegistrationResult) -> str | None:
+        block = await self._block(claim_id, registration)
+        return block[0] if block else None
+
+    async def _hospital_payee(self, claim: ClaimRow) -> tuple[Payee | None, list[PayeeCheck]]:
+        """A cashless claim pays the hospital the account its agreement names."""
+        async with self._sessions() as session:
+            agreement = await session.scalar(
+                select(HospitalAgreementRow)
+                .where(HospitalAgreementRow.hospital_id == claim.hospital_id)
+                .order_by(HospitalAgreementRow.valid_from.desc())
+                .limit(1)
+            )
+        account = digits(agreement.payee_account_number) if agreement else ""
+        ifsc = ((agreement.payee_ifsc if agreement else None) or "").strip().upper()
+        checks = [
+            PayeeCheck(
+                check_id="ifsc_format",
+                passed=re.fullmatch(IFSC_PATTERN, ifsc) is not None,
+                detail=f"IFSC {ifsc or '(none)'} against {IFSC_PATTERN}",
+            ),
+            PayeeCheck(
+                check_id="agreement_payee_on_file",
+                passed=bool(agreement and agreement.payee_name and account),
+                detail=f"hospital {claim.hospital_id}: agreement account {account or '(none)'}",
+            ),
+        ]
+        if agreement is None or not agreement.payee_name:
+            return None, checks
+        payee = Payee(kind="hospital", name=agreement.payee_name, account_number=account, ifsc=ifsc)
+        return payee, checks
 
     async def _latest(self, claim_id: UUID, decision_version: int) -> SettlementRecord | None:
         stored = await self._records.latest(claim_id, Stage.SETTLEMENT)

@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import Depends, Header, HTTPException, Request
 
 from app.integrations.core.contract import PermissionService
+from app.services.cashless.contract import CashlessService
 from app.services.claims.contract import ClaimQueryService
 from app.services.file_store.contract import FileStore
 from app.services.intake.contract import IntakeService
@@ -55,6 +56,11 @@ def get_permission_service(request: Request) -> PermissionService:
     return service
 
 
+def get_cashless_service(request: Request) -> CashlessService:
+    service: CashlessService = request.app.state.cashless_service
+    return service
+
+
 async def current_user(
     users: Annotated[UserService, Depends(get_user_service)],
     x_user_id: Annotated[str | None, Header()] = None,
@@ -85,3 +91,4 @@ Claims = Annotated[ClaimQueryService, Depends(get_claim_queries)]
 Files = Annotated[FileStore, Depends(get_file_store)]
 Permissions = Annotated[PermissionService, Depends(get_permission_service)]
 Queries = Annotated[QueryService, Depends(get_query_service)]
+Cashless = Annotated[CashlessService, Depends(get_cashless_service)]

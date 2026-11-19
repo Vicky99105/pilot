@@ -166,3 +166,41 @@ async def test_an_address_off_the_allowlist_is_not_sent_and_the_letter_says_why(
     assert (letter.kind, letter.sent) == ("approval", False)
     assert "not on NOTIFICATION_ALLOWLIST" in (letter.send_error or "")
     assert transport.messages == []
+
+
+# --- P2-5: the cashless authorisation letter (Part D style) ----------------------------------
+
+
+async def test_a_cashless_request_gets_an_authorisation_letter(env: Env) -> None:
+    """An approved or partly approved cashless request is authorised, not paid to the
+    member: the letter states the request, the amount approved now, the earlier approved
+    total and the new total, all from the authorisation record."""
+    from sqlalchemy import update
+
+    from app.database.models import ClaimRow
+    from app.database.repositories.stage_records import StageRecordRepository
+    from app.shared.types import Stage
+
+    claim = await decided_claim(env.sessions, "partial")
+    async with env.sessions.begin() as session:
+        await session.execute(
+            update(ClaimRow)
+            .where(ClaimRow.id == claim.claim_id)
+            .values(request_type="preauth", current_request="enhancement")
+        )
+    await StageRecordRepository(env.sessions).append(
+        claim.claim_id,
+        Stage.AUTHORISATION,
+        {"request_type": "enhancement", "previous_total": "26500.00",
+         "approved_now": "9837.50", "approved_total": "36337.50"},
+        created_by="test",
+    )  # fmt: skip
+    letter = await env.service(echo_gateway()).issue_letter(claim.claim_id)
+
+    assert letter.kind == "authorisation"
+    assert letter.request_type == "enhancement"
+    assert (letter.previous_total, letter.amount, letter.approved_total) == (
+        D("26500.00"), D("9837.50"), D("36337.50"))  # fmt: skip
+    text = await env.pdf_text(letter.pdf_key)
+    assert "Authorisation letter" in text and "Enhancement" in text
+    assert "36,337.50" in text and "26,500.00" in text

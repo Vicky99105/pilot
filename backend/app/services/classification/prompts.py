@@ -31,6 +31,15 @@ DOC_TYPE_GUIDE = {
     DocType.CANCELLED_CHEQUE: "Cancelled cheque or bank passbook page showing account and IFSC",
     DocType.KYC: "Identity or address proof: Aadhaar, PAN, passport, voter ID",
     DocType.FIR_MLC: "Police FIR or medico-legal certificate (MLC) for an injury or accident",
+    DocType.PREAUTH_FORM: (
+        "Cashless pre-authorisation request form (Part C), filled by the hospital and the "
+        "treating doctor: provisional diagnosis, proposed treatment and cost estimate"
+    ),
+    DocType.ENHANCEMENT_REQUEST: (
+        "Hospital letter or form asking the insurer to raise an approved cashless amount, "
+        "with the extra amount and the reason"
+    ),
+    DocType.INTERIM_BILL: "Interim or running hospital bill during the stay, before discharge",
     DocType.OTHER: "Anything else",
 }
 

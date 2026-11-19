@@ -21,10 +21,15 @@ export function TopBar({
           { to: '/review', label: 'Review' },
           { to: '/monitoring', label: 'Monitoring' },
         ]
-      : [
-          { to: '/submit', label: 'My claims' },
-          { to: '/submit/new', label: 'New claim' },
-        ]
+      : user.kind === 'hospital'
+        ? [
+            { to: '/submit', label: 'Admissions' },
+            { to: '/submit/new', label: 'New pre-auth' },
+          ]
+        : [
+            { to: '/submit', label: 'My claims' },
+            { to: '/submit/new', label: 'New claim' },
+          ]
 
   return (
     <header className="border-b border-line bg-surface">

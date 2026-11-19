@@ -554,3 +554,116 @@ async def test_review_needs_the_medical_coding(env: Env) -> None:
 
     with pytest.raises(NotReadyForBillReview, match="coded"):
         await env.service.review(claim_id)
+
+
+# --- P2-5: the cashless estimate and R26 -------------------------------------------------
+
+
+def estimate_head(name: str, amount: str, days: str | None = None) -> dict[str, Any]:
+    def f(value: str | None) -> dict[str, Any]:
+        return {"value": value, "confidence": 0.99}
+
+    return {"head": f(name), "days": f(days), "amount": f(amount)}
+
+
+PREAUTH_ESTIMATE = [
+    estimate_head("Room rent", "15000", days="3"),
+    estimate_head("OT charges", "14500"),
+    estimate_head("Surgeon and anaesthetist fees", "12000"),
+    estimate_head("Medicines and consumables", "6000"),
+    estimate_head("Investigations", "2500"),
+]
+ENHANCEMENT_HEADS = [
+    estimate_head("Room rent", "5000", days="1"),
+    estimate_head("Medicines", "3000"),
+]
+
+
+class EverythingPayable(FakeModelGateway):
+    """R12 reads every unclear line as payable; other purposes follow the script."""
+
+    def _next(self, purpose: str, schema: Any) -> Any:
+        if purpose == "bill_non_payable":
+            reading = {"choice": "payable", "confidence": 1.0}
+            return schema.model_validate({name: reading for name in schema.model_fields})
+        return super()._next(purpose, schema)
+
+
+async def cashless_claim(
+    env: Env,
+    *,
+    lines: list[Any] | None = None,
+    enhancements: list[list[dict[str, Any]]] = (),  # type: ignore[assignment]
+) -> UUID:
+    """A claim the pre-auth opened, with its Part C estimate; a final bill only when lines
+    are given (the discharge). Registered and coded with the lap appendicectomy."""
+    spec = ClaimSpec(request_type=RequestType.PREAUTH, lines=lines or [], claimed=D("50000"))
+    claim_id = await add_digitised_claim(env.sessions, spec)
+    records = StageRecordRepository(env.sessions)
+    latest = await records.latest(claim_id, Stage.DIGITISATION)
+    assert latest is not None
+    payload = dict(latest.payload)
+    payload["preauth"] = {"estimate": PREAUTH_ESTIMATE,
+                          "estimate_total": {"value": "50000", "confidence": 0.99}}  # fmt: skip
+    payload["enhancements"] = [{"estimate": heads} for heads in enhancements]
+    await records.append(claim_id, Stage.DIGITISATION, payload, created_by="test")
+    await env.registration.register(claim_id)
+    await add_coding(env.sessions, claim_id, procedures=LAP)
+    env.gateway = EverythingPayable(dict(CHOOSE_AG095))
+    return claim_id
+
+
+async def test_a_preauth_reviews_its_estimate_capped_at_the_package(env: Env) -> None:
+    """No final bill yet: the lines are the Part C estimate heads. The route is cashless, so
+    Sunrise's AG095 rate (Rs 33,000) caps the heads the package covers."""
+    claim_id = await cashless_claim(env)
+
+    sheet = await env.service.review(claim_id)
+
+    assert [(ln.head, ln.claimed) for ln in sheet.lines] == [
+        (Head.ROOM, D("15000.00")),
+        (Head.OT, D("14500.00")),
+        (Head.PROFESSIONAL_FEES, D("12000.00")),
+        (Head.PHARMACY, D("6000.00")),
+        (Head.DIAGNOSTICS, D("2500.00")),
+    ]
+    assert {ln.head_as_written for ln in sheet.lines} == {"Pre-auth estimate"}
+    assert sheet.claimed_total == D("50000.00")
+    assert sheet.admissible_total == D("33000.00")
+    assert all(ln.in_package and ln.rule_id == "R20" for ln in sheet.lines)
+    [r26] = [r for r in sheet.rule_results if r.rule_id == "R26"]
+    assert r26.passed and "no pre-auth" in r26.reason  # nothing approved before
+
+
+async def test_an_enhancement_adds_its_heads_to_the_estimate(env: Env) -> None:
+    claim_id = await cashless_claim(env, enhancements=[ENHANCEMENT_HEADS])
+
+    sheet = await env.service.review(claim_id)
+
+    assert [ln.head_as_written for ln in sheet.lines][-2:] == ["Enhancement 1"] * 2
+    assert sheet.claimed_total == D("58000.00")
+    room = [ln for ln in sheet.lines if ln.head is Head.ROOM]
+    assert [ln.claimed for ln in room] == [D("15000.00"), D("5000.00")]
+
+
+async def test_the_final_bill_is_held_to_the_approved_total_r26(env: Env) -> None:
+    """At discharge the lines are the final bill. The implant and the ambulance are outside
+    the package, so the admissible total (Rs 33,000 package, Rs 2,500 implant, Rs 1,800
+    ambulance after the 10% non-package discount) exceeds the Rs 33,000 approved before
+    co-pay: R26 takes the Rs 4,300 excess."""
+    lines = [*ITEMISED, bill_line(11, "Ambulance", "Ambulance to hospital", "2000")]
+    claim_id = await cashless_claim(env, lines=lines)
+    await StageRecordRepository(env.sessions).append(
+        claim_id,
+        Stage.AUTHORISATION,
+        {"approved_total": "31350.00", "approved_admissible": "33000.00",
+         "diagnosis_codes": ["K35.80"], "status": "awaiting_discharge"},
+        created_by="test",
+    )  # fmt: skip
+
+    sheet = await env.service.review(claim_id)
+
+    [r26] = [r for r in sheet.rule_results if r.rule_id == "R26"]
+    assert (r26.passed, r26.amount_effect) == (False, D("-4300.00"))
+    assert sheet.admissible_total == D("33000.00")
+    assert sheet.payable == D("31350.00")

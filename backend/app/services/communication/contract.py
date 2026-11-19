@@ -1,9 +1,11 @@
 """Contract for communication: letters to the claimant as PDFs, sent through the
 NotificationService contract.
 
-Kinds: approval, partial (with the deduction table), rejection (reasons with clause refs)
-and query (the items to send). Every number in a letter comes from code: the deduction sheet
-and the decision record. One FAST_TEXT model call may rewrite the reasons in plain language;
+Kinds: approval, partial (with the deduction table), rejection (reasons with clause refs),
+query (the items to send) and authorisation (Part D style, for an approved or partly
+approved cashless request: the amount approved now, the earlier total and the new total).
+Every number in a letter comes from code: the deduction sheet, the decision record and the
+authorisation. One FAST_TEXT model call may rewrite the reasons in plain language;
 when the rewrite changes or drops any number or clause reference, the raw reasons are used.
 
 Callers import this module only.
@@ -18,7 +20,7 @@ from pydantic import BaseModel
 
 from app.shared.errors import PermanentError
 
-LetterKind = Literal["approval", "partial", "rejection", "query"]
+LetterKind = Literal["approval", "partial", "rejection", "query", "authorisation"]
 
 
 class DeductionRow(BaseModel):
@@ -47,6 +49,9 @@ class Letter(BaseModel):
     plain_language: bool
     query_items: list[str]
     reply_by: datetime | None  # query letters
+    request_type: str | None = None  # authorisation letters: preauth, enhancement, discharge
+    previous_total: Decimal | None = None  # authorisation letters: approved earlier
+    approved_total: Decimal | None = None  # authorisation letters: approved in all
     pdf_key: str
     sent: bool
     send_error: str | None = None

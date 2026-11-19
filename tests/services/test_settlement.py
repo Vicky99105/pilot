@@ -21,6 +21,8 @@ from app.shared.types import Stage
 from tests.fakes.core import FakeMoneyService
 from tests.services.decided_claims import BREACH_PAYABLE, bank, decided_claim
 
+SUNRISE_PAYEE = "Sunrise Multispeciality Hospital"
+
 D = Decimal
 
 
@@ -176,3 +178,42 @@ async def test_a_form_without_bank_details_adds_no_third_check(
     checked = await service(sessions, claim.money).check_payee(claim.claim_id)
 
     assert "cheque_matches_submit_form" not in [c.check_id for c in checked.payee_checks]
+
+
+# --- P2-5: a cashless claim pays the hospital ------------------------------------------------
+
+
+async def test_a_cashless_discharge_pays_the_hospital_and_releases_the_authorised_block(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """The payee is the account in the hospital's agreement, not the member's cheque. The
+    block is the authorised one (the enhancement raised it), so the release returns the
+    authorised block less the amount paid."""
+    claim = await decided_claim(sessions, "partial")
+    await seed_claims_db(sessions)  # the hospital agreements, with their payee accounts
+    async with sessions.begin() as session:
+        row = await session.get(ClaimRow, claim.claim_id)
+        assert row is not None
+        row.request_type, row.current_request = "preauth", "discharge"
+    [block] = claim.money.blocks.values()
+    await StageRecordRepository(sessions).append(
+        claim.claim_id,
+        Stage.AUTHORISATION,
+        {"block_id": block.block_id, "blocked": "45000.00", "status": "final"},
+        created_by="test",
+    )
+    settlement = service(sessions, claim.money)
+
+    checked = await settlement.check_payee(claim.claim_id)
+    settled = await settlement.settle(claim.claim_id, released_by=FINANCE_USER_ID)
+
+    assert checked.payee is not None
+    assert (checked.payee.kind, checked.payee.name) == ("hospital", SUNRISE_PAYEE)
+    assert [(c.check_id, c.passed) for c in checked.payee_checks] == [
+        ("ifsc_format", True),
+        ("agreement_payee_on_file", True),
+    ]
+    [payment] = claim.money.payments.values()
+    assert payment.amount == BREACH_PAYABLE
+    assert list(claim.money.releases.values()) == [(block.block_id, BREACH_PAYABLE)]
+    assert settled.released == D("45000.00") - BREACH_PAYABLE

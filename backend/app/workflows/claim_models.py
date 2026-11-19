@@ -31,6 +31,14 @@ class StageResult(BaseModel):
     checkpoint_payload: dict[str, Any] = {}  # what the person needs to see at the checkpoint
     draft: DraftDecision | None = None  # adjudication only
     authority_amount: Decimal | None = None  # decision only: the approver limit needed
+    closed: bool = False  # authorisation only: a rejected pre-auth closed the claim
+
+
+class CashlessStepInput(BaseModel):
+    """A cashless request on the claim: the follow-up submission that carries it."""
+
+    claim_id: UUID
+    submission_id: UUID
 
 
 class OpenTaskInput(BaseModel):

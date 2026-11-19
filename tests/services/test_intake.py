@@ -381,3 +381,90 @@ async def test_a_failed_start_warns_once(env: Env) -> None:
     assert await env.intake.start_missing_workflows() == []
     stored = await env.intake.get(claim.submission_id)
     assert stored is not None and len(stored.warnings) == 1
+
+
+# --- P2-5: cashless requests ---------------------------------------------------------------
+
+
+async def _preauth(env: Env) -> UUID:
+    submission = await env.intake.accept(
+        _submission(
+            [_file(DocType.PREAUTH_FORM, make_pdf(["Part C"]))],
+            request_type=RequestType.PREAUTH,
+            channel="hospital",
+            discharge_date=None,
+        )
+    )
+    return submission.claim_id
+
+
+@pytest.mark.parametrize(
+    ("request_type", "hours"),
+    [(RequestType.PREAUTH, 1), (RequestType.ENHANCEMENT, 1), (RequestType.DISCHARGE, 3)],
+)
+async def test_each_cashless_request_carries_its_own_clock(
+    env: Env, request_type: RequestType, hours: int
+) -> None:
+    """The clock is set at intake per request: 1 hour for a pre-auth or an enhancement, 3
+    hours for a discharge."""
+    claim_id = await _preauth(env)
+    if request_type is RequestType.PREAUTH:
+        reply = await env.intake.accept_followup(
+            claim_id, submitted_by=MEMBER_USER_ID, channel="hospital", files=[_file(None)]
+        )
+        submission = await env.intake.get(reply.submission_id)
+        async with env.sessions() as session:
+            claim = await session.get(ClaimRow, claim_id)
+        assert claim is not None and claim.deadline == NOW + timedelta(hours=1)
+        assert submission is not None and submission.clock_deadline is None  # a query reply
+        return
+    followup = await env.intake.accept_followup(
+        claim_id,
+        submitted_by=MEMBER_USER_ID,
+        channel="hospital",
+        files=[_file(None, make_pdf([request_type.value]))],
+        request_type=request_type,
+    )
+
+    assert followup.request_type is request_type
+    assert followup.clock_deadline == NOW + timedelta(hours=hours)
+    assert env.starter.followups[-1] == (str(claim_id), followup.submission_id)
+
+
+async def test_a_cashless_follow_up_lists_the_missing_documents_of_its_checklist(
+    env: Env,
+) -> None:
+    claim_id = await _preauth(env)
+
+    discharge = await env.intake.accept_followup(
+        claim_id,
+        submitted_by=MEMBER_USER_ID,
+        channel="hospital",
+        files=[_file(DocType.FINAL_BILL)],
+        request_type=RequestType.DISCHARGE,
+    )
+
+    assert DocType.DISCHARGE_SUMMARY in discharge.missing_documents
+    assert DocType.FINAL_BILL not in discharge.missing_documents
+
+
+async def test_a_cancellation_needs_no_files(env: Env) -> None:
+    claim_id = await _preauth(env)
+
+    cancelled = await env.intake.accept_followup(
+        claim_id,
+        submitted_by=MEMBER_USER_ID,
+        channel="hospital",
+        files=[],
+        request_type=RequestType.CANCELLATION,
+    )
+
+    assert cancelled.files == [] and cancelled.request_type is RequestType.CANCELLATION
+    with pytest.raises(SubmissionRejected):
+        await env.intake.accept_followup(
+            claim_id,
+            submitted_by=MEMBER_USER_ID,
+            channel="hospital",
+            files=[],
+            request_type=RequestType.ENHANCEMENT,
+        )

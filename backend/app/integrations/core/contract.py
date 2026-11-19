@@ -95,6 +95,13 @@ class MoneyService(Protocol):
         self, *, policy_number: str, member_id: str, amount: Decimal, idempotency_key: str
     ) -> BlockRef: ...
 
+    async def adjust_block(
+        self, *, block_id: str, amount: Decimal, idempotency_key: str
+    ) -> BlockRef:
+        """Set an active block to amount: an enhancement raises it, a pre-auth approved
+        below its estimate lowers it. A raise beyond the available sum insured is refused."""
+        ...
+
     async def release_block(
         self, *, block_id: str, utilised: Decimal, idempotency_key: str
     ) -> None: ...

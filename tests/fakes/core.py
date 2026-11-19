@@ -58,6 +58,7 @@ class FakeMoneyService:
     def __init__(self) -> None:
         self.blocks: dict[str, BlockRef] = {}
         self.releases: dict[str, tuple[str, Decimal]] = {}
+        self.adjustments: dict[str, BlockRef] = {}
         self.payments: dict[str, PaymentRef] = {}
 
     async def block_sum_insured(
@@ -68,6 +69,15 @@ class FakeMoneyService:
                 block_id=str(uuid4()), amount=amount, available_after=Decimal("0")
             )
         return self.blocks[idempotency_key]
+
+    async def adjust_block(
+        self, *, block_id: str, amount: Decimal, idempotency_key: str
+    ) -> BlockRef:
+        if idempotency_key not in self.adjustments:
+            self.adjustments[idempotency_key] = BlockRef(
+                block_id=block_id, amount=amount, available_after=Decimal("0")
+            )
+        return self.adjustments[idempotency_key]
 
     async def release_block(
         self, *, block_id: str, utilised: Decimal, idempotency_key: str

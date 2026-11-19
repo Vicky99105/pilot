@@ -48,6 +48,16 @@ class RequestType(StrEnum):
     CANCELLATION = "cancellation"
 
 
+# The requests a network hospital sends on one cashless claim, one claim per admission. The
+# pre-auth opens the claim; the others are follow-ups on it.
+CASHLESS_REQUESTS = (
+    RequestType.PREAUTH,
+    RequestType.ENHANCEMENT,
+    RequestType.DISCHARGE,
+    RequestType.CANCELLATION,
+)
+
+
 class DocType(StrEnum):
     """Document types a page can be labelled with. Checklists and slots use the same values."""
 
@@ -63,6 +73,9 @@ class DocType(StrEnum):
     CANCELLED_CHEQUE = "cancelled_cheque"
     KYC = "kyc"
     FIR_MLC = "fir_mlc"  # police FIR or medico-legal certificate, for an injury or accident
+    PREAUTH_FORM = "preauth_form"  # cashless request form, Part C (hospital and doctor)
+    ENHANCEMENT_REQUEST = "enhancement_request"  # the hospital's note asking for more
+    INTERIM_BILL = "interim_bill"  # the running bill during the stay
     OTHER = "other"
 
 
@@ -77,6 +90,7 @@ class Stage(StrEnum):
     RISK = "risk"
     ADJUDICATION = "adjudication"
     DECISION = "decision"
+    AUTHORISATION = "authorisation"  # cashless: the approved total and the block behind it
     COMMUNICATION = "communication"
     QUERY = "query"
     SETTLEMENT = "settlement"

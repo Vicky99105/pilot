@@ -5,19 +5,19 @@ import { useAsync } from '../../hooks/useAsync'
 import { Button, Card, Chip, Empty, ErrorList, Loading } from '../ui/primitives'
 import { statusLabel, statusTone } from './status'
 
-export function MyClaims({ userId }: { userId: string }) {
+export function MyClaims({ userId, hospital = false }: { userId: string; hospital?: boolean }) {
   const [state, reload] = useAsync(() => api.myClaims(), [userId])
 
   return (
     <Card
-      title="My claims"
+      title={hospital ? 'Admissions' : 'My claims'}
       actions={
         <div className="flex gap-2">
           <Button variant="ghost" onClick={reload}>
             Refresh
           </Button>
           <a href={href('/submit/new')} className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-ink">
-            New claim
+            {hospital ? 'New pre-auth' : 'New claim'}
           </a>
         </div>
       }

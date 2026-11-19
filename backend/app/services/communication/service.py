@@ -38,7 +38,7 @@ from app.services.notification.contract import (
     NotificationService,
 )
 from app.shared.errors import PermanentError
-from app.shared.types import Stage
+from app.shared.types import RequestType, Stage
 
 __all__ = ["PLAIN_PURPOSE", "DefaultCommunicationService"]
 
@@ -99,18 +99,41 @@ class DefaultCommunicationService:
             raw = [row_reason(r) for r in rows]
             clauses = [[r.clause_ref] if r.clause_ref else [] for r in rows]
         reasons, plain = await self._plain(claim_id, raw, clauses)
+        extra: dict[str, Any] = {"amount": record.final_amount}
+        authorised = await self._authorisation(claim_id) if kind != "rejection" else None
+        if authorised is not None:
+            kind = "authorisation"
+            extra = {
+                "amount": Decimal(str(authorised["approved_now"])),
+                "request_type": authorised["request_type"],
+                "previous_total": Decimal(str(authorised["previous_total"])),
+                "approved_total": Decimal(str(authorised["approved_total"])),
+            }
+            if authorised["request_type"] == RequestType.DISCHARGE.value:
+                extra["amount"] = record.final_amount
         letter = await self._letter(
             claim_id,
             kind=kind,
             decision_version=stored.version,
-            amount=record.final_amount,
             claimed=sheet.claimed_total,
             deductions=rows,
             raw_reasons=raw,
             reasons=reasons,
             plain_language=plain,
+            **extra,
         )
         return await self._store_and_send(letter)
+
+    async def _authorisation(self, claim_id: UUID) -> dict[str, Any] | None:
+        """The authorisation of the claim's current cashless request, if it has one."""
+        async with self._sessions() as session:
+            claim = await session.get(ClaimRow, claim_id)
+        if claim is None or claim.request_type != RequestType.PREAUTH.value:
+            return None
+        stored = await self._records.latest(claim_id, Stage.AUTHORISATION)
+        if stored is None or stored.payload.get("request_type") != claim.current_request:
+            return None
+        return stored.payload
 
     async def issue_query_letter(self, claim_id: UUID, query_id: UUID) -> Letter:
         existing = await self._existing(LetterRow.query_id == query_id)

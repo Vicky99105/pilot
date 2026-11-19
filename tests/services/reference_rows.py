@@ -21,6 +21,7 @@ D = Decimal
 VERSIONS = {"CGHS": "2025-10-13", "PMJAY": "HBP2022", "MEDISEP": "PhaseII-2026"}
 
 # The guideline's mandatory claim documents, as the STG compilation writes them.
+SG017B_PREAUTH_DOCUMENTS = ["Clinical notes", "USG abdomen report"]
 SG017B_CLAIM_DOCUMENTS = [
     "Is there documentary evidence of indication of surgery? Yes",
     "Are detailed operative notes available with indications for surgery and",
@@ -80,6 +81,7 @@ async def add_reference_rows(sessions: async_sessionmaker[AsyncSession]) -> None
                                     page=36, source="stg", source_version="v")
                 for section, items in (
                     ("claim_documents", SG017B_CLAIM_DOCUMENTS),
+                    ("preauth_documents", SG017B_PREAUTH_DOCUMENTS),
                     ("alos", ["3 Days"]),
                     ("clinical_pointers", ["Pain shifting to the lower right abdomen"]),
                     ("doctor_qualification", ["MS General Surgery"]),

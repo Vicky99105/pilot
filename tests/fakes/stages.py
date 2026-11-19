@@ -1,7 +1,7 @@
 """Fakes of the stage contracts for workflow tests: clean results, no checkpoints."""
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -468,3 +468,74 @@ class FakeSettlementService:
             raise PaymentNotReleased("needs a finance release")
         self.calls.append(("settle", released_by))
         return self._record(claim_id, "settled")
+
+
+class FakeCashlessService:
+    """Implements the CashlessService contract. Each follow-up's request type comes from
+    requests (submission ID -> type); any other submission is the pre-auth. The clock
+    starts when the request begins, in workflow time: 1 hour, or 3 for a discharge."""
+
+    def __init__(self) -> None:
+        self.requests: dict[UUID, RequestType] = {}
+        self.calls: list[tuple[str, str]] = []
+        self.current = RequestType.PREAUTH
+        self.closed = False
+        self.clocks: list[datetime | None] = []
+
+    async def begin_request(self, claim_id: UUID, submission_id: UUID) -> Any:
+        from temporalio import activity
+
+        from app.services.cashless.contract import CashlessRequest
+
+        self.current = self.requests.get(submission_id, RequestType.PREAUTH)
+        self.calls.append(("begin_request", self.current.value))
+        started = activity.info().current_attempt_scheduled_time
+        hours = {RequestType.DISCHARGE: 3, RequestType.CANCELLATION: None}.get(self.current, 1)
+        self.clocks.append(started + timedelta(hours=hours) if hours else None)
+        return CashlessRequest(
+            claim_id=claim_id,
+            submission_id=submission_id,
+            request_type=self.current,
+            received_at=started,
+            clock_deadline=started + timedelta(hours=hours) if hours else None,
+        )
+
+    def _authorisation(self, claim_id: UUID, status: Any, request: RequestType) -> Any:
+        from app.services.cashless.contract import Authorisation
+
+        zero = Decimal("0.00")
+        return Authorisation(
+            claim_id=claim_id,
+            request_type=request,
+            submission_id=None,
+            decision_version=1,
+            final_decision="approve",
+            approved_now=zero,
+            previous_total=zero,
+            approved_total=zero,
+            approved_admissible=zero,
+            diagnosis_codes=[],
+            block_id=None,
+            blocked=zero,
+            status=status,
+            authorised_at=datetime(2026, 11, 19, tzinfo=UTC),
+        )
+
+    async def authorise(self, claim_id: UUID) -> Any:
+        self.calls.append(("authorise", self.current.value))
+        status = "final" if self.current is RequestType.DISCHARGE else "awaiting_discharge"
+        return self._authorisation(claim_id, status, self.current)
+
+    async def latest_authorisation(self, claim_id: UUID) -> Any:
+        return None
+
+    async def mark_awaiting_discharge(self, claim_id: UUID) -> None:
+        self.calls.append(("awaiting_discharge", self.current.value))
+
+    async def cancel(self, claim_id: UUID, submission_id: UUID) -> Any:
+        self.calls.append(("cancel", RequestType.CANCELLATION.value))
+        self.closed = True
+        return self._authorisation(claim_id, "cancelled", RequestType.CANCELLATION)
+
+    async def mark_originals_received(self, claim_id: UUID, user_id: UUID) -> Any:
+        raise NotImplementedError

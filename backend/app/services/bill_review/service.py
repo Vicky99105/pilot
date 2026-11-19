@@ -58,6 +58,7 @@ from app.services.rules.contract import (
     NonPayableItem,
     NonPayableJudgement,
     PackageFacts,
+    PreAuthFacts,
     ProductConfig,
     RoomFacts,
     RulesEngine,
@@ -224,6 +225,7 @@ class DefaultBillReviewService:
             review.spread("R19", ambulance, Facts(ambulance_total=total))
         procedures = [p.code.code for p in coding.procedure_codes]
         diagnoses = [v.code.code for v in coding.verified_codes]
+        preauth = await self._approved(claim_id) if record.bill.lines else None
         for rule_id in ("R16", "R17", "R26"):
             review.spread(
                 rule_id,
@@ -233,6 +235,7 @@ class DefaultBillReviewService:
                     admissible_total=review.admissible(),
                     procedure_codes=procedures,
                     diagnosis_codes=diagnoses,
+                    preauth=preauth,
                 ),
             )
 
@@ -304,6 +307,17 @@ class DefaultBillReviewService:
             claim_id, Stage.BILL_REVIEW, sheet.model_dump(mode="json"), created_by=actor
         )
         return sheet
+
+    async def _approved(self, claim_id: UUID) -> PreAuthFacts | None:
+        """R26 at discharge: what the pre-auth and enhancements approved, before co-pay,
+        and the diagnosis codes the pre-auth verified. None on a claim with no pre-auth."""
+        stored = await self._records.latest(claim_id, Stage.AUTHORISATION)
+        if stored is None or stored.payload.get("approved_admissible") is None:
+            return None
+        return PreAuthFacts(
+            approved_total=Decimal(str(stored.payload["approved_admissible"])),
+            diagnosis_codes=stored.payload.get("diagnosis_codes") or [],
+        )
 
     async def _claim_route(self, claim_id: UUID) -> ClaimRoute | None:
         async with self._sessions() as session:
@@ -570,7 +584,40 @@ def diagnoses_codes(coding: MedicalCoding) -> list[str]:
     return [v.code.code for v in coding.verified_codes]
 
 
+def _estimate_lines(record: ClaimRecord) -> list[_Line]:
+    """A cashless request before discharge has no bill: its lines are the estimate, the
+    Part C heads, then each enhancement's heads, mapped like bill lines. A head with days
+    (room, ICU) carries them as its quantity."""
+    sources = [("Pre-auth estimate", record.preauth.estimate)]
+    sources += [(f"Enhancement {n}", e.estimate) for n, e in enumerate(record.enhancements, 1)]
+    lines: list[_Line] = []
+    for written, heads in sources:
+        for item in heads:
+            head, flagged = map_head(item.head.value, None)
+            claimed = money(item.amount.value or ZERO)
+            days = item.days.value if item.days.value and item.days.value > 0 else None
+            sheet = DeductionLine(
+                line_id=len(lines) + 1,
+                head=head,
+                head_as_written=written,
+                description=item.head.value or "",
+                claimed=claimed,
+                admissible=claimed,
+                deducted=ZERO,
+                rule_id=None,
+                clause_ref=None,
+                reason=None,
+                flagged=flagged,
+                flag_reason="no known head; check this line" if flagged else None,
+            )
+            rate = claimed / days if days else None
+            lines.append(_Line(sheet=sheet, qty=days, rate=rate, service_date=None))
+    return lines
+
+
 def _lines(record: ClaimRecord) -> list[_Line]:
+    if not record.bill.lines:
+        return _estimate_lines(record)
     lines = []
     for bill_line in record.bill.lines:
         head, flagged = map_head(bill_line.head.value, bill_line.description.value)

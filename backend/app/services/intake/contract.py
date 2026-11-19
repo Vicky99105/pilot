@@ -87,6 +87,7 @@ class Submission(BaseModel):
     missing_documents: list[DocType]
     warnings: list[str]
     deadline: datetime | None
+    clock_deadline: datetime | None = None  # a cashless request's own clock
     duplicate_of: UUID | None = None  # set when this repeats an earlier submission
     workflow_id: str | None = None  # None when the workflow could not be started yet
     created_at: datetime
@@ -115,7 +116,9 @@ class IntakeService(Protocol):
         files: list[UploadedFile],
         request_type: RequestType = RequestType.QUERY_REPLY,
     ) -> Submission:
-        """A follow-up with the parent claim's form, such as a query reply."""
+        """A follow-up with the parent claim's form: a query reply, or a cashless request
+        (enhancement, discharge, cancellation) on the claim its pre-auth opened. A
+        cancellation needs no files; any other submission needs at least one."""
         ...
 
     async def get(self, submission_id: UUID) -> Submission | None: ...

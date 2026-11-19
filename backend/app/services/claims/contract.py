@@ -4,6 +4,7 @@ Callers import this module only.
 """
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
 
@@ -60,6 +61,23 @@ class OpenQueryView(BaseModel):
     reply_url: str  # POST, multipart
 
 
+class AuthorisationView(BaseModel):
+    """One cashless authorisation: what the request added and the total approved."""
+
+    request_type: RequestType
+    status: str  # awaiting_discharge, final, rejected or cancelled
+    approved_now: Decimal
+    approved_total: Decimal
+    authorised_at: datetime
+
+
+class ChecklistItem(BaseModel):
+    doc_type: DocType
+    required: bool
+    mandatory_from_amount: Decimal | None
+    notes: str | None
+
+
 class ClaimDetail(ClaimSummary):
     policy_number: str | None
     member_id: str | None
@@ -69,6 +87,13 @@ class ClaimDetail(ClaimSummary):
     submissions: list[SubmissionView]
     letters: list[LetterView] = []  # oldest first
     open_query: OpenQueryView | None = None
+    # Cashless claims: the request being processed and its clock, the authorisations so far
+    # (oldest first), and the hospital's originals (due 15 days after discharge).
+    current_request: RequestType | None = None
+    clock_deadline: datetime | None = None  # None once the current request is authorised
+    authorisations: list[AuthorisationView] = []
+    originals_due_at: datetime | None = None
+    originals_received_at: datetime | None = None
 
 
 class ClaimPage(BaseModel):
@@ -118,4 +143,8 @@ class ClaimQueryService(Protocol):
 
     async def stored_file(self, storage_key: str) -> StoredFile | None:
         """An uploaded file, a rendered page image or a letter PDF, by its storage key."""
+        ...
+
+    async def checklist(self, request_type: RequestType) -> list[ChecklistItem]:
+        """The documents a request needs, in checklist order."""
         ...

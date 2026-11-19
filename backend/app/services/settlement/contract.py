@@ -4,6 +4,8 @@
    the claim form Part A and, when the Submit-area form carries bank details, against
    that form too. Nothing is paid.
 2. A person with the FINANCE role releases the payment (a workflow checkpoint).
+   A cashless claim pays the hospital: the payee is the hospital agreement's account, and
+   the checks are its IFSC format and that the agreement names an account.
 3. settle: the payment instruction (idempotency key claim_id + "pay" + decision version),
    then the sum insured block released with utilised = the paid amount, then the claim
    closes. A rejected claim needs no release: its whole block is released and it closes.
@@ -30,6 +32,7 @@ PayeeCheckId = Literal[
     "holder_matches_member",
     "cheque_matches_claim_form",
     "cheque_matches_submit_form",
+    "agreement_payee_on_file",  # cashless: the hospital agreement names the payee account
 ]
 
 

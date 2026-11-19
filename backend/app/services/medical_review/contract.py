@@ -21,6 +21,8 @@ These guarantees hold for every MedicalCoding and MedicalFindings:
   option's label. Free-text concerns are findings, never query items.
 - A mandatory document an earlier query asked for and the claim still does not hold is a
   "documents" finding for the approver, never a second query.
+- Document findings are code-only: the findings model call cannot write the "documents"
+  kind and never sees the guideline's mandatory document list.
 
 Callers import this module only.
 """
@@ -43,6 +45,10 @@ FindingKind = Literal[
     "clinical",
     "documents",  # a mandatory document a query asked for and the claim still does not hold
 ]
+# The kinds the findings model call may write. Document presence ("documents") and the
+# eligibility, stay, history and hospital-code findings are written by code alone.
+ModelFindingKind = Literal["clinical", "coding"]
+MODEL_FINDING_KINDS: tuple[ModelFindingKind, ...] = ("clinical", "coding")
 LookupTool = Literal["search_icd_index", "get_icd_tabular", "pcs_options", "pcs_validate"]
 PED_CLAUSE = "Excl01"
 

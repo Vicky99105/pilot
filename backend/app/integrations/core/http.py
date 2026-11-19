@@ -74,6 +74,22 @@ class HttpMoneyService(_CoreClient):
             raise _refused(response)
         return BlockRef.model_validate(response.json())
 
+    async def adjust_block(
+        self, *, block_id: str, amount: Decimal, idempotency_key: str
+    ) -> BlockRef:
+        response = await self._request(
+            "POST",
+            f"/blocks/{block_id}/adjust",
+            json={"amount": str(amount), "idempotency_key": idempotency_key},
+        )
+        if response.status_code == 404:
+            raise BlockNotFound(block_id)
+        if response.status_code == 409:
+            raise InsufficientSumInsured(response.json().get("detail", ""))
+        if response.status_code != 200:
+            raise _refused(response)
+        return BlockRef.model_validate(response.json())
+
     async def release_block(
         self, *, block_id: str, utilised: Decimal, idempotency_key: str
     ) -> None:

@@ -170,7 +170,7 @@ class DefaultIntakeService:
         return found
 
     async def _check(self, submission: SubmissionInput) -> list[CheckedFile]:
-        if not submission.files:
+        if not submission.files and submission.request_type is not RequestType.CANCELLATION:
             raise SubmissionRejected(["no files attached"])
         results = [
             await asyncio.to_thread(check_file, f, submission.channel) for f in submission.files
@@ -230,6 +230,8 @@ class DefaultIntakeService:
             row = self._submission_row(submission, digest)
             row.missing_documents = [d.value for d in missing]
             row.warnings = warnings
+            if submission.request_type in TURNAROUND:
+                row.clock_deadline = row.created_at + TURNAROUND[submission.request_type]
             session.add(row)
             await session.flush()
             if submission.parent_claim_id is not None:
@@ -304,8 +306,10 @@ class DefaultIntakeService:
     ) -> list[DocType]:
         """Required documents with no file in their slot. A merged upload has no slots, so
         classification checks it instead. Missing documents never block a submission."""
-        if submission.parent_claim_id is not None:
+        if submission.parent_claim_id is not None and submission.request_type not in TURNAROUND:
             return []  # a follow-up answers a query; the claim's own checklist applies
+        if not checked:
+            return []
         if any(f.slot is None for f in checked):
             warnings.append(MERGED_WARNING)
             return []
@@ -375,6 +379,7 @@ async def _load(session: AsyncSession, submission_id: UUID) -> Submission | None
         missing_documents=[DocType(d) for d in row.missing_documents],
         warnings=row.warnings,
         deadline=claim.deadline,
+        clock_deadline=row.clock_deadline,
         duplicate_of=row.duplicate_of,
         workflow_id=claim.workflow_id,
         created_at=row.created_at,

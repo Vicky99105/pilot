@@ -33,7 +33,7 @@ from app.services.registration.contract import (
     RegistrationResult,
 )
 from app.services.rules.contract import Claimant, Facts, MemberMatch, RulesEngine
-from app.shared.types import RuleResult, Stage
+from app.shared.types import CASHLESS_REQUESTS, RequestType, RuleResult, Stage
 
 CENTS = Decimal("0.01")
 CLAIM_NUMBER_ATTEMPTS = 3
@@ -129,6 +129,15 @@ class DefaultRegistrationService:
         )
         version = (latest.version if latest else 0) + 1
         previous = RegistrationResult.model_validate(latest.payload) if latest else None
+        if (
+            previous is not None
+            and previous.block_ref is not None
+            and RequestType(claim.request_type) in CASHLESS_REQUESTS
+        ):
+            # A later cashless request keeps the admission's block; its authorisation sets
+            # the amount (an enhancement raises it). Never release and re-block here.
+            result.block_ref, result.block_amount = previous.block_ref, previous.block_amount
+            return await self._store(result, created_by="code")
         if previous is not None and previous.block_ref is not None:
             await self._money.release_block(
                 block_id=previous.block_ref.block_id,
@@ -318,8 +327,13 @@ class DefaultRegistrationService:
 
 
 def _amount(record: ClaimRecord, form: ClaimForm | None) -> Decimal | None:
-    """The amount to block: the claimed total, else the bill total, else the form."""
-    for value in (record.claimed.total.value, record.bill.grand_total.value):
+    """The amount to block: the claimed total, else the bill total, else a cashless
+    pre-auth's estimate, else the form."""
+    for value in (
+        record.claimed.total.value,
+        record.bill.grand_total.value,
+        record.preauth.estimate_total.value,
+    ):
         if value is not None:
             return value.quantize(CENTS)
     return form.claimed_amount if form else None

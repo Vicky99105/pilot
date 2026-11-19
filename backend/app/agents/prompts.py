@@ -13,7 +13,14 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from app.agents.medical_case import CaseFile, stay_days, stay_limit, stg_key, stg_refs
+from app.agents.medical_case import (
+    CaseFile,
+    model_sections,
+    stay_days,
+    stay_limit,
+    stg_key,
+    stg_refs,
+)
 from app.services.adjudication.contract import Decision
 from app.services.knowledge_base.contract import (
     IcdTabularEntry,
@@ -21,7 +28,14 @@ from app.services.knowledge_base.contract import (
     PcsOption,
     PolicyClause,
 )
-from app.services.medical_review.contract import CLAUSE_PREFIX, ICD_PREFIX, Citation, Severity
+from app.services.medical_review.contract import (
+    CLAUSE_PREFIX,
+    ICD_PREFIX,
+    MODEL_FINDING_KINDS,
+    Citation,
+    ModelFindingKind,
+    Severity,
+)
 from app.services.model_gateway.contract import Message
 from app.shared.closed_schema import closed_schema, list_of, one_of
 from app.shared.types import PageRef
@@ -88,6 +102,7 @@ class CodeChoice(BaseModel):
 
 
 class FindingReply(BaseModel):
+    kind: ModelFindingKind = "clinical"
     text: str
     severity: Severity
     citations: list[str] = []
@@ -131,8 +146,16 @@ def findings_schema(case: CaseFile) -> type[FindingsReply]:
     codes and guideline sections; query items are labels of the case's document options and
     nothing else (an empty list when there are none); a long-stay reason only when the stay
     is over its norm."""
-    cites = list_of(citation_keys(case, case.verified_codes))
-    finding = closed_schema(FindingReply, "FindingClosed", citations=(cites, []))
+    hidden = set(stg_refs(case)) - {
+        stg_key(case.guideline_code or "", section) for section in model_sections(case)
+    }
+    cites = list_of([k for k in citation_keys(case, case.verified_codes) if k not in hidden])
+    finding = closed_schema(
+        FindingReply,
+        "FindingClosed",
+        kind=(one_of(MODEL_FINDING_KINDS), "clinical"),
+        citations=(cites, []),
+    )
     days, (limit, _) = stay_days(case), stay_limit(case)
     long_stay = days is not None and days > limit
     stay = closed_schema(StayReason, "StayReasonClosed", citations=(cites, []))
@@ -229,16 +252,12 @@ def findings_messages(case: CaseFile, feedback: list[str]) -> list[Message]:
             "code": case.guideline_code,
             "sections": {
                 stg_key(case.guideline_code, section): items
-                for section, items in case.guideline.items()
+                for section, items in model_sections(case).items()
             }
             if case.guideline_code
             else {},
         },
         "stay": {"days": days, "norm_days": limit, "norm": which},
-        "documents_that_may_be_requested": [
-            {"document": d.label, "mandatory_in_guideline": d.from_guideline}
-            for d in case.documents
-        ],
     }
     messages = [
         Message(
@@ -411,7 +430,7 @@ def decide_messages(
                 "set by the rules in code. Give reasons, each tied to a clause_ref, rule_id or "
                 "bill line_id, and one reason for every bill line with a deduction. One reason "
                 "with the rule_id and no line_id covers every line a claim-level rule (R16, "
-                "R17, R19, R20) spread its deduction over. A reject or partial cites at least "
+                "R17, R19, R20, R26) spread its deduction over. A reject or partial cites at least "
                 "one clause. For a query, list the documents to ask for."
             ),
         ),

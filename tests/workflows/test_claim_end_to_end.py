@@ -35,6 +35,7 @@ from app.integrations.core.contract import MemberPolicy
 from app.knowledge.loaders.icd10pcs import load_icd10pcs
 from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
+from app.services.cashless.service import DefaultCashlessService
 from app.services.classification.service import DefaultClassificationService
 from app.services.communication.service import PLAIN_PURPOSE, DefaultCommunicationService
 from app.services.decision.service import DefaultDecisionService
@@ -252,6 +253,7 @@ class Harness:
             communication=communication,
             query=self.queries,
             settlement=DefaultSettlementService(sessions, self.money),
+            cashless=DefaultCashlessService(sessions, self.money),
         )
 
     async def submit(self) -> Submission:

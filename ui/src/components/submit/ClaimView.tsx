@@ -8,6 +8,7 @@ import { EventHistory } from '../monitoring/EventHistory'
 import { Button, Card, Chip, Detail, ErrorList, Loading, Notice } from '../ui/primitives'
 import { FilePicker } from './FilePicker'
 import { JOURNEY, journeyIndex, statusLabel, statusTone } from './status'
+import { CashlessPanel } from './CashlessPanel'
 import { SubmissionResult } from './SubmissionResult'
 import { REIMBURSEMENT_SLOTS, slotParts, type SlotFiles } from './uploads'
 
@@ -52,6 +53,10 @@ export function ClaimView({ claimId, user }: { claimId: string; user: User }) {
           Query {claim.open_query.status}, reply due {date(claim.open_query.deadline)}:{' '}
           {claim.open_query.items.join('; ')}
         </Notice>
+      )}
+
+      {(claim.request_type === 'preauth' || user.kind === 'hospital') && (
+        <CashlessPanel claim={claim} user={user} onChanged={reload} />
       )}
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
@@ -108,7 +113,7 @@ function Letters({ claim }: { claim: ClaimDetail }) {
           {claim.letters.map((l) => (
             <li key={l.letter_id} className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm">
               <span>
-                {humanise(l.kind)} letter <span className="text-muted">{dateTime(l.created_at)}</span>
+                {l.kind === 'authorisation' ? 'Authorisation (Part D)' : humanise(l.kind)} letter <span className="text-muted">{dateTime(l.created_at)}</span>
               </span>
               <Button
                 variant="ghost"

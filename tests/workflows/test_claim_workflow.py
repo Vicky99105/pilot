@@ -24,6 +24,7 @@ from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.stages import (
     FakeAdjudicationService,
     FakeBillReviewService,
+    FakeCashlessService,
     FakeClassificationService,
     FakeCommunicationService,
     FakeDecisionService,
@@ -137,6 +138,7 @@ async def _harness(
             communication=FakeCommunicationService(),
             query=query,
             settlement=settlement,
+            cashless=FakeCashlessService(),
         )
         worker: Worker = build_worker(env.client, TASK_QUEUE, claim_activities=activities)
         async with worker:
@@ -178,7 +180,8 @@ async def test_happy_path_opens_always_on_checkpoints_and_closes(harness: Harnes
     assert result.status == "closed"
     assert harness.opened_kinds() == ALWAYS_ON
     completed = [e.stage for e in harness.monitoring.recorded if e.action == "stage_completed"]
-    assert completed == [s for s in Stage if s is not Stage.QUERY]
+    # A reimbursement has no cashless authorisation stage.
+    assert completed == [s for s in Stage if s not in (Stage.QUERY, Stage.AUTHORISATION)]
 
 
 async def test_medical_coding_runs_before_bill_review_and_the_full_review_after_it(
@@ -248,7 +251,8 @@ async def test_query_path_passes_all_13_stages(query_harness: Harness) -> None:
     result = await handle.result()
 
     assert result.status == "closed"
-    assert {e.stage for e in h.monitoring.recorded if e.action == "stage_completed"} == set(Stage)
+    completed = {e.stage for e in h.monitoring.recorded if e.action == "stage_completed"}
+    assert completed == set(Stage) - {Stage.AUTHORISATION}  # cashless only
     # The reply re-ran classification and digitisation, then resumed at medical coding: new
     # documents can change the codes, so the package and the deductions, so the bill
     # processor confirms the sheet again.

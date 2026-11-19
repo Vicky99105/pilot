@@ -116,11 +116,55 @@ class CancelledChequeReply(BaseModel):
     bank_name: Extracted[str] = Extracted()
 
 
+class EstimateHeadReply(BaseModel):
+    head: str
+    days: Amount | None = None
+    amount: Amount | None = None
+    page: int | None = None
+    confidence: float = 0.0
+
+
+class PreAuthFormReply(BaseModel):
+    patient_name: Extracted[str] = Extracted()
+    policy_number: Extracted[str] = Extracted()
+    member_id: Extracted[str] = Extracted()
+    date_of_birth: Extracted[dt.date] = Extracted()
+    gender: Extracted[str] = Extracted()
+    hospital_name: Extracted[str] = Extracted()
+    hospital_city: Extracted[str] = Extracted()
+    rohini_id: Extracted[str] = Extracted()
+    treating_doctor: Extracted[str] = Extracted()
+    doctor_registration_number: Extracted[str] = Extracted()
+    presenting_complaints: Extracted[str] = Extracted()
+    provisional_diagnosis: Extracted[str] = Extracted()
+    icd_code_written: Extracted[str] = Extracted()
+    proposed_treatment: Extracted[str] = Extracted()
+    pcs_code_written: Extracted[str] = Extracted()
+    admission_date: Extracted[dt.date] = Extracted()
+    admission_type: Extracted[Literal["emergency", "planned"]] = Extracted()
+    expected_stay_days: Extracted[int] = Extracted()
+    room_type: Extracted[str] = Extracted()
+    hospitalisation_due_to_injury: Extracted[bool] = Extracted()
+    estimate: list[EstimateHeadReply] = []
+    estimate_total: Extracted[Amount] = Extracted()
+
+
+class EnhancementReply(BaseModel):
+    extra_amount: Extracted[Amount] = Extracted()
+    reason: Extracted[str] = Extracted()
+    extra_days: Extracted[int] = Extracted()
+    revised_discharge_date: Extracted[dt.date] = Extracted()
+    estimate: list[EstimateHeadReply] = []
+
+
 REPLY_SCHEMAS: dict[DocType, type[BaseModel]] = {
     DocType.CLAIM_FORM_PART_A: PartAReply,
     DocType.DISCHARGE_SUMMARY: DischargeSummaryReply,
     DocType.FINAL_BILL: FinalBillReply,
     DocType.CANCELLED_CHEQUE: CancelledChequeReply,
+    DocType.PREAUTH_FORM: PreAuthFormReply,
+    DocType.ENHANCEMENT_REQUEST: EnhancementReply,
+    DocType.INTERIM_BILL: FinalBillReply,
 }
 
 
@@ -164,4 +208,23 @@ PROMPTS = {
     "the bill prints them.",
     DocType.CANCELLED_CHEQUE: _COMMON + "Document: cancelled cheque or bank passbook page.\n"
     "Extract: the account number, IFSC code, account holder name and bank name.",
+    DocType.PREAUTH_FORM: _COMMON
+    + "Document: cashless pre-authorisation request form, Part C, filled by the hospital "
+    "and the treating doctor.\n"
+    "Extract: the patient's name, policy number, member or insured ID, date of birth, "
+    "gender; the hospital's name, city and ROHINI ID; the treating doctor's name and "
+    "registration number; the presenting complaints; the provisional diagnosis and any ICD "
+    "code written; the proposed treatment and any procedure (PCS) code written; the date and "
+    "type of admission (emergency or planned); the expected length of stay in days; the "
+    "room type; whether the hospitalisation is due to an injury or accident; and the cost "
+    "estimate: each head with its amount (and its days when written), and the total.",
+    DocType.ENHANCEMENT_REQUEST: _COMMON
+    + "Document: hospital request to raise an approved cashless amount (enhancement).\n"
+    "Extract: the extra amount asked for, the reason as written, the extra days of stay, "
+    "the revised expected discharge date, and the extra amount by head (each head with its "
+    "amount, and its days when written).",
+    DocType.INTERIM_BILL: _COMMON + "Document: interim or running hospital bill.\n"
+    "Extract: the bill number, the patient's name, every bill line, every section total "
+    "and the grand total. A bill line has the section heading it sits under, its date, "
+    "description, quantity, rate and amount. Give each line one confidence and its page.",
 }

@@ -391,7 +391,7 @@ async def run_medical_review(
                 continue
             kept.append(
                 Finding(
-                    kind="clinical",
+                    kind=reply.kind,
                     text=reply.text,
                     severity=reply.severity,
                     citations=citations,

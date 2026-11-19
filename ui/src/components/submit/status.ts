@@ -7,7 +7,7 @@ export const JOURNEY: { label: string; states: string[] }[] = [
   { label: 'Registered', states: ['registration', 'medical_coding'] },
   { label: 'Bills checked', states: ['bill_review'] },
   { label: 'Medical review', states: ['medical_review', 'risk', 'adjudication', 'query'] },
-  { label: 'Decision', states: ['decision'] },
+  { label: 'Decision', states: ['decision', 'authorisation', 'awaiting_discharge'] },
   { label: 'Letter sent', states: ['communication'] },
   { label: 'Payment', states: ['settlement'] },
   { label: 'Closed', states: ['monitoring', 'closed'] },
@@ -26,6 +26,8 @@ const STATUS_LABELS: Record<string, string> = {
   adjudication: 'Under review',
   query: 'Waiting for your reply',
   decision: 'Awaiting decision',
+  authorisation: 'Authorising',
+  awaiting_discharge: 'Approved, awaiting discharge',
   communication: 'Letter being sent',
   settlement: 'Payment in progress',
   monitoring: 'Closed',
@@ -43,6 +45,7 @@ export function journeyIndex(status: string): number {
 export function statusTone(status: string): 'ok' | 'warn' | 'accent' | 'neutral' {
   if (status === 'closed' || status === 'monitoring') return 'ok'
   if (status === 'query') return 'warn'
+  if (status === 'awaiting_discharge') return 'ok'
   return 'accent'
 }
 
@@ -57,6 +60,7 @@ export const STAGE_LABELS: Record<Stage, string> = {
   risk: 'Risk',
   adjudication: 'Adjudication',
   decision: 'Decision',
+  authorisation: 'Authorisation',
   communication: 'Communication',
   query: 'Query',
   settlement: 'Settlement',

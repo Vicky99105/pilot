@@ -51,6 +51,7 @@ from tests.fakes.model_gateway import FakeModelGateway
 from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.stages import (
     FakeAdjudicationService,
+    FakeCashlessService,
     FakeCommunicationService,
     FakeDecisionService,
     FakeMedicalReviewService,
@@ -120,6 +121,7 @@ class Harness:
             communication=FakeCommunicationService(),
             query=FakeQueryService(),
             settlement=FakeSettlementService(),
+            cashless=FakeCashlessService(),
         )
 
     async def submit(self) -> Submission:

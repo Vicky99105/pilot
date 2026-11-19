@@ -4,6 +4,7 @@ import io
 import re
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from xml.sax.saxutils import escape
 
 from pydantic import BaseModel
@@ -24,6 +25,12 @@ TITLES = {
     "partial": "Claim approved in part",
     "rejection": "Claim not payable",
     "query": "Information needed for your claim",
+    "authorisation": "Authorisation letter",
+}
+REQUEST_NAMES = {
+    "preauth": "Pre-authorisation",
+    "enhancement": "Enhancement",
+    "discharge": "Final authorisation at discharge",
 }
 
 
@@ -88,6 +95,8 @@ def render_pdf(letter: Letter) -> bytes:
         Paragraph(escape(_opening(letter)), body),
         Spacer(1, 4 * mm),
     ]
+    if letter.kind == "authorisation":
+        story += [_authorisation_table(letter, body), Spacer(1, 4 * mm)]
     if letter.deductions:
         story += [_table(letter.deductions, small), Spacer(1, 4 * mm)]
     if letter.reasons:
@@ -106,7 +115,36 @@ def render_pdf(letter: Letter) -> bytes:
     return buffer.getvalue()
 
 
+def _authorisation_table(letter: Letter, style: Any) -> Table:
+    """Part D style: the request and the amounts it authorises, all from the record."""
+    rows = [
+        ["Request", REQUEST_NAMES.get(letter.request_type or "", letter.request_type or "")],
+        ["Approved earlier (Rs)", f"{letter.previous_total or 0:,.2f}"],
+        ["Approved by this letter (Rs)", f"{letter.amount:,.2f}"],
+        ["Total approved (Rs)", f"{letter.approved_total or 0:,.2f}"],
+    ]
+    if letter.claimed is not None:
+        rows.insert(1, ["Requested or billed (Rs)", f"{letter.claimed:,.2f}"])
+    table = Table(rows, colWidths=[60 * mm, 60 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9AA5B1")),
+                ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+            ]
+        )
+    )
+    return table
+
+
 def _opening(letter: Letter) -> str:
+    if letter.kind == "authorisation":
+        return (
+            "We authorise the cashless treatment below at the network hospital, subject to "
+            f"the policy terms. Total approved: {rupees(letter.approved_total or letter.amount)}."
+        )
     if letter.kind == "approval":
         return f"Your claim is approved. Amount payable: {rupees(letter.amount)}."
     if letter.kind == "partial":
