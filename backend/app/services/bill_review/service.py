@@ -31,6 +31,7 @@ from app.services.rules.contract import (
 from app.shared.types import RuleResult, Stage
 
 ONE_DAY = Decimal("1")
+FIXTURE = "fixture"  # the hand-made non-payable subset seeded for the tracer
 
 
 class DefaultBillReviewService:
@@ -167,18 +168,32 @@ class DefaultBillReviewService:
         return sheet
 
     async def _non_payable(self) -> list[NonPayableItem]:
+        """The loaded wording's lists when one is loaded, else the fixture."""
         async with self._sessions() as session:
-            rows = await session.scalars(
-                select(NonPayableItemRow).order_by(
-                    NonPayableItemRow.list_name, NonPayableItemRow.item_number
-                )
+            loaded = await session.scalar(
+                select(NonPayableItemRow.source_version)
+                .where(NonPayableItemRow.source != FIXTURE)
+                .order_by(NonPayableItemRow.id.desc())
+                .limit(1)
             )
+            query = select(NonPayableItemRow).order_by(
+                NonPayableItemRow.list_name, NonPayableItemRow.item_number
+            )
+            if loaded is None:
+                query = query.where(NonPayableItemRow.source == FIXTURE)
+            else:
+                query = query.where(
+                    NonPayableItemRow.source != FIXTURE,
+                    NonPayableItemRow.source_version == loaded,
+                )
+            rows = await session.scalars(query)
             return [
                 NonPayableItem(
                     list_name=r.list_name,
                     item_number=r.item_number,
                     item=r.item,
                     condition=r.condition,
+                    payable_in_product=r.payable_in_product,
                 )
                 for r in rows
             ]

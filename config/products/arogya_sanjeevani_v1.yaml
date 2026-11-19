@@ -5,6 +5,9 @@
 product_uin: PLACEHOLDER-AROGYA-SANJEEVANI-UIN
 name: Arogya Sanjeevani style standard product (pilot)
 version: 1
+# The filed wording the limits below are checked against when the policy_wording loader runs
+# (python -m app.knowledge.load policy_wording): Go Digit's Arogya Sanjeevani wording.
+wording_uin: GODHLIP24179V022324
 
 room_rent:
   percent_of_sum_insured: 2
@@ -34,6 +37,102 @@ grace_period_days:
   monthly: 15
   other: 30
 
+# Sub-limits and windows, each checked against the wording (section C.I).
+sub_limits:
+  cataract:
+    percent_of_sum_insured: 25
+    max_per_eye: 40000
+  modern_treatments_percent_of_sum_insured: 50
+  ambulance_max_per_hospitalisation: 2000
+pre_hospitalisation_days: 30
+post_hospitalisation_days: 60
+pre_existing_waiting_months: 36
+
+# Excl02: the wording's specified conditions, in its order, with ICD ranges. Ranges follow
+# KnowledgeBase.code_in_ranges: one code covers the codes below it; "A-B" covers both ends
+# and everything between. Mapping is conservative: a condition too broad or vague for an ICD
+# grouping, or a procedure that ICD-10-CM does not code, says so in `unmapped` instead of
+# guessing. Procedures carry ICD-10-PCS table prefixes (FY2027) instead.
+specific_waiting:
+  clause: Excl02
+  accident_exempt: true
+  conditions:
+    - item: Benign ENT disorders
+      months: 24
+      unmapped: no ICD-10-CM grouping matches "benign ENT disorders"; too broad to map
+    - item: Tonsillectomy
+      months: 24
+      icd10pcs: [0CTP]  # resection of tonsils
+      unmapped: a procedure; ICD-10-CM does not code it
+    - item: Adenoidectomy
+      months: 24
+      icd10pcs: [0CTQ]  # resection of adenoids
+      unmapped: a procedure; ICD-10-CM does not code it
+    - item: Mastoidectomy
+      months: 24
+      icd10pcs: [09TB, 09TC]  # resection of the right or left mastoid sinus
+      unmapped: a procedure; ICD-10-CM does not code it
+    - item: Tympanoplasty
+      months: 24
+      icd10pcs: [09Q7, 09Q8, 09R7, 09R8]  # repair or replacement of a tympanic membrane
+      unmapped: a procedure; ICD-10-CM does not code it
+    - item: Hysterectomy
+      months: 24
+      icd10pcs: [0UT9]  # resection of uterus
+      unmapped: a procedure; ICD-10-CM does not code it
+    - item: All internal and external benign tumours, cysts, polyps of any kind, including benign breast lumps
+      months: 24
+      # benign neoplasms; breast dysplasia and lumps; nasal, gastric, anal, rectal, colon and
+      # female genital polyps
+      icd10cm: [D10-D36, N60, N63, J33, K31.7, K62.0, K62.1, K63.5, N84]
+      unmapped: cysts are spread across every chapter with no common grouping; not mapped
+    - item: Benign prostate hypertrophy
+      months: 24
+      icd10cm: [N40]
+    - item: Cataract and age-related eye ailments
+      months: 24
+      icd10cm: [H25, H26, H28]
+      unmapped: '"age-related eye ailments" other than cataract are not a defined grouping'
+    - item: Gastric/ Duodenal Ulcer
+      months: 24
+      icd10cm: [K25-K27]  # gastric, duodenal, and peptic ulcer of unspecified site
+    - item: Gout and Rheumatism
+      months: 24
+      icd10cm: [M10, M1A, M79.0]
+    - item: Hernia of all types
+      months: 24
+      icd10cm: [K40-K46]
+    - item: Hydrocele
+      months: 24
+      icd10cm: [N43.0-N43.3, P83.5]  # N43.4 is spermatocele, not hydrocele
+    - item: Non-Infective Arthritis
+      months: 24
+      # inflammatory polyarthropathies; osteoarthritis (M15-M19) sits under the 36-month item
+      icd10cm: [M05-M14]
+    - item: Piles, Fissures and Fistula in anus
+      months: 24
+      icd10cm: [K60, K64]
+    - item: Pilonidal sinus, Sinusitis and related disorders
+      months: 24
+      icd10cm: [L05, J01, J32]
+      unmapped: '"related disorders" is not defined; not mapped'
+    - item: Prolapse inter Vertebral Disc and Spinal Diseases unless arising from accident
+      months: 24
+      icd10cm: [M40-M54]  # dorsopathies, including disc disorders M50-M51
+    - item: Calculi in urinary system, Gall Bladder and Bile duct, excluding malignancy.
+      months: 24
+      icd10cm: [N20-N22, K80]  # N23 is renal colic, not a calculus
+    - item: Varicose Veins and Varicose Ulcers
+      months: 24
+      icd10cm: [I83]  # I86 (other sites) includes gastric varices; left out
+    - item: Treatment for joint replacement unless arising from accident
+      months: 36
+      icd10pcs: [0SR, 0RR]  # replacement of lower and upper joints
+      unmapped: a procedure; ICD-10-CM does not code it
+    - item: Age-related Osteoarthritis & Osteoporosis
+      months: 36
+      icd10cm: [M15-M19, M80-M81]
+
 clauses:
   premium_received: 64VB
   policy_period: POLICY-PERIOD
@@ -45,6 +144,7 @@ clauses:
   icu_cap: ICU-CAP
   proportionate_deduction: PROP-DED
   co_pay: CO-PAY
+  specific_waiting: Excl02
   # Non-payable annexure, by IRDAI list number.
   non_payable:
     I: ANNEX-I

@@ -16,6 +16,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Dialect,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -432,20 +433,36 @@ class PcsDefinitionRow(Base):
 
 
 class NonPayableItemRow(Base):
+    """One item of the IRDAI non-payable lists I to IV. The fixture (source "fixture") and a
+    loaded wording can sit side by side; bill review reads the loaded list when there is one."""
+
     __tablename__ = "non_payable_items"
-    __table_args__ = (UniqueConstraint("list_name", "item_number"),)
+    __table_args__ = (
+        UniqueConstraint("source", "source_version", "list_name", "item_number"),
+        Index(
+            "ix_non_payable_items_item_trgm",
+            "item",
+            postgresql_using="gin",
+            postgresql_ops={"item": "gin_trgm_ops"},
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     list_name: Mapped[str] = mapped_column(String(20))  # IRDAI List I to IV
     item_number: Mapped[int] = mapped_column(Integer)
-    item: Mapped[str] = mapped_column(Text)
+    item: Mapped[str] = mapped_column(Text)  # the short item label as the list names it
     category: Mapped[str | None] = mapped_column(String(100))
-    condition: Mapped[str | None] = mapped_column(Text)  # when the item is not paid separately
+    condition: Mapped[str | None] = mapped_column(Text)  # our own summary of the product note
+    # not_payable, not_payable_unless, payable_within_limits or payable
+    payable_in_product: Mapped[str] = mapped_column(String(30), default="not_payable")
+    page: Mapped[int | None] = mapped_column(Integer)  # 1-based page in the source file
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))
 
 
 class PolicyClauseRow(Base):
+    """A clause of a product wording: its ID and our own short summary, never the wording."""
+
     __tablename__ = "policy_clauses"
     __table_args__ = (UniqueConstraint("product_uin", "clause_ref"),)
 
@@ -454,6 +471,200 @@ class PolicyClauseRow(Base):
     clause_ref: Mapped[str] = mapped_column(String(40))
     title: Mapped[str] = mapped_column(String(300))
     text: Mapped[str] = mapped_column(Text)
+    page: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class ExclusionRow(Base):
+    """A standard IRDAI exclusion (scope "IRDAI", codes Excl01 to Excl18) or a product's own
+    specific exclusion (scope = the product UIN). The summary is in our own words."""
+
+    __tablename__ = "exclusions"
+    __table_args__ = (UniqueConstraint("scope", "code", "source_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope: Mapped[str] = mapped_column(String(60))
+    code: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(300))
+    summary: Mapped[str] = mapped_column(Text)
+    page: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class PackageMasterRow(Base):
+    """One package or procedure of a scheme's rate list (CGHS, PM-JAY HBP, MEDISEP)."""
+
+    __tablename__ = "package_masters"
+    __table_args__ = (
+        Index("ix_package_masters_code", "scheme", "version", "procedure_code"),
+        Index(
+            "ix_package_masters_search_trgm",
+            "search_text",
+            postgresql_using="gin",
+            postgresql_ops={"search_text": "gin_trgm_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scheme: Mapped[str] = mapped_column(String(20))  # CGHS, PMJAY, MEDISEP
+    version: Mapped[str] = mapped_column(String(40))
+    package_code: Mapped[str | None] = mapped_column(String(20))
+    procedure_code: Mapped[str] = mapped_column(String(20))
+    name: Mapped[str] = mapped_column(Text)  # the procedure name
+    package_name: Mapped[str | None] = mapped_column(Text)
+    # The package name and the procedure name, lower case: what name lookups search, since a
+    # procedure name alone can be as short as "Lap" or "Without biopsy".
+    search_text: Mapped[str] = mapped_column(Text, default="")
+    specialty: Mapped[str | None] = mapped_column(Text)
+    specialty_code: Mapped[str | None] = mapped_column(String(10))
+    rate: Mapped[Decimal | None] = mapped_column(Money)  # the scheme's base rate, see rate_basis
+    rate_basis: Mapped[str | None] = mapped_column(String(120))
+    alos_days: Mapped[int | None] = mapped_column(Integer)
+    los_text: Mapped[str | None] = mapped_column(Text)  # as written, e.g. "10-15 days"
+    implant: Mapped[str | None] = mapped_column(Text)  # implant mapped, as written
+    implant_cost: Mapped[str | None] = mapped_column(Text)
+    stratification: Mapped[bool | None] = mapped_column(Boolean)
+    multiple_procedures: Mapped[bool | None] = mapped_column(Boolean)
+    addon: Mapped[bool | None] = mapped_column(Boolean)
+    standalone: Mapped[bool | None] = mapped_column(Boolean)
+    public_only: Mapped[bool | None] = mapped_column(Boolean)
+    medical_or_surgical: Mapped[str | None] = mapped_column(String(20))
+    extra: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict)
+    page: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class PackageItemRow(Base):
+    """One priced variant of a package: the rate for a city tier and an accreditation level."""
+
+    __tablename__ = "package_items"
+    __table_args__ = (Index("ix_package_items_package", "package_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey("package_masters.id", ondelete="CASCADE"))
+    tier: Mapped[str] = mapped_column(String(10))  # X, Y, Z, or "all"
+    accreditation: Mapped[str] = mapped_column(String(30))  # e.g. non_nabh, nabh
+    ward: Mapped[str] = mapped_column(String(20))  # the ward the rate is for
+    rate: Mapped[Decimal | None] = mapped_column(Money)  # None when the list says NA
+    page: Mapped[int | None] = mapped_column(Integer)
+
+
+class RateFactorRow(Base):
+    """A rule that turns a base rate into the payable rate, or a city's tier, as the scheme
+    states it: tier and accreditation differentials, ward entitlement, multi-procedure."""
+
+    __tablename__ = "rate_factors"
+    __table_args__ = (Index("ix_rate_factors_kind", "scheme", "version", "factor", "key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scheme: Mapped[str] = mapped_column(String(20))
+    version: Mapped[str] = mapped_column(String(40))
+    factor: Mapped[str] = mapped_column(String(40))  # e.g. city_tier, ward, multi_procedure
+    key: Mapped[str] = mapped_column(String(120))  # e.g. a city, "general", "second"
+    value: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))  # a multiplier, or days
+    text_value: Mapped[str | None] = mapped_column(String(60))  # e.g. the tier "X"
+    note: Mapped[str | None] = mapped_column(Text)
+    page: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class LosNormRow(Base):
+    """A length-of-stay norm for one package."""
+
+    __tablename__ = "los_norms"
+    __table_args__ = (
+        Index("ix_los_norms_code", "package_code"),
+        Index(
+            "ix_los_norms_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scheme: Mapped[str] = mapped_column(String(20))
+    version: Mapped[str] = mapped_column(String(40))
+    package_code: Mapped[str] = mapped_column(String(20))
+    name: Mapped[str] = mapped_column(Text)
+    specialty: Mapped[str | None] = mapped_column(Text)
+    los_days: Mapped[int | None] = mapped_column(Integer)  # 0 for day care
+    los_text: Mapped[str | None] = mapped_column(Text)
+    page: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class DrugPriceRow(Base):
+    """An NPPA ceiling price for one formulation (per unit, in rupees, before GST)."""
+
+    __tablename__ = "drug_prices"
+    __table_args__ = (
+        Index(
+            "ix_drug_prices_medicine_trgm",
+            "medicine",
+            postgresql_using="gin",
+            postgresql_ops={"medicine": "gin_trgm_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    serial: Mapped[int] = mapped_column(Integer)
+    medicine: Mapped[str] = mapped_column(Text)
+    dosage_form: Mapped[str] = mapped_column(Text)  # dosage form and strength
+    unit: Mapped[str] = mapped_column(String(60))
+    ceiling_price: Mapped[Decimal] = mapped_column(Numeric(14, 4))
+    notification: Mapped[str] = mapped_column(Text)  # the S.O. that fixes the price
+    effective_from: Mapped[date] = mapped_column(Date)
+    page: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class NlemMedicineRow(Base):
+    """One medicine of the National List of Essential Medicines with its formulations."""
+
+    __tablename__ = "nlem_medicines"
+    __table_args__ = (
+        Index(
+            "ix_nlem_medicines_medicine_trgm",
+            "medicine",
+            postgresql_using="gin",
+            postgresql_ops={"medicine": "gin_trgm_ops"},
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    number: Mapped[str] = mapped_column(String(20))  # e.g. "2.1.5"
+    section: Mapped[str] = mapped_column(Text)
+    medicine: Mapped[str] = mapped_column(Text)
+    levels: Mapped[str | None] = mapped_column(String(20))  # P, S, T: levels of care
+    formulations: Mapped[list[str]] = mapped_column(JsonType, default=list)
+    page: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class GuidelineSectionRow(Base):
+    """One section of a PM-JAY standard treatment guideline for one package, as a short
+    factual list (documents, checks) with its source page."""
+
+    __tablename__ = "guideline_sections"
+    __table_args__ = (Index("ix_guideline_sections_code", "package_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    package_code: Mapped[str] = mapped_column(String(20))  # HBP 2022 when matched, else old
+    old_code: Mapped[str | None] = mapped_column(String(20))  # the HBP 2.0 code as written
+    procedure_name: Mapped[str] = mapped_column(Text)
+    section: Mapped[str] = mapped_column(String(40))
+    items: Mapped[list[str]] = mapped_column(JsonType, default=list)
+    match_score: Mapped[float | None] = mapped_column(Float)
+    file_name: Mapped[str] = mapped_column(Text)
+    page: Mapped[int | None] = mapped_column(Integer)
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))
 

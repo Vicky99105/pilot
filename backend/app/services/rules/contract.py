@@ -77,6 +77,40 @@ class GracePeriodDays(BaseModel):
     other: int
 
 
+class CataractLimit(BaseModel):
+    percent_of_sum_insured: Decimal
+    max_per_eye: Decimal
+
+
+class SubLimits(BaseModel):
+    cataract: CataractLimit
+    modern_treatments_percent_of_sum_insured: Decimal
+    ambulance_max_per_hospitalisation: Decimal
+
+
+class WaitingCondition(BaseModel):
+    """One specified condition with its waiting period and ICD ranges. A condition with no
+    ICD-10-CM range says why in `unmapped`."""
+
+    item: str  # as the wording lists it
+    months: int
+    icd10cm: list[str] = []
+    icd10pcs: list[str] = []  # PCS code prefixes, for procedures
+    unmapped: str | None = None
+
+    @model_validator(mode="after")
+    def _mapped_or_explained(self) -> "WaitingCondition":
+        if not self.icd10cm and not self.unmapped:
+            raise ValueError(f"{self.item!r}: no ICD-10-CM range and no reason it is unmapped")
+        return self
+
+
+class SpecificWaiting(BaseModel):
+    clause: str
+    accident_exempt: bool = True
+    conditions: list[WaitingCondition]
+
+
 class Clauses(BaseModel):
     premium_received: str
     policy_period: str
@@ -88,6 +122,7 @@ class Clauses(BaseModel):
     icu_cap: str
     proportionate_deduction: str
     co_pay: str
+    specific_waiting: str | None = None
     non_payable: dict[str, str]  # IRDAI list number ("I" to "IV") -> clause
 
 
@@ -102,6 +137,12 @@ class ProductConfig(BaseModel):
     initial_waiting: InitialWaiting
     grace_period_days: GracePeriodDays
     clauses: Clauses
+    wording_uin: str | None = None  # the filed wording the limits are checked against
+    sub_limits: SubLimits | None = None
+    pre_hospitalisation_days: int | None = None
+    post_hospitalisation_days: int | None = None
+    pre_existing_waiting_months: int | None = None
+    specific_waiting: SpecificWaiting | None = None
 
 
 # --- Facts --------------------------------------------------------------------------------
@@ -130,11 +171,19 @@ class RoomFacts(BaseModel):
     differential_billing: bool  # False when the hospital charges one rate for every room
 
 
+PayableInProduct = Literal["not_payable", "not_payable_unless", "payable_within_limits", "payable"]
+# Flags under which R11 leaves a matching line to be paid (a limit, if any, is another rule's).
+PAID_FLAGS = ("payable_within_limits", "payable")
+
+
 class NonPayableItem(BaseModel):
     list_name: str  # IRDAI list, "I" to "IV"
     item_number: int
     item: str
     condition: str | None = None
+    # How the product treats the item: not_payable_unless means a bill line naming only the
+    # item does not show the exception, so it is deducted.
+    payable_in_product: PayableInProduct = "not_payable"
 
 
 class Facts(BaseModel):

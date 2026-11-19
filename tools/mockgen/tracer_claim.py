@@ -316,11 +316,15 @@ def _non_payable() -> list[NonPayableItem]:
     ]
 
 
-def expected_sheet(claim: TracerClaim, rules: RulesEngine) -> dict[str, Any]:
+def expected_sheet(
+    claim: TracerClaim, rules: RulesEngine, non_payable: list[NonPayableItem] | None = None
+) -> dict[str, Any]:
     """Bill rules on the ground-truth lines through the real rules engine, in bill review's
-    order: R11 per line, R13 per line still payable (room rate from those lines), R21 last."""
+    order: R11 per line, R13 per line still payable (room rate from those lines), R21 last.
+    The non-payable lists default to the seeded fixture; a test passes the loaded lists to
+    show the ground truth holds against them too."""
     product = rules.product(PRODUCT_UIN)
-    non_payable = _non_payable()
+    non_payable = _non_payable() if non_payable is None else non_payable
     lines: list[dict[str, Any]] = []
     facts: dict[int, LineFacts] = {}
     for line_id, item in enumerate(claim.ordered_items, start=1):

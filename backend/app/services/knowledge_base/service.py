@@ -12,6 +12,7 @@ the prefix. A code is valid when one row holds all four of its last characters.
 
 import re
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import Select, and_, func, select
@@ -26,16 +27,23 @@ from app.database.models import (
     PcsTableRow,
     PolicyClauseRow,
 )
+from app.services.knowledge_base import _reference
 from app.services.knowledge_base.contract import (
     ICD10CM,
     ICD10PCS,
     MAX_INDEX_HITS,
     PCS_LENGTH,
+    DrugCheck,
+    Exclusion,
+    GuidelineSection,
     IcdIndexHit,
     IcdTabularEntry,
     IndexName,
+    LosNorm,
+    NonPayableCandidate,
     PcsOption,
     PolicyClause,
+    TariffCandidate,
 )
 from app.shared.types import Code
 
@@ -313,6 +321,34 @@ class DefaultKnowledgeBase:
         return PolicyClause(
             product_uin=row.product_uin, clause_ref=row.clause_ref, title=row.title, text=row.text
         )
+
+    # --- Public reference data --------------------------------------------------------------
+
+    async def tariff_candidates(
+        self, procedure_codes: list[str], names: list[str], hospital_id: str | None
+    ) -> list[TariffCandidate]:
+        async with self._sessions() as session:
+            return await _reference.tariff_candidates(session, procedure_codes, names, hospital_id)
+
+    async def get_guideline(self, package_code: str) -> list[GuidelineSection]:
+        async with self._sessions() as session:
+            return await _reference.get_guideline(session, package_code)
+
+    async def get_los_norm(self, package_code_or_name: str) -> LosNorm | None:
+        async with self._sessions() as session:
+            return await _reference.get_los_norm(session, package_code_or_name)
+
+    async def check_drug(self, name: str, unit_price: Decimal | None) -> DrugCheck:
+        async with self._sessions() as session:
+            return await _reference.check_drug(session, name, unit_price)
+
+    async def match_non_payable(self, text: str) -> list[NonPayableCandidate]:
+        async with self._sessions() as session:
+            return await _reference.match_non_payable(session, text)
+
+    async def exclusion(self, code: str) -> Exclusion | None:
+        async with self._sessions() as session:
+            return await _reference.exclusion(session, code)
 
 
 def _row_holds(axes: list[Any], chars: str) -> bool:

@@ -163,9 +163,17 @@ async def _seed_clauses(session: AsyncSession) -> None:
 
 
 async def _seed_non_payable(session: AsyncSession) -> None:
+    """The fixture stands in for the lists until a wording is loaded; then it is not seeded."""
+    loaded = await session.scalar(
+        select(NonPayableItemRow.id).where(NonPayableItemRow.source != FIXTURE).limit(1)
+    )
+    if loaded is not None:
+        return
     existing = {
         (row.list_name, row.item_number): row
-        for row in await session.scalars(select(NonPayableItemRow))
+        for row in await session.scalars(
+            select(NonPayableItemRow).where(NonPayableItemRow.source == FIXTURE)
+        )
     }
     for list_name, number, item, category, condition in NON_PAYABLE_ITEMS:
         row = existing.get((list_name, number)) or NonPayableItemRow(

@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
+from app.database.models import NonPayableItemRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.bill_review.contract import (
@@ -125,6 +126,45 @@ async def test_non_payable_items_are_deducted_in_full_with_their_list_clause(env
     )
     assert "Part of the room charges" in (found[9].reason or "")
     assert (found[10].head, found[10].admissible) == (Head.CONSUMABLES, D("800.00"))
+
+
+async def test_a_loaded_wording_list_replaces_the_fixture_for_r11(env: Env) -> None:
+    async with env.sessions.begin() as session:
+        session.add_all(
+            [
+                NonPayableItemRow(
+                    list_name="IV",
+                    item_number=18,
+                    item="URINE BAG",
+                    condition="Paid where medically necessary, at most one bag in 24 hours",
+                    payable_in_product="payable_within_limits",
+                    source="non_payable",
+                    source_version="GODHLIP24179V022324",
+                ),
+                NonPayableItemRow(
+                    list_name="I",
+                    item_number=56,
+                    item="GLOVES",
+                    condition="Sterile gloves are paid; non-sterile gloves are not",
+                    payable_in_product="not_payable_unless",
+                    source="non_payable",
+                    source_version="GODHLIP24179V022324",
+                ),
+            ]
+        )
+    lines = [
+        *WORKED_BILL,
+        bill_line(8, "Consumables", "Gloves", "264"),
+        bill_line(9, "Consumables", "Urine bag", "150"),  # list IV in the fixture too
+        bill_line(10, "Room Charges", "Admission Kit", "1200"),  # only in the fixture
+    ]
+    claim_id = await env.registered(ClaimSpec(lines=lines, claimed=D("171614.00")))
+
+    found = {ln.line_id: ln for ln in (await env.service.review(claim_id)).lines}
+
+    assert (found[8].deducted, found[8].clause_ref) == (D("264.00"), "ANNEX-I")
+    assert found[9].deducted == D("0.00")
+    assert found[10].deducted == D("0.00")
 
 
 async def test_lines_map_by_heading_then_description_and_unknown_lines_are_flagged(

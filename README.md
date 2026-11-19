@@ -75,7 +75,23 @@ for system in icd10cm icd10pcs; do
 done
 ```
 
-Both seeds and both loads are idempotent. Phase 1 has no real auth: the `X-User-Id` header picks a
+Load the public reference data (slice P2-3) the same way, from the whole source inventory
+in the gitignored `.local/kb_sources/` (laid out as its `MANIFEST.json` describes). Load `hbp`
+before `stg`: the STG loader matches HBP 2.0 codes to the loaded HBP 2022 list. Each load
+replaces its source version in one transaction and prints file hashes, counts, cross-checks
+and a 20-row spot check. The `non_payable` load replaces the seeded fixture lists, and
+`policy_wording` checks the product config's limits and waiting-period list against the
+wording:
+
+```bash
+for source in non_payable policy_wording exclusions cghs hbp medisep drugs stg; do
+  docker compose -f deploy/docker-compose.yml run --rm --no-deps \
+    -v "$PWD/.local/kb_sources:/kb_sources:ro" \
+    app python -m app.knowledge.load "$source" --source-dir /kb_sources
+done
+```
+
+Both seeds and all loads are idempotent. Phase 1 has no real auth: the `X-User-Id` header picks a
 seeded user (IDs in `backend/app/shared/seed_ids.py`): `...0001` member, `...0002`
 hospital, `...0003` ops, `...0004` doctor (approver up to Rs 1 lakh, CRC), `...0005`
 finance, `...0006` senior approver (no limit).

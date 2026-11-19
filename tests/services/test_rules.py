@@ -300,6 +300,44 @@ def test_r11_non_payable_match(
     assert (result.passed, result.clause_ref, result.amount_effect) == (passed, clause, effect)
 
 
+def test_r11_pays_an_item_the_product_pays_and_deducts_one_paid_only_with_an_exception(
+    engine: RulesEngine, product: ProductConfig
+) -> None:
+    items = [
+        NonPayableItem(
+            list_name="IV",
+            item_number=18,
+            item="URINE BAG",
+            condition="Paid where medically necessary, at most one bag in 24 hours",
+            payable_in_product="payable_within_limits",
+        ),
+        NonPayableItem(
+            list_name="I",
+            item_number=56,
+            item="GLOVES",
+            condition="Sterile gloves are paid; non-sterile gloves are not",
+            payable_in_product="not_payable_unless",
+        ),
+    ]
+
+    def r11(description: str) -> RuleResult:
+        line = LineFacts(
+            line_id=1, head=Head.CONSUMABLES, description=description, claimed=D("264")
+        )
+        return one(engine, "R11", Facts(line=line, non_payable=items), product)
+
+    bag, gloves = r11("Urine bag"), r11("Gloves")
+
+    assert (bag.passed, bag.amount_effect) == (True, D("0"))
+    assert "List IV item 18" in bag.reason and "at most one bag" in bag.reason
+    assert (gloves.passed, gloves.amount_effect, gloves.clause_ref) == (
+        False,
+        D("-264.00"),
+        "ANNEX-I",
+    )
+    assert "Sterile gloves are paid" in gloves.reason
+
+
 # --- R13: room cap and proportionate deduction --------------------------------------------
 
 # Worked example: SI 3 lakh, room Rs 7,500 a day for 4 days against a Rs 5,000 cap.

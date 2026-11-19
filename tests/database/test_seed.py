@@ -100,6 +100,29 @@ async def test_seed_has_non_payable_items_from_all_four_lists_marked_fixture(
     assert len({(r.list_name, r.item_number) for r in rows}) == len(rows)
 
 
+async def test_seed_leaves_a_loaded_non_payable_list_alone_and_adds_no_fixture_beside_it(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    async with sessions.begin() as session:
+        session.add(
+            NonPayableItemRow(
+                list_name="I",
+                item_number=1,
+                item="BABY FOOD",
+                condition="Not covered by the policy",
+                payable_in_product="not_payable",
+                source="non_payable",
+                source_version="GODHLIP24179V022324",
+            )
+        )
+
+    await seed_claims_db(sessions)
+
+    async with sessions() as session:
+        rows = (await session.scalars(select(NonPayableItemRow))).all()
+    assert [(r.item, r.source) for r in rows] == [("BABY FOOD", "non_payable")]
+
+
 async def test_one_seeded_hospital_has_no_differential_billing(
     sessions: async_sessionmaker[AsyncSession],
 ) -> None:

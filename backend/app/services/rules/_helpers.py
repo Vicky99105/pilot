@@ -10,6 +10,7 @@ from rapidfuzz import fuzz
 
 from app.integrations.core.contract import InsuredMember, MemberPolicy
 from app.services.rules.contract import (
+    PAID_FLAGS,
     Claimant,
     Facts,
     Head,
@@ -260,6 +261,12 @@ def r11_non_payable(facts: Facts, product: ProductConfig) -> RuleResult:
     if item is None:
         return RuleResult(rule_id="R11", passed=True, reason="not on the non-payable lists")
     condition = f"; {item.condition}" if item.condition else ""
+    if item.payable_in_product in PAID_FLAGS:
+        return RuleResult(
+            rule_id="R11",
+            passed=True,
+            reason=f"paid: List {item.list_name} item {item.item_number} {item.item!r}{condition}",
+        )
     return RuleResult(
         rule_id="R11",
         passed=False,
