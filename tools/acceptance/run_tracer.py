@@ -1,7 +1,8 @@
 """Live end-to-end acceptance run of the tracer claim against a running stack.
 
 Prerequisites: the stack runs with the local override (the app on 127.0.0.1:8000) and with
-OPENROUTER_API_KEY set; the claims and mock_core databases are migrated and seeded.
+the key for the provider in config/models.yaml set (currently GEMINI_API_KEY); the claims
+and mock_core databases are migrated and seeded.
 
     uv run --project backend python tools/acceptance/run_tracer.py --out .local/acceptance
 

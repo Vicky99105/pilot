@@ -21,6 +21,10 @@ DOC_TYPE_GUIDE = {
     DocType.DISCHARGE_SUMMARY: (
         "Discharge summary: diagnosis, history, findings, treatment, advice on discharge"
     ),
+    DocType.OT_NOTES: (
+        "Operation theatre notes: operative record of a surgery, with surgeon, anaesthetist, "
+        "anaesthesia, procedure steps and operative findings"
+    ),
     DocType.INVESTIGATION_REPORT: "Lab or imaging report (blood test, X-ray, scan)",
     DocType.PRESCRIPTION: "Doctor's prescription",
     DocType.PHARMACY_BILL: "Pharmacy or chemist bill for medicines",

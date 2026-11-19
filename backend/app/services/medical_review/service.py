@@ -16,6 +16,7 @@ from app.services.digitisation.contract import ClaimRecord
 from app.services.knowledge_base.contract import KnowledgeBase
 from app.services.medical_review.contract import (
     CLAUSE_PREFIX,
+    MEDICAL_DOCUMENTS,
     Citation,
     DroppedItem,
     Finding,
@@ -23,10 +24,9 @@ from app.services.medical_review.contract import (
     NotReadyForMedicalReview,
 )
 from app.services.model_gateway.contract import ModelGateway
-from app.services.query.contract import same_item
 from app.services.registration.contract import RegistrationResult
 from app.services.rules.contract import Facts, RulesEngine
-from app.shared.types import PageRef, RuleResult, Stage
+from app.shared.types import DocType, PageRef, RuleResult, Stage
 
 RERUN_RULES = ["R5"]
 
@@ -72,22 +72,24 @@ class DefaultMedicalReviewService:
                 f"policy {registration.policy.policy_number} not found in the core system"
             )
 
-        answered = await self._answered_queries(claim_id)
+        answered = await self._answered_doc_types(claim_id)
+        held = await self._held_doc_types(claim_id)
         case = _case_file(record, policy, await self._clause_refs(policy.product_uin))
-        case.answered_queries = answered
+        case.requestable = [d for d in MEDICAL_DOCUMENTS if d not in held | answered]
         result = await run_medical_review(
             case, gateway=self._gateway, kb=self._kb, claim_id=claim_id
         )
         query_items, repeated = [], []
-        for item in result["query_items"]:
-            if any(same_item(item, a) for a in answered):
-                repeated.append(
-                    DroppedItem(
-                        item="query_item",
-                        detail=item,
-                        reason="already answered by the claimant in a query reply",
-                    )
-                )
+        for item in result["query_items"]:  # second check behind the reply schema
+            reason = (
+                "already answered by the claimant in a query reply"
+                if item.doc_type in answered
+                else f"{item.doc_type.value} is already in the claim's documents"
+                if item.doc_type in held
+                else None
+            )
+            if reason:
+                repeated.append(DroppedItem(item="query_item", detail=item.text, reason=reason))
             else:
                 query_items.append(item)
 
@@ -117,17 +119,27 @@ class DefaultMedicalReviewService:
         )
         return medical
 
-    async def _answered_queries(self, claim_id: UUID) -> list[str]:
-        """Items of the claim's answered queries, from each query's latest stage record."""
+    async def _answered_doc_types(self, claim_id: UUID) -> set[DocType]:
+        """Document types asked for in the claim's answered queries, from each query's latest
+        stage record."""
         latest: dict[str, dict[str, Any]] = {}
         for record in await self._records.history(claim_id, Stage.QUERY):
             latest[str(record.payload.get("query_id"))] = record.payload
-        return [
-            item["text"]
+        return {
+            DocType(item["doc_type"])
             for query in latest.values()
             if query.get("status") == "answered"
             for item in query.get("items", [])
-        ]
+            if item.get("doc_type")
+        }
+
+    async def _held_doc_types(self, claim_id: UUID) -> set[DocType]:
+        """Document types in any of the claim's document sets (the bundle and each reply)."""
+        return {
+            DocType(document["doc_type"])
+            for record in await self._records.history(claim_id, Stage.CLASSIFICATION)
+            for document in record.payload.get("documents", [])
+        }
 
     async def _clause_refs(self, product_uin: str) -> list[str]:
         async with self._sessions() as session:

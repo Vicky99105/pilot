@@ -52,6 +52,7 @@ const DOC_LABELS: Record<DocType, string> = {
   final_bill: 'Itemised final bill',
   payment_receipt: 'Payment receipt',
   discharge_summary: 'Discharge summary',
+  ot_notes: 'OT notes',
   investigation_report: 'Investigation reports',
   prescription: 'Prescriptions',
   pharmacy_bill: 'Pharmacy bills',

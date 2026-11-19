@@ -123,7 +123,7 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
             {
                 "code": CODE,
                 "phrase": gen.DIAGNOSIS,
-                "citations": [{"ref": f"icd:{CODE}"}],
+                "citations": [f"icd:{CODE}"],
                 "rationale": "Acute appendicitis without perforation",
             }
         ],
@@ -134,7 +134,7 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
         "decision": "query",
         "reasons": [],
         "summary": "The payment receipt is missing.",
-        "query_items": ["Payment receipt"],
+        "query_items": ["payment_receipt"],
     }
     partial = {
         "decision": "partial",

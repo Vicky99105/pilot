@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { humanise, rupees } from '../../../lib/format'
+import { docLabel, humanise, rupees } from '../../../lib/format'
 import { Button, Chip, Detail, inputClass, Notice } from '../../ui/primitives'
 import { Actions, Section, SendBack, TextArea, type KindProps } from './common'
 import type { ApprovePayload, CrcPayload, Draft, QueryNoReplyPayload, ReleasePayload } from './payloads'
@@ -60,7 +60,9 @@ function DraftView({ draft, routing }: { draft: Draft; routing?: ApprovePayload[
         <Section title="Open questions">
           <ul className="list-disc pl-5 text-sm">
             {draft.query_items.map((q) => (
-              <li key={q}>{q}</li>
+              <li key={q.doc_type}>
+                {q.text} <span className="text-muted">({docLabel(q.doc_type)})</span>
+              </li>
             ))}
           </ul>
         </Section>

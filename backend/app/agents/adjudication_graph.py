@@ -14,7 +14,7 @@ from uuid import UUID
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
-from app.agents.prompts import DECIDE_PURPOSE, DecisionReply, decide_messages
+from app.agents.prompts import DECIDE_PURPOSE, DecisionReply, decide_messages, decide_schema
 from app.agents.tools import AdjudicationTools
 from app.services.adjudication.contract import (
     Decision,
@@ -24,11 +24,11 @@ from app.services.adjudication.contract import (
 )
 from app.services.bill_review.contract import DeductionSheet
 from app.services.knowledge_base.contract import PolicyClause
-from app.services.medical_review.contract import CLAUSE_PREFIX, MedicalFindings
+from app.services.medical_review.contract import CLAUSE_PREFIX, DocumentRequest, MedicalFindings
 from app.services.model_gateway.contract import ModelGateway, ModelRole
 from app.services.registration.contract import RegistrationResult
 from app.services.risk.contract import RiskReport
-from app.shared.types import RuleResult, Stage
+from app.shared.types import DocType, RuleResult, Stage
 
 MAX_REVISIONS = 1
 ZERO = Decimal("0.00")
@@ -69,7 +69,7 @@ def expected_decision(
         return "reject", "eligibility rules failed: " + ", ".join(r.rule_id for r in failed_rules)
     query_items = medical.query_items if medical else []
     if outstanding or query_items:
-        missing = [*outstanding, *query_items]
+        missing = [*outstanding, *(q.doc_type.value for q in query_items)]
         return "query", "information is missing: " + ", ".join(missing)
     deducted = [ln.line_id for ln in sheet.lines if ln.deducted > 0]
     if deducted:
@@ -147,7 +147,13 @@ async def run_adjudication(
         reply = await gateway.structured(
             ModelRole.REASONING,
             decide_messages(_view(inputs), inputs.clauses, state.get("feedback", [])),
-            DecisionReply,
+            decide_schema(
+                inputs.expected,
+                [c.clause_ref for c in inputs.clauses],
+                sorted(_rule_ids(inputs)),
+                [ln.line_id for ln in inputs.sheet.lines],
+                [r.doc_type.value for r in _requests(inputs)],
+            ),
             claim_id=claim_id,
             purpose=DECIDE_PURPOSE,
         )
@@ -177,7 +183,7 @@ async def run_adjudication(
                 payable_on_sheet=payable,
                 available_balance=inputs.registration.policy.balance,
                 reasons=[Reason(**r.model_dump()) for r in reply.reasons],
-                query_items=[q.strip() for q in reply.query_items if q.strip()],
+                query_items=[r for r in _requests(inputs) if r.doc_type in reply.query_items],
                 summary=reply.summary.strip(),
                 self_check_errors=state.get("self_check_errors", []),
                 guardrail_errors=[],
@@ -276,7 +282,9 @@ def _view(inputs: AdjudicationInputs) -> dict[str, Any]:
         "medical": {
             "verified_codes": [v.code.code for v in medical.verified_codes] if medical else [],
             "findings": [f.model_dump(mode="json") for f in medical.findings] if medical else [],
-            "query_items": medical.query_items if medical else [],
+            "query_items": [q.model_dump(mode="json") for q in medical.query_items]
+            if medical
+            else [],
         },
         "risk": {
             "score": inputs.risk.score if inputs.risk else None,
@@ -295,9 +303,7 @@ def _self_check(inputs: AdjudicationInputs, reply: DecisionReply) -> list[str]:
             f"because {inputs.expected_because}"
         )
     clause_refs = {c.clause_ref for c in inputs.clauses}
-    rule_ids = {r.rule_id for r in inputs.registration.rule_results}
-    rule_ids |= {r.rule_id for r in inputs.sheet.rule_results}
-    rule_ids |= {r.rule_id for r in (inputs.medical.rule_results if inputs.medical else [])}
+    rule_ids = _rule_ids(inputs)
     line_ids = {ln.line_id for ln in inputs.sheet.lines}
     for i, reason in enumerate(reply.reasons, start=1):
         if not (reason.clause_ref or reason.rule_id or reason.line_id is not None):
@@ -317,6 +323,33 @@ def _self_check(inputs: AdjudicationInputs, reply: DecisionReply) -> list[str]:
                 errors.append(f"bill line {line.line_id} has a deduction but no reason")
     if reply.decision in ("partial", "reject") and not any(r.clause_ref for r in reply.reasons):
         errors.append(f"a {reply.decision} must cite at least one clause")
-    if reply.decision == "query" and not any(q.strip() for q in reply.query_items):
+    if reply.decision == "query" and not reply.query_items:
         errors.append("a query must list what to ask for")
+    requested = {r.doc_type.value for r in _requests(inputs)}
+    for item in reply.query_items:
+        if reply.decision != "query" or item not in requested:
+            errors.append(
+                f"query item {item} is not an outstanding document or a medical review request"
+            )
     return errors
+
+
+def _rule_ids(inputs: AdjudicationInputs) -> set[str]:
+    """The rules that ran on this claim."""
+    ids = {r.rule_id for r in inputs.registration.rule_results}
+    ids |= {r.rule_id for r in inputs.sheet.rule_results}
+    ids |= {r.rule_id for r in (inputs.medical.rule_results if inputs.medical else [])}
+    return ids
+
+
+def _requests(inputs: AdjudicationInputs) -> list[DocumentRequest]:
+    """The documents a query may ask for: the outstanding documents, then the medical
+    review's requests."""
+    requests = [
+        DocumentRequest(doc_type=DocType(d), text=d.replace("_", " ").capitalize())
+        for d in inputs.outstanding_documents
+    ]
+    for request in inputs.medical.query_items if inputs.medical else []:
+        if all(r.doc_type != request.doc_type for r in requests):
+            requests.append(request)
+    return requests

@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.adjudication_graph import run_adjudication
@@ -24,12 +25,12 @@ from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
 from app.services.knowledge_base.contract import PolicyClause
 from app.services.knowledge_base.service import DefaultKnowledgeBase
-from app.services.medical_review.contract import MedicalFindings
+from app.services.medical_review.contract import DocumentRequest, MedicalFindings
 from app.services.registration.service import DefaultRegistrationService
 from app.services.risk.contract import RiskReport
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import PRODUCT_UIN
-from app.shared.types import Stage
+from app.shared.types import DocType, Stage
 from tests.database.factories import add_claim
 from tests.fakes.adjudication import FakeAdjudicationTools
 from tests.fakes.core import FakeMoneyService, FakePolicyService
@@ -60,7 +61,9 @@ PARTIAL = {"decision": "partial", "reasons": ALL_LINES, "summary": "Room cap bre
 
 
 async def add_medical(
-    sessions: async_sessionmaker[AsyncSession], claim_id: UUID, query_items: list[str] | None = None
+    sessions: async_sessionmaker[AsyncSession],
+    claim_id: UUID,
+    query_items: list[DocumentRequest] | None = None,
 ) -> None:
     medical = MedicalFindings(
         claim_id=claim_id,
@@ -96,7 +99,7 @@ class Env:
     sessions: async_sessionmaker[AsyncSession]
     policies: FakePolicyService
 
-    async def reviewed(self, query_items: list[str] | None = None) -> UUID:
+    async def reviewed(self, query_items: list[DocumentRequest] | None = None) -> UUID:
         """A claim through registration, bill review, medical review and risk."""
         claim_id = await add_digitised_claim(self.sessions, ClaimSpec())
         rules = DefaultRulesEngine(Settings().config_dir / "products")
@@ -158,36 +161,71 @@ async def test_a_failed_eligibility_rule_gives_a_reject_with_zero_amount(env: En
     assert draft.guardrail_passed is True
 
 
-async def test_medical_query_items_give_a_query(env: Env) -> None:
-    claim_id = await env.reviewed(query_items=["CT abdomen report"])
-    query = {
+CT_REPORT = DocumentRequest(doc_type=DocType.INVESTIGATION_REPORT, text="CT abdomen report")
+
+
+def query_reply(*doc_types: str) -> dict[str, Any]:
+    return {
         "decision": "query",
         "reasons": [{"text": "Imaging report needed", "rule_id": "R13", "line_id": 1}],
         "summary": "Asking for the CT report.",
-        "query_items": ["CT abdomen report"],
+        "query_items": list(doc_types),
     }
-    gateway = FakeModelGateway({"adjudication_decide": [query]})
+
+
+async def test_medical_query_items_give_a_query(env: Env) -> None:
+    claim_id = await env.reviewed(query_items=[CT_REPORT])
+    gateway = FakeModelGateway({"adjudication_decide": [query_reply("investigation_report")]})
 
     draft = await env.service(gateway).draft(claim_id)
 
-    assert (draft.decision, draft.amount, draft.query_items) == (
-        "query",
-        D("0.00"),
-        ["CT abdomen report"],
-    )
+    assert (draft.decision, draft.amount, draft.query_items) == ("query", D("0.00"), [CT_REPORT])
     assert draft.guardrail_passed is True
 
 
-async def test_a_decision_that_contradicts_the_rules_fails_the_guardrail(env: Env) -> None:
+async def test_a_query_may_only_ask_for_documents_the_inputs_request(env: Env) -> None:
+    """The draft's query items are document types from the outstanding documents or the
+    medical review's requests: the reply schema lists only those."""
+    claim_id = await env.reviewed(query_items=[CT_REPORT])
+    gateway = FakeModelGateway({"adjudication_decide": [query_reply("investigation_report")]})
+
+    await env.service(gateway).draft(claim_id)
+
+    schema = gateway.calls[-1].schema
+    assert schema is not None
+    items = schema.model_json_schema()["properties"]["query_items"]["items"]
+    assert items["enum"] == ["investigation_report"]
+    with pytest.raises(ValidationError):
+        schema.model_validate(query_reply("investigation_report", "final_bill"))
+
+
+async def test_the_reply_schema_allows_only_the_decision_and_ids_in_the_inputs(
+    env: Env,
+) -> None:
+    """Code decides; the model's reply can only carry that decision, the rules that ran, the
+    sheet's lines and the clauses read, and no query items unless the decision is a query."""
     claim_id = await env.reviewed()
+    gateway = FakeModelGateway({"adjudication_decide": [PARTIAL]})
+
+    await env.service(gateway).draft(claim_id)
+
+    schema = gateway.calls[-1].schema
+    assert schema is not None
+    spec = schema.model_json_schema()
+    assert spec["properties"]["decision"]["enum"] == ["partial"]
+    assert spec["properties"]["query_items"]["maxItems"] == 0
+    reason = spec["$defs"]["ReasonClosed"]["properties"]
+    enums = {k: v["anyOf"][0]["enum"] for k, v in reason.items() if "anyOf" in v}
+    assert set(enums["clause_ref"]) >= {"ROOM-CAP", "PROP-DED"}
+    assert "R13" in enums["rule_id"] and "R99" not in enums["rule_id"]
+    sheet = await StageRecordRepository(env.sessions).latest(claim_id, Stage.BILL_REVIEW)
+    assert sheet is not None
+    assert enums["line_id"] == [ln["line_id"] for ln in sheet.payload["lines"]]
     approve = {"decision": "approve", "reasons": ALL_LINES, "summary": "Looks fine."}
-    gateway = FakeModelGateway({"adjudication_decide": [approve, approve]})
-
-    draft = await env.service(gateway).draft(claim_id)
-
-    assert draft.revisions == 1
-    assert any("expected partial" in e for e in draft.self_check_errors)
-    assert draft.guardrail_passed is False
+    with pytest.raises(ValidationError):
+        schema.model_validate(approve)
+    with pytest.raises(ValidationError):  # a bill line that is not on the sheet
+        schema.model_validate({**PARTIAL, "reasons": [line_reason(9, "ROOM-CAP")]})
 
 
 async def test_drafting_is_idempotent_per_input_versions(env: Env) -> None:

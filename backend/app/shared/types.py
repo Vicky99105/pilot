@@ -56,6 +56,7 @@ class DocType(StrEnum):
     FINAL_BILL = "final_bill"
     PAYMENT_RECEIPT = "payment_receipt"
     DISCHARGE_SUMMARY = "discharge_summary"
+    OT_NOTES = "ot_notes"
     INVESTIGATION_REPORT = "investigation_report"
     PRESCRIPTION = "prescription"
     PHARMACY_BILL = "pharmacy_bill"

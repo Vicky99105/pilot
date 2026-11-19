@@ -41,6 +41,7 @@ export const DOC_TYPES = [
   'final_bill',
   'payment_receipt',
   'discharge_summary',
+  'ot_notes',
   'investigation_report',
   'prescription',
   'pharmacy_bill',

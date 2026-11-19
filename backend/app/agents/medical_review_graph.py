@@ -28,17 +28,21 @@ from app.agents.prompts import (
     ChooseCodesReply,
     TermRewriteReply,
     choose_messages,
+    choose_schema,
     rewrite_messages,
+    to_citation,
 )
 from app.agents.tools import IcdLookupLedger
 from app.services.knowledge_base.contract import IcdTabularEntry, KnowledgeBase
 from app.services.medical_review.contract import (
+    DocumentRequest,
     DroppedItem,
     Finding,
     LookupCall,
     VerifiedCode,
 )
 from app.services.model_gateway.contract import ModelGateway, ModelRole
+from app.shared.types import DocType
 
 MAX_REVISIONS = 1
 NOT_RETURNED = "not returned by any lookup in this run"
@@ -48,7 +52,7 @@ NO_CITATION = "no valid citation"
 class MedicalGraphResult(TypedDict):
     verified_codes: list[VerifiedCode]
     findings: list[Finding]
-    query_items: list[str]
+    query_items: list[DocumentRequest]
     lookups: list[LookupCall]
     dropped: list[DroppedItem]
     revisions: int
@@ -64,7 +68,7 @@ class _State(TypedDict, total=False):
     revisions: int
     verified_codes: list[VerifiedCode]
     findings: list[Finding]
-    query_items: list[str]
+    query_items: list[DocumentRequest]
     dropped: list[DroppedItem]
 
 
@@ -100,7 +104,7 @@ async def run_medical_review(
         reply = await gateway.structured(
             ModelRole.REASONING,
             choose_messages(state["case"], state["candidates"], state.get("feedback", [])),
-            ChooseCodesReply,
+            choose_schema(state["case"], state["candidates"]),
             claim_id=claim_id,
             purpose=CHOOSE_PURPOSE,
         )
@@ -114,7 +118,7 @@ async def run_medical_review(
     def stay(state: _State) -> dict[str, Any]:
         reason = state["proposal"].long_stay_reason
         cited = reason is not None and bool(
-            valid_citations([c.to_citation() for c in reason.citations], state["case"], _seen())
+            valid_citations([to_citation(c) for c in reason.citations], state["case"], _seen())
         )
         found = length_of_stay(state["case"], cited)
         return {"code_findings": {**state.get("code_findings", {}), "stay": found}}
@@ -132,7 +136,7 @@ async def run_medical_review(
 
         for choice in proposal.codes:
             code = choice.code.strip().upper()
-            citations = valid_citations([c.to_citation() for c in choice.citations], case, _seen())
+            citations = valid_citations([to_citation(c) for c in choice.citations], case, _seen())
             problem = _code_problem(code) or (None if citations else NO_CITATION)
             if problem:
                 rejected.append((DroppedItem(item="code", detail=code, reason=problem), True))
@@ -153,7 +157,7 @@ async def run_medical_review(
             )
 
         for reply in proposal.findings:
-            citations = valid_citations([c.to_citation() for c in reply.citations], case, _seen())
+            citations = valid_citations([to_citation(c) for c in reply.citations], case, _seen())
             if not citations:
                 rejected.append(
                     (DroppedItem(item="finding", detail=reply.text, reason=NO_CITATION), True)
@@ -182,6 +186,16 @@ async def run_medical_review(
                         )
                     )
 
+        requests: list[DocumentRequest] = []
+        for item in proposal.query_items:
+            problem = _request_problem(item.doc_type, case, requests)
+            if problem:  # the reply schema already excludes these; this is the second check
+                rejected.append(
+                    (DroppedItem(item="query_item", detail=item.text, reason=problem), False)
+                )
+                continue
+            requests.append(DocumentRequest(doc_type=DocType(item.doc_type), text=item.text))
+
         fixable = [item for item, can_fix in rejected if can_fix]
         if fixable and revisions < MAX_REVISIONS:
             feedback = [f"{i.item} {i.detail!r}: {i.reason}" for i in fixable]
@@ -191,7 +205,7 @@ async def run_medical_review(
             "revisions": revisions,
             "verified_codes": verified,
             "findings": findings,
-            "query_items": [q.strip() for q in proposal.query_items if q.strip()],
+            "query_items": requests,
             "dropped": [item for item, _ in rejected],
         }
 
@@ -210,6 +224,13 @@ async def run_medical_review(
             return "no tabular entry was looked up"
         if not entry.billable:
             return "not billable; choose a more specific code from the candidates"
+        return None
+
+    def _request_problem(doc_type: str, case: CaseFile, kept: list[DocumentRequest]) -> str | None:
+        if doc_type not in {d.value for d in case.requestable}:
+            return f"{doc_type} is not a document this claim may be asked for"
+        if any(r.doc_type == doc_type for r in kept):
+            return f"{doc_type} is already asked for"
         return None
 
     graph = StateGraph(_State)

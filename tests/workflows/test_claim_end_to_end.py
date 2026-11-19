@@ -124,7 +124,7 @@ CHOOSE = {
         {
             "code": "K35.32",
             "phrase": DIAGNOSIS,
-            "citations": [{"ref": "icd:K35.32"}],
+            "citations": ["icd:K35.32"],
             "rationale": "Perforation with localised peritonitis on CT",
         }
     ],
@@ -135,7 +135,7 @@ QUERY_DRAFT = {
     "decision": "query",
     "reasons": [],
     "summary": "The payment receipt is missing.",
-    "query_items": ["Payment receipt"],
+    "query_items": ["payment_receipt"],
 }
 PARTIAL_DRAFT = {
     "decision": "partial",

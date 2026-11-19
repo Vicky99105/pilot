@@ -15,6 +15,7 @@ class RecordedCall:
     messages: list[Message] | None = None
     prompt: str | None = None
     image_count: int = 0
+    schema: type[BaseModel] | None = None  # the reply schema the call sent
 
 
 class FakeModelGateway:
@@ -34,7 +35,7 @@ class FakeModelGateway:
         claim_id: UUID | None,
         purpose: str,
     ) -> T:
-        self.calls.append(RecordedCall(role, purpose, claim_id, messages=messages))
+        self.calls.append(RecordedCall(role, purpose, claim_id, messages=messages, schema=schema))
         return self._next(purpose, schema)
 
     async def vision(
@@ -48,7 +49,9 @@ class FakeModelGateway:
         purpose: str,
     ) -> T:
         self.calls.append(
-            RecordedCall(role, purpose, claim_id, prompt=prompt, image_count=len(images))
+            RecordedCall(
+                role, purpose, claim_id, prompt=prompt, image_count=len(images), schema=schema
+            )
         )
         return self._next(purpose, schema)
 

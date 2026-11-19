@@ -1,8 +1,10 @@
 """Contract for adjudication: draft a decision for the approver.
 
-The model chooses the decision and writes the reasons; code checks them and sets the
-amount. The amount is copied from the latest DeductionSheet.payable for approve and
-partial, and is zero for query and reject. A code guardrail then re-reads the sheet and the
+Code decides (the decision rules in expected_decision); the model's reply schema allows only
+that decision, the rule, line and clause ids in the inputs, and the requested document
+types. The model writes the reasons and the summary; code checks them and sets the amount.
+The amount is copied from the latest DeductionSheet.payable for approve and partial, and is
+zero for query and reject. A code guardrail then re-reads the sheet and the
 balance: a draft whose amount differs from the sheet, or exceeds the available balance,
 is marked guardrail_passed=False and cannot be approved as it stands.
 
@@ -15,6 +17,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.services.medical_review.contract import DocumentRequest
 from app.shared.errors import PermanentError
 
 Decision = Literal["approve", "partial", "query", "reject"]
@@ -37,7 +40,7 @@ class DraftDecision(BaseModel):
     payable_on_sheet: Decimal
     available_balance: Decimal
     reasons: list[Reason]
-    query_items: list[str]
+    query_items: list[DocumentRequest]  # the documents a query asks for
     summary: str
     self_check_errors: list[str]  # left after one revision
     guardrail_errors: list[str]

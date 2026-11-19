@@ -29,7 +29,11 @@ NOW = datetime(2026, 11, 19, 9, 0, tzinfo=UTC)
 RECEIPT = QueryItem(
     text="Payment receipt", source="missing_document", doc_type=DocType.PAYMENT_RECEIPT
 )
-HISTOPATHOLOGY = QueryItem(text="Histopathology report of the appendix", source="medical")
+HISTOPATHOLOGY = QueryItem(
+    text="Histopathology report of the appendix",
+    source="medical",
+    doc_type=DocType.INVESTIGATION_REPORT,
+)
 
 
 class Env:
@@ -49,7 +53,10 @@ class Env:
         )
 
     async def claim(
-        self, missing: list[str], received: list[list[str]], medical: list[str]
+        self,
+        missing: list[str],
+        received: list[list[str]],
+        medical: list[dict[str, str]],
     ) -> UUID:
         claim_id = await add_digitised_claim(self.sessions, ClaimSpec(submitted_by=MEMBER_USER_ID))
         intake = await self.records.latest(claim_id, Stage.INTAKE)
@@ -94,7 +101,11 @@ async def test_outstanding_items_are_missing_documents_and_medical_query_items(e
     claim_id = await env.claim(
         missing=["payment_receipt", "claim_form_part_b"],
         received=[["claim_form_part_a", "final_bill"], ["claim_form_part_b"]],
-        medical=["Histopathology report of the appendix"],
+        medical=[
+            {"doc_type": "investigation_report", "text": "Histopathology report of the appendix"},
+            # The claim already holds a final bill: it is never asked for.
+            {"doc_type": "final_bill", "text": "Detailed itemised bill"},
+        ],
     )
 
     items = await env.service.outstanding_items(claim_id)
@@ -138,11 +149,14 @@ async def test_an_answered_item_is_never_asked_again(env: Env) -> None:
 
     with pytest.raises(NothingToAsk):
         await env.service.raise_query(claim_id, [HISTOPATHOLOGY])
-    lab = QueryItem(text="Liver function test", source="medical")
-    second = await env.service.raise_query(claim_id, [HISTOPATHOLOGY, lab])
+    reworded = QueryItem(text="HPE report", source="medical", doc_type=DocType.INVESTIGATION_REPORT)
+    with pytest.raises(NothingToAsk):  # the same document type, worded differently
+        await env.service.raise_query(claim_id, [reworded])
+    notes = QueryItem(text="OT notes", source="medical", doc_type=DocType.OT_NOTES)
+    second = await env.service.raise_query(claim_id, [HISTOPATHOLOGY, notes])
 
     assert second.query_id != first.query_id
-    assert [i.text for i in second.items] == ["Liver function test"]
+    assert [i.text for i in second.items] == ["OT notes"]
 
 
 async def test_a_reply_answers_the_query_once(env: Env) -> None:

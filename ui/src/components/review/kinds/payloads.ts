@@ -115,6 +115,9 @@ export type DeductionsPayload = Common & {
 
 export type Citation = { page: PageRef | null; ref: string | null }
 
+/** A document to ask the claimant for. */
+export type DocumentRequest = { doc_type: DocType; text: string }
+
 export type MedicalPayload = Common & {
   verified_codes: {
     code: { system: string; version: string; code: string; display: string | null }
@@ -124,7 +127,7 @@ export type MedicalPayload = Common & {
     rationale: string
   }[]
   findings: { kind: string; text: string; severity: 'info' | 'query' | 'adverse'; citations: Citation[]; judged_by: string }[]
-  query_items: string[]
+  query_items: DocumentRequest[]
   rule_results: RuleResult[]
   dropped: { item: string; detail: string; reason: string }[]
   adverse: boolean
@@ -144,7 +147,7 @@ export type Draft = {
   payable_on_sheet: Money
   available_balance: Money
   reasons: { text: string; clause_ref: string | null; rule_id: string | null; line_id: number | null }[]
-  query_items: string[]
+  query_items: DocumentRequest[]
   summary: string
   self_check_errors: string[]
   guardrail_errors: string[]

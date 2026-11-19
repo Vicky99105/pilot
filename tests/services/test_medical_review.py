@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
@@ -15,6 +16,7 @@ from app.database.seed import seed_claims_db
 from app.services.knowledge_base.service import DefaultKnowledgeBase
 from app.services.medical_review.contract import (
     Citation,
+    DocumentRequest,
     MedicalFindings,
     MedicalReviewService,
     NotReadyForMedicalReview,
@@ -22,7 +24,7 @@ from app.services.medical_review.contract import (
 from app.services.medical_review.service import DefaultMedicalReviewService
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.service import DefaultRulesEngine
-from app.shared.types import Stage
+from app.shared.types import DocType, Stage
 from tests.database.factories import add_claim
 from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.model_gateway import FakeModelGateway
@@ -41,11 +43,27 @@ APPENDIX_TERM = "appendicitis acute perforation localized peritonitis"
 REWRITE = {"items": [{"phrase": DIAGNOSIS, "index_terms": [APPENDIX_TERM]}]}
 
 
-def cite(n: int) -> dict[str, Any]:
-    return {"document_id": str(DISCHARGE_DOC), "page": n}
+def cite(n: int) -> str:
+    return f"page:{DISCHARGE_DOC}:{n}"
 
 
-def k35_32(*citations: dict[str, Any]) -> dict[str, Any]:
+def enum_at(schema: type[BaseModel] | None, *path: str) -> list[Any]:
+    """The enum of a field of a reply schema, following arrays and $refs along the path."""
+    assert schema is not None
+    root = schema.model_json_schema()
+    node: dict[str, Any] = root
+    for name in path:
+        node = node["properties"][name]
+        node = next((n for n in node.get("anyOf", [node]) if n.get("type") != "null"), node)
+        while "items" in node or "$ref" in node:
+            if "items" in node:
+                node = node["items"]
+            if "$ref" in node:
+                node = root["$defs"][node["$ref"].split("/")[-1]]
+    return list(node["enum"])
+
+
+def k35_32(*citations: str) -> dict[str, Any]:
     return {
         "code": "K35.32",
         "phrase": DIAGNOSIS,
@@ -120,31 +138,35 @@ async def test_happy_path_codes_from_the_lookup_with_citations(env: Env) -> None
     assert [c.purpose for c in gateway.calls] == ["medical_rewrite_terms", "medical_choose_codes"]
 
 
-async def test_a_code_no_lookup_returned_is_sent_back_then_dropped(env: Env) -> None:
+async def test_the_reply_schema_allows_only_billable_codes_the_lookups_returned(
+    env: Env,
+) -> None:
     claim_id = await env.claim()
-    invented = {"code": "K35.9", "phrase": DIAGNOSIS, "citations": [cite(1)], "rationale": "x"}
     gateway = FakeModelGateway(
-        {
-            "medical_rewrite_terms": [REWRITE],
-            "medical_choose_codes": [choose(k35_32(), invented), choose(k35_32(), invented)],
-        }
+        {"medical_rewrite_terms": [REWRITE], "medical_choose_codes": [choose(k35_32())]}
     )
 
     findings = await env.service(gateway).review(claim_id)
 
-    assert codes(findings) == ["K35.32"]
-    assert findings.revisions == 1
-    [dropped] = findings.dropped
-    assert (dropped.item, dropped.detail) == ("code", "K35.9")
-    assert "not returned by any lookup" in dropped.reason
-    revise_prompt = gateway.calls[-1].messages[-1].content  # type: ignore[index]
-    assert "K35.9" in revise_prompt and "not returned by any lookup" in revise_prompt
+    schema = gateway.calls[-1].schema
+    allowed = enum_at(schema, "codes", "code")
+    returned = {code for call in findings.lookups for code in call.returned_codes}
+    assert "K35.32" in allowed and set(allowed) <= returned
+    assert "K35.3" not in allowed  # a category: returned by the lookup, but not billable
+    assert "K35.9" not in allowed  # never returned by a lookup
+    invented = {"code": "K35.9", "phrase": DIAGNOSIS, "citations": [cite(1)], "rationale": "x"}
+    assert schema is not None
+    with pytest.raises(ValidationError):
+        schema.model_validate(choose(k35_32(), invented))
+    cites = enum_at(schema, "findings", "citations")
+    assert cite(1) in cites and "clause:Excl01" in cites and "icd:K35.32" in cites
+    assert cite(9) not in cites  # not a page of the claim
 
 
 async def test_uncited_findings_are_sent_back_once_then_dropped(env: Env) -> None:
     claim_id = await env.claim()
     fixed = {"text": "Perforation seen on CT", "severity": "info", "citations": []}
-    bad_page = {"text": "Wound infection", "severity": "query", "citations": [cite(9)]}
+    bad_page = {"text": "Wound infection", "severity": "query", "citations": []}
     gateway = FakeModelGateway(
         {
             "medical_rewrite_terms": [REWRITE],
@@ -248,18 +270,25 @@ async def test_a_claim_without_registration_is_not_ready(env: Env) -> None:
 
 async def test_an_item_the_claimant_already_answered_is_not_asked_again(env: Env) -> None:
     """After a query reply the review runs again. The model sees what was answered, and an
-    answered item it repeats is dropped, so the same query is never raised twice."""
+    item for a document type already answered is dropped, however it is worded, so the same
+    query is never raised twice."""
     claim_id = await env.claim()
     answered = {
         "query_id": "6f1c1d1e-5a43-4a8e-9a55-0c1a1f0c0002",
         "status": "answered",
-        "items": [{"text": "Histopathology report", "source": "medical", "doc_type": None}],
+        "items": [
+            {
+                "text": "Histopathology report",
+                "source": "medical",
+                "doc_type": "investigation_report",
+            }
+        ],
     }
     records = StageRecordRepository(env.sessions)
     await records.append(claim_id, Stage.QUERY, answered, created_by="test")
     reply = {
         **choose(k35_32()),
-        "query_items": ["histopathology  REPORT", "Ultrasound abdomen report"],
+        "query_items": [{"doc_type": "ot_notes", "text": "Operation theatre notes"}],
     }
     gateway = FakeModelGateway(
         {"medical_rewrite_terms": [REWRITE], "medical_choose_codes": [reply]}
@@ -267,9 +296,45 @@ async def test_an_item_the_claimant_already_answered_is_not_asked_again(env: Env
 
     findings = await env.service(gateway).review(claim_id)
 
-    assert findings.query_items == ["Ultrasound abdomen report"]
-    [dropped] = [d for d in findings.dropped if d.item == "query_item"]
-    assert dropped.detail == "histopathology  REPORT"
-    assert "already answered" in dropped.reason
-    choose_prompt = gateway.calls[-1].messages[-1].content  # type: ignore[index]
-    assert "Histopathology report" in choose_prompt
+    assert findings.query_items == [
+        DocumentRequest(doc_type=DocType.OT_NOTES, text="Operation theatre notes")
+    ]
+    schema = gateway.calls[-1].schema
+    assert "investigation_report" not in enum_at(schema, "query_items", "doc_type")
+    assert schema is not None
+    asked_again = {"doc_type": "investigation_report", "text": "HPE report of the appendix"}
+    with pytest.raises(ValidationError):
+        schema.model_validate({**choose(k35_32()), "query_items": [asked_again]})
+
+
+async def test_query_items_are_only_documents_the_claim_does_not_have(env: Env) -> None:
+    """A query item names a medical document type the claim does not hold. The reply schema
+    lists only those, so the model cannot ask for a document the claim already has."""
+    claim_id = await env.claim()
+    received = {"documents": [{"doc_type": "discharge_summary"}, {"doc_type": "final_bill"}]}
+    records = StageRecordRepository(env.sessions)
+    await records.append(claim_id, Stage.CLASSIFICATION, received, created_by="test")
+    reply = {
+        **choose(k35_32()),
+        "query_items": [{"doc_type": "ot_notes", "text": "Complete OT notes"}],
+    }
+    gateway = FakeModelGateway(
+        {"medical_rewrite_terms": [REWRITE], "medical_choose_codes": [reply]}
+    )
+
+    findings = await env.service(gateway).review(claim_id)
+
+    assert findings.query_items == [
+        DocumentRequest(doc_type=DocType.OT_NOTES, text="Complete OT notes")
+    ]
+    schema = gateway.calls[-1].schema
+    assert enum_at(schema, "query_items", "doc_type") == [
+        "ot_notes",
+        "investigation_report",
+        "prescription",
+    ]
+    assert schema is not None
+    for held in ("final_bill", "discharge_summary", "other"):
+        bill = {"doc_type": held, "text": "Detailed itemized hospital bill"}
+        with pytest.raises(ValidationError):
+            schema.model_validate({**choose(k35_32()), "query_items": [bill]})

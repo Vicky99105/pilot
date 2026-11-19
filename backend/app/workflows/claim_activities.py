@@ -274,7 +274,7 @@ class ClaimActivities:
                 "adverse": findings.adverse,
                 "findings": len(findings.findings),
                 "dropped": len(findings.dropped),
-                "query_items": findings.query_items,
+                "query_items": [q.doc_type.value for q in findings.query_items],
             },
             needs_checkpoint=findings.adverse,  # "medical findings" only when adverse
             checkpoint_payload=findings.model_dump(mode="json"),

@@ -13,6 +13,7 @@ from app.database.models import QueryRow, SubmissionRow, utcnow
 from app.database.repositories.stage_records import StageRecordRepository, append_in_session
 from app.services.communication.contract import CommunicationService
 from app.services.query.contract import (
+    ItemSource,
     NothingToAsk,
     Query,
     QueryItem,
@@ -26,6 +27,24 @@ PENDING = ("open", "overdue")
 
 def _label(doc_type: DocType) -> str:
     return doc_type.value.replace("_", " ").capitalize()
+
+
+def _same(a: QueryItem, b: QueryItem) -> bool:
+    """The same document type, or the same words when either item has no type."""
+    if a.doc_type is not None and b.doc_type is not None:
+        return a.doc_type == b.doc_type
+    return same_item(a.text, b.text)
+
+
+def _requested(
+    payload: dict[str, Any] | None, source: ItemSource, received: set[Any]
+) -> list[QueryItem]:
+    """A stage record's document requests, less the document types the claim holds."""
+    return [
+        QueryItem(text=r["text"], source=source, doc_type=DocType(r["doc_type"]))
+        for r in (payload or {}).get("query_items", [])
+        if r["doc_type"] not in received
+    ]
 
 
 class DefaultQueryService:
@@ -59,17 +78,11 @@ class DefaultQueryService:
             if d not in received
         ]
         medical = await self._records.latest(claim_id, Stage.MEDICAL_REVIEW)
-        items += [
-            QueryItem(text=q, source="medical")
-            for q in (medical.payload.get("query_items", []) if medical else [])
-        ]
+        items += _requested(medical.payload if medical else None, "medical", received)
         if not items:
             draft = await self._records.latest(claim_id, Stage.ADJUDICATION)
             if draft is not None and draft.payload.get("decision") == "query":
-                items = [
-                    QueryItem(text=q, source="adjudication")
-                    for q in draft.payload.get("query_items", [])
-                ]
+                items = _requested(draft.payload, "adjudication", received)
         return items
 
     async def raise_query(self, claim_id: UUID, items: list[QueryItem]) -> Query:
@@ -79,7 +92,7 @@ class DefaultQueryService:
         answered = await self._answered_items(claim_id)
         new: list[QueryItem] = []
         for item in items:
-            if not any(same_item(item.text, a) for a in [*answered, *(n.text for n in new)]):
+            if not any(_same(item, a) for a in [*answered, *new]):
                 new.append(item)
         if not new:
             raise NothingToAsk(f"claim {claim_id}: every item was asked and answered before")
@@ -146,12 +159,12 @@ class DefaultQueryService:
             )
         return self._to_query(row) if row else None
 
-    async def _answered_items(self, claim_id: UUID) -> list[str]:
+    async def _answered_items(self, claim_id: UUID) -> list[QueryItem]:
         async with self._sessions() as session:
             rows = await session.scalars(
                 select(QueryRow).where(QueryRow.claim_id == claim_id, QueryRow.status == "answered")
             )
-            return [item["text"] for row in rows for item in row.items]
+            return [QueryItem.model_validate(item) for row in rows for item in row.items]
 
     async def _get_row(self, query_id: UUID) -> QueryRow:
         async with self._sessions() as session:

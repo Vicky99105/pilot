@@ -6,6 +6,8 @@ Two guarantees hold for every MedicalFindings:
   it, and names that lookup.
 - Every finding cites a page of the claim or a clause or ICD reference. Uncited items go back
   to the model once, then are dropped with the reason recorded.
+- Every query item names one of MEDICAL_DOCUMENTS that the claim does not hold and the
+  claimant has not answered. Free-text concerns are findings, never query items.
 
 Callers import this module only.
 """
@@ -16,13 +18,22 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from app.shared.errors import PermanentError
-from app.shared.types import Code, PageRef, RuleResult
+from app.shared.types import Code, DocType, PageRef, RuleResult
 
 Severity = Literal["info", "query", "adverse"]
 FindingKind = Literal[
     "coding", "hospital_codes", "length_of_stay", "pre_existing", "eligibility", "clinical"
 ]
 LookupTool = Literal["search_icd_index", "get_icd_tabular"]
+
+# The documents medical review may ask the claimant for. A query item also excludes any of
+# these the claim already holds or the claimant already answered.
+MEDICAL_DOCUMENTS = (
+    DocType.DISCHARGE_SUMMARY,
+    DocType.OT_NOTES,
+    DocType.INVESTIGATION_REPORT,
+    DocType.PRESCRIPTION,
+)
 
 # Citation references other than pages: "clause:<clause_ref>" or "icd:<code>".
 CLAUSE_PREFIX = "clause:"
@@ -63,13 +74,20 @@ class DroppedItem(BaseModel):
     reason: str
 
 
+class DocumentRequest(BaseModel):
+    """A document to ask the claimant for. Never DocType.OTHER."""
+
+    doc_type: DocType
+    text: str  # the request as the claimant reads it
+
+
 class MedicalFindings(BaseModel):
     claim_id: UUID
     digitisation_version: int  # the ClaimRecord version reviewed
     registration_version: int  # the RegistrationResult version used
     verified_codes: list[VerifiedCode]
     findings: list[Finding]
-    query_items: list[str]  # what to ask the claimant for
+    query_items: list[DocumentRequest]  # the documents to ask the claimant for
     rule_results: list[RuleResult]  # eligibility rules re-run on the verified facts
     lookups: list[LookupCall]  # every tool call of the run, in order
     dropped: list[DroppedItem]

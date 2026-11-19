@@ -90,6 +90,10 @@ def test_merged_pdf_has_every_part_and_no_receipt(bundle: tuple[Path, dict[str, 
     assert merged == sum(p["pages"] for p in parts) == len(truth["files"]["merged_pages"])
     assert "payment_receipt" not in truth["files"]["merged_pages"]
     assert truth["missing_documents"] == ["payment_receipt"]
+    # A surgical claim carries the operation theatre notes; the receipt is the only gap.
+    assert "ot_notes" in truth["files"]["merged_pages"]
+    assert [p["doc_type"] for p in parts if p["doc_type"] == "ot_notes"] == ["ot_notes"]
+    assert truth["expected"]["query_items"] == ["payment receipt"]
     assert gen.page_count((out / gen.REPLY).read_bytes()) == truth["files"]["reply"]["pages"] == 1
 
 

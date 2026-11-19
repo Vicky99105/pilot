@@ -22,25 +22,27 @@ providers:
     # Gemini does not return a cost, so cost is estimated from tokens at list price (USD,
     # paid tier, output includes thinking tokens). gemini-3.8-flash: 0.75 / 3.75 through
     # 2026-12-31, rising to 1.50 / 7.50 from 2027-01-01 (ai.google.dev/gemini-api/docs/pricing).
-    # gemini-2.5-flash is closed to new API keys.
+    # gemini-2.5-flash is closed to new API keys. gemini-3.1-flash-lite: 0.25 / 1.50, run with
+    # reasoning_effort "none", so it spends no thinking tokens.
     pricing:
       gemini-2.5-flash: {input_per_mtok: "0.30", output_per_mtok: "2.50"}
       gemini-3.8-flash: {input_per_mtok: "0.75", output_per_mtok: "3.75"}
+      gemini-3.1-flash-lite: {input_per_mtok: "0.25", output_per_mtok: "1.50"}
 
 roles:
   vision_classify:
     provider: gemini
-    model: gemini-3.8-flash
-    params: {temperature: 0}
+    model: gemini-3.1-flash-lite
+    params: {temperature: 0, reasoning_effort: "none"}
   vision_extract:
     provider: gemini
-    model: gemini-3.8-flash
-    params: {temperature: 0}
+    model: gemini-3.1-flash-lite
+    params: {temperature: 0, reasoning_effort: "none"}
   reasoning:
     provider: gemini
-    model: gemini-3.8-flash
-    params: {temperature: 0}
+    model: gemini-3.1-flash-lite
+    params: {temperature: 0, reasoning_effort: "none"}
   fast_text:
     provider: gemini
-    model: gemini-3.8-flash
-    params: {temperature: 0}
+    model: gemini-3.1-flash-lite
+    params: {temperature: 0, reasoning_effort: "none"}

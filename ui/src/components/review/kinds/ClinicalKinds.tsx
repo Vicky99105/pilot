@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { PageRef } from '../../../lib/api'
-import { humanise } from '../../../lib/format'
+import { docLabel, humanise } from '../../../lib/format'
 import { Button, Chip, Notice } from '../../ui/primitives'
 import { Actions, CiteButton, RuleTable, Section, SendBack, TextArea, type KindProps } from './common'
 import type { Citation, MedicalPayload, RiskPayload } from './payloads'
@@ -66,7 +66,9 @@ export function MedicalFindings({ payload, cite, submit, busy }: KindProps<Medic
         <Section title="To ask the claimant">
           <ul className="list-disc pl-5 text-sm">
             {payload.query_items.map((q) => (
-              <li key={q}>{q}</li>
+              <li key={q.doc_type}>
+                {q.text} <span className="text-muted">({docLabel(q.doc_type)})</span>
+              </li>
             ))}
           </ul>
         </Section>

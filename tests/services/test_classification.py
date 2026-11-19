@@ -13,6 +13,7 @@ from app.services.classification.contract import (
     DocumentSet,
     UnknownPage,
 )
+from app.services.classification.prompts import DOC_TYPE_GUIDE
 from app.services.classification.service import DefaultClassificationService
 from app.services.intake.contract import ClaimForm, Submission, SubmissionInput, UploadedFile
 from app.services.intake.service import DefaultIntakeService
@@ -223,3 +224,8 @@ async def test_slotted_uploads_keep_the_missing_documents_intake_found(env: Env)
     assert await _intake_missing(env, submission) == (["payment_receipt"], [R])
     history = await StageRecordRepository(env.sessions).history(submission.claim_id, Stage.INTAKE)
     assert len(history) == len(history_before)  # nothing new written
+
+
+def test_every_document_type_has_a_labelling_guide() -> None:
+    assert set(DOC_TYPE_GUIDE) == set(DocType)
+    assert DocType("ot_notes") in DOC_TYPE_GUIDE

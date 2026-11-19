@@ -17,8 +17,8 @@ The claim:
   Rs 7,500 a day. R13 deducts the room excess and the proportionate share of the linked heads.
   One consumable line, "Gloves", is on the seeded non-payable list I, so R11 deducts it.
 - Bundle: claim form Part A (typed), claim form Part B (hospital), discharge summary,
-  itemised final bill, cancelled cheque. The payment receipt is left out on purpose, so a
-  query is raised; it is written separately as the query reply.
+  operation theatre notes, itemised final bill, cancelled cheque. The payment receipt is left
+  out on purpose, so a query is raised; it is written separately as the query reply.
 
 The ground truth's deductions come from the real rules engine (R11, R13, R21) run on the
 ground-truth bill lines, so every expected amount is exact. All data is synthetic.
@@ -1104,6 +1104,83 @@ def discharge_summary(claim: TracerClaim) -> bytes:
     return _save(build)
 
 
+def ot_notes(claim: TracerClaim) -> bytes:
+    """The operation theatre notes for the appendicectomy: one page."""
+
+    def build(pdf: Canvas) -> None:
+        y = _hospital_header(pdf, "OPERATION THEATRE NOTES")
+        y = _box_row(
+            pdf,
+            y,
+            [
+                ("Patient name", f"Mrs. {PATIENT.upper()}", 3),
+                ("Age / Sex", f"{claim.age} Y / F", 1.3),
+                ("IP No.", claim.ip_number, 1.8),
+            ],
+        )
+        y = (
+            _box_row(
+                pdf,
+                y,
+                [
+                    ("Date of surgery", dmon(claim.surgery), 1.5),
+                    ("OT", "OT 2", 0.8),
+                    ("Surgeon", SURGEON, 2),
+                    ("Anaesthetist", ANAESTHETIST, 2),
+                ],
+            )
+            - 12
+        )
+        y = _labelled(pdf, y, "PRE-OPERATIVE DIAGNOSIS", DIAGNOSIS)
+        y = _labelled(pdf, y, "PROCEDURE", PROCEDURE)
+        y = _labelled(
+            pdf,
+            y,
+            "ANAESTHESIA",
+            "General anaesthesia with endotracheal intubation. ASA grade I. Induction 10:05, "
+            "incision 10:20, closure 11:05, extubation 11:15.",
+        )
+        y = _labelled(
+            pdf,
+            y,
+            "OPERATIVE STEPS",
+            "Patient supine. Pneumoperitoneum by open technique at the umbilicus. Three ports: "
+            "10 mm umbilical, 5 mm suprapubic, 5 mm left iliac fossa. Appendix identified and "
+            "mobilised. Mesoappendix divided with bipolar cautery. Base secured with two "
+            "endoloops and the appendix divided. Specimen retrieved in an endobag. Peritoneal "
+            "toilet done. Ports closed in layers.",
+        )
+        y = _labelled(
+            pdf,
+            y,
+            "OPERATIVE FINDINGS",
+            "Acutely inflamed, oedematous retrocaecal appendix, 8 cm long. No perforation, no "
+            "gangrene, no abscess, no free pus. Caecum and terminal ileum normal.",
+        )
+        y = _labelled(
+            pdf,
+            y,
+            "SPECIMEN AND DRAIN",
+            "Appendix sent for histopathology. No drain placed. Blood loss minimal. Sponge and "
+            "instrument counts correct.",
+        )
+        y = _labelled(
+            pdf,
+            y,
+            "POST-OPERATIVE ORDERS",
+            "Nil by mouth for 6 hours, IV fluids, IV antibiotics and analgesics, early ambulation.",
+        )
+        pdf.setFont("Helvetica-Oblique", 12)
+        pdf.drawString(LEFT + 10, y - 30, "R. Khanna")
+        pdf.setFont("Helvetica", 8.5)
+        pdf.drawString(LEFT + 10, y - 44, f"{SURGEON}, MS (General Surgery)")
+        _seal(pdf, RIGHT - 90, y - 50)
+        _footer(pdf, "OT notes, page 1 of 1")
+        pdf.showPage()
+
+    return _save(build)
+
+
 _COLUMNS = [("Date", LEFT + 4), ("Particulars", LEFT + 78), ("Qty", 352.0)]
 _RATE_X, _AMOUNT_X = 440.0, RIGHT - 4
 
@@ -1396,11 +1473,12 @@ BUNDLE: list[tuple[str, DocType, Callable[[TracerClaim], bytes]]] = [
     ("01_claim_form_part_a.pdf", DocType.CLAIM_FORM_PART_A, claim_form_part_a),
     ("02_claim_form_part_b.pdf", DocType.CLAIM_FORM_PART_B, claim_form_part_b),
     ("03_discharge_summary.pdf", DocType.DISCHARGE_SUMMARY, discharge_summary),
-    ("04_final_bill.pdf", DocType.FINAL_BILL, final_bill),
-    ("05_cancelled_cheque.pdf", DocType.CANCELLED_CHEQUE, cancelled_cheque),
+    ("04_ot_notes.pdf", DocType.OT_NOTES, ot_notes),
+    ("05_final_bill.pdf", DocType.FINAL_BILL, final_bill),
+    ("06_cancelled_cheque.pdf", DocType.CANCELLED_CHEQUE, cancelled_cheque),
 ]
 # (file, page index, angle in degrees): the pages that get the scan treatment.
-SCANS = {"03_discharge_summary.pdf": (1, 0.8), "05_cancelled_cheque.pdf": (0, -1.3)}
+SCANS = {"03_discharge_summary.pdf": (1, 0.8), "06_cancelled_cheque.pdf": (0, -1.3)}
 MERGED = "bundle_merged.pdf"
 REPLY = "query_reply_payment_receipt.pdf"
 GROUND_TRUTH = "ground_truth.json"

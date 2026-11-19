@@ -14,7 +14,7 @@ from app.services.medical_review.contract import (
     Citation,
     Finding,
 )
-from app.shared.types import Code, PageRef
+from app.shared.types import Code, DocType, PageRef
 
 LONG_STAY_DAYS = 7  # no norms table in the tracer: longer stays need a stated reason
 PED_CLAUSE = "Excl01"
@@ -53,7 +53,9 @@ class CaseFile(BaseModel):
     declared_peds: list[Code]
     known_pages: list[PageRef]  # the pages a citation may name
     clause_refs: list[str]  # the policy clauses a citation may name
-    answered_queries: list[str] = []  # items the claimant already answered in a query reply
+    # Document types a query may ask for: medical documents the claim does not hold and the
+    # claimant has not already been asked for and answered.
+    requestable: list[DocType] = []
 
 
 # --- Citations ----------------------------------------------------------------------------
