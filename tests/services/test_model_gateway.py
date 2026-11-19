@@ -339,3 +339,24 @@ async def test_fake_gateway_returns_scripted_responses_by_purpose() -> None:
     )
 
     assert result == DocLabel(doc_type="final_bill", confidence=0.9)
+
+
+async def test_thinking_tokens_count_as_output_tokens() -> None:
+    """Gemini bills thinking tokens as output but reports them outside completion_tokens."""
+    completion = _completion('{"doc_type": "x", "confidence": 1}', cost=None)
+    completion["usage"] = {"prompt_tokens": 9, "completion_tokens": 12, "total_tokens": 255}
+    transport = ScriptedTransport([httpx.Response(200, json=completion)])
+    provider = OpenAICompatibleProvider(
+        name="gemini",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key=SecretStr(API_KEY),
+        http=httpx.AsyncClient(transport=httpx.MockTransport(transport.handler)),
+    )
+    reply = await provider.chat_json(
+        model="gemini-3.8-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        schema_name="DocLabel",
+        json_schema=DocLabel.model_json_schema(),
+        params={},
+    )
+    assert (reply.input_tokens, reply.output_tokens) == (9, 246)

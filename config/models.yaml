@@ -19,24 +19,28 @@ providers:
     kind: openai_compatible
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
     api_key_env: GEMINI_API_KEY
-    # Gemini does not return a cost, so cost is estimated from tokens at list price (USD).
+    # Gemini does not return a cost, so cost is estimated from tokens at list price (USD,
+    # paid tier, output includes thinking tokens). gemini-3.8-flash: 0.75 / 3.75 through
+    # 2026-12-31, rising to 1.50 / 7.50 from 2027-01-01 (ai.google.dev/gemini-api/docs/pricing).
+    # gemini-2.5-flash is closed to new API keys.
     pricing:
       gemini-2.5-flash: {input_per_mtok: "0.30", output_per_mtok: "2.50"}
+      gemini-3.8-flash: {input_per_mtok: "0.75", output_per_mtok: "3.75"}
 
 roles:
   vision_classify:
     provider: gemini
-    model: gemini-2.5-flash
+    model: gemini-3.8-flash
     params: {temperature: 0}
   vision_extract:
     provider: gemini
-    model: gemini-2.5-flash
+    model: gemini-3.8-flash
     params: {temperature: 0}
   reasoning:
     provider: gemini
-    model: gemini-2.5-flash
+    model: gemini-3.8-flash
     params: {temperature: 0}
   fast_text:
     provider: gemini
-    model: gemini-2.5-flash
+    model: gemini-3.8-flash
     params: {temperature: 0}

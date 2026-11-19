@@ -85,10 +85,17 @@ def _parse(data: dict[str, Any], requested_model: str) -> ChatResponse:
         raise ProviderTransientError(f"malformed completion: {str(data)[:500]}") from exc
     usage = data.get("usage") or {}
     cost = usage.get("cost")
+    input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    total = usage.get("total_tokens")
+    # Some providers (Gemini) bill thinking tokens as output but leave them out of
+    # completion_tokens; the total still includes them.
+    if input_tokens is not None and total is not None and output_tokens is not None:
+        output_tokens = max(output_tokens, total - input_tokens)
     return ChatResponse(
         content=content,
         model=data.get("model") or requested_model,
-        input_tokens=usage.get("prompt_tokens"),
-        output_tokens=usage.get("completion_tokens"),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         cost=Decimal(str(cost)) if cost is not None else None,
     )
