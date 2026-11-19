@@ -35,7 +35,11 @@ from app.services.registration.contract import (
     RegistrationResult,
 )
 from app.services.risk.contract import InvalidVerdict, RiskHit, RiskReport, Verdict
-from app.services.settlement.contract import PaymentNotReleased, SettlementRecord
+from app.services.settlement.contract import (
+    PayeeCheckFailed,
+    PaymentNotReleased,
+    SettlementRecord,
+)
 from app.shared.types import DocType, RequestType, Role
 
 _NAMESPACE = uuid.UUID("6f1c1d1e-5a43-4a8e-9a55-0c1a1f0c0001")
@@ -259,6 +263,7 @@ class FakeAdjudicationService:
 
     def __init__(self, decision: Decision = "approve") -> None:
         self.decision = decision
+        self.unanswered: list[tuple[UUID, list[str]]] = []
 
     async def draft(self, claim_id: UUID) -> DraftDecision:
         zero = Decimal("0.00")
@@ -279,13 +284,27 @@ class FakeAdjudicationService:
             revisions=0,
         )
 
+    async def draft_unanswered(self, claim_id: UUID, documents: list[str]) -> DraftDecision:
+        """The draft becomes a reject for non-submission from here on."""
+        self.unanswered.append((claim_id, documents))
+        self.decision = "reject"
+        return await self.draft(claim_id)
+
 
 class FakeDecisionService:
-    """Routes every claim to the approver band and records outcomes as given."""
+    """Routes every claim to the approver band and records outcomes as given. With an
+    adjudication fake, the draft follows that fake's current decision."""
 
-    def __init__(self, draft: Decision = "approve") -> None:
-        self.draft = draft
+    def __init__(
+        self, draft: Decision = "approve", adjudication: FakeAdjudicationService | None = None
+    ) -> None:
+        self._draft = draft
+        self._adjudication = adjudication
         self.records: list[DecisionRecord] = []
+
+    @property
+    def draft(self) -> Decision:
+        return self._adjudication.decision if self._adjudication else self._draft
 
     async def route(self, claim_id: UUID) -> Routing:
         return Routing(
@@ -385,9 +404,13 @@ class FakeCommunicationService:
 class FakeQueryService:
     """Always one missing document to ask for. Records reminders, replies and deadlines."""
 
-    def __init__(self, reply_days: int = 15, reminder_days: list[int] | None = None) -> None:
-        self.reply_days = reply_days
-        self.reminder_days = [3, 7] if reminder_days is None else reminder_days
+    def __init__(
+        self,
+        reply_window: timedelta = timedelta(days=15),
+        reminders: list[timedelta] | None = None,
+    ) -> None:
+        self.reply_window = reply_window
+        self.reminders = [timedelta(days=3), timedelta(days=7)] if reminders is None else reminders
         self.queries: dict[UUID, Query] = {}
         self.calls: list[tuple[str, Any]] = []
 
@@ -404,8 +427,8 @@ class FakeQueryService:
             letter_id=None,
             raised_at=now,
             deadline=now,
-            reply_window_days=self.reply_days,
-            reminder_days=self.reminder_days,
+            reply_window=self.reply_window,
+            reminder_offsets=self.reminders,
             reminders=[],
             reply_submission_id=None,
             answered_at=None,
@@ -420,8 +443,8 @@ class FakeQueryService:
             update={"status": "answered", "reply_submission_id": submission_id}
         )
 
-    async def record_reminder(self, query_id: UUID, day: int) -> Query:
-        self.calls.append(("reminder", day))
+    async def record_reminder(self, query_id: UUID, number: int) -> Query:
+        self.calls.append(("reminder", number))
         return self.queries[query_id]
 
     async def mark_overdue(self, query_id: UUID) -> Query:
@@ -438,12 +461,28 @@ class FakeQueryService:
 class FakeSettlementService:
     """Records the order of calls. A paid claim is refused without a release."""
 
-    def __init__(self, final: Decision = "approve") -> None:
-        self.final = final
+    def __init__(
+        self, final: Decision = "approve", decisions: FakeDecisionService | None = None
+    ) -> None:
+        self._final = final
+        self._decisions = decisions
         self.calls: list[tuple[str, UUID | None]] = []
         # What the decision pays now: zero for a reject, or a reconsideration that adds
         # nothing; set it to zero to test that case.
         self.to_pay = Decimal("1000.00")
+        # A payee check fails on every release until a test clears it (as a correction
+        # after a send-back would).
+        self.payee_fails = False
+
+    @property
+    def final(self) -> Decision:
+        """The decision service's latest final decision, when linked and recorded."""
+        latest = (
+            self._decisions.records[-1] if self._decisions and self._decisions.records else None
+        )
+        if latest is not None and latest.final_decision is not None:
+            return latest.final_decision
+        return self._final
 
     @property
     def paid(self) -> Decimal:
@@ -473,6 +512,8 @@ class FakeSettlementService:
     async def settle(self, claim_id: UUID, *, released_by: UUID | None) -> SettlementRecord:
         if self.paid > 0 and released_by is None:
             raise PaymentNotReleased("needs a finance release")
+        if self.paid > 0 and self.payee_fails:
+            raise PayeeCheckFailed("payee checks failed: bank_matches_cheque")
         self.calls.append(("settle", released_by))
         return self._record(claim_id, "settled")
 

@@ -1,6 +1,6 @@
 """Inputs and outputs of ClaimWorkflow and its activities."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
@@ -112,14 +112,14 @@ class DecisionStep(BaseModel):
 
 class QueryRaised(BaseModel):
     query_id: UUID | None  # None when there was nothing new to ask
-    reply_window_days: int = 0
-    reminder_days: list[int] = []
+    reply_window: timedelta = timedelta(0)
+    reminder_offsets: list[timedelta] = []  # after raising, in order
 
 
 class QueryStepInput(BaseModel):
     claim_id: UUID
     query_id: UUID
-    day: int | None = None  # reminders
+    reminder: int | None = None  # reminders: the number, 1-based
     submission_id: UUID | None = None  # replies
 
 

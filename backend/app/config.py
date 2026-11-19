@@ -1,5 +1,6 @@
 """Runtime settings, read from environment variables."""
 
+from datetime import timedelta
 from pathlib import Path
 
 from pydantic import SecretStr
@@ -34,9 +35,11 @@ class Settings(BaseSettings):
     notification_allowlist: str = ""
     graph_sender: str | None = None
     graph_access_token: SecretStr | None = None
-    # Query loop: days the claimant has to reply, and the days after raising to remind them.
-    query_reply_days: int = 15
-    query_reminder_days: list[int] = [3, 7]
+    # Query loop: how long the claimant has to reply, and when to remind them, as offsets
+    # from raising the query. ISO 8601 durations in the environment, e.g. QUERY_REPLY_WINDOW
+    # =PT6M and QUERY_REMINDERS='["PT2M","PT4M"]' for an eval run in minutes.
+    query_reply_window: timedelta = timedelta(days=15)
+    query_reminders: list[timedelta] = [timedelta(days=3), timedelta(days=7)]
     # Evals only: "role=provider:model,..." repoints model roles without editing
     # config/models.yaml (see model_gateway.service.apply_role_overrides). Empty in production.
     model_role_overrides: str = ""

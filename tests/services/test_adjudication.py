@@ -17,6 +17,7 @@ from app.config import Settings
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.adjudication.contract import (
+    DOCUMENTS_CLAUSE,
     AdjudicationService,
     DraftDecision,
     NotReadyForAdjudication,
@@ -517,3 +518,31 @@ async def test_a_document_in_any_classified_set_is_not_outstanding(env: Env) -> 
     draft = await env.service(gateway).draft(claim_id)
 
     assert (draft.expected_decision, draft.decision) == ("partial", "partial")
+
+
+# --- Phase 3: a query the claimant never answered -----------------------------------------
+
+
+async def test_an_unanswered_query_drafts_a_reject_for_non_submission(env: Env) -> None:
+    """The query's deadline passed with no reply: code drafts a reject for non-submission of
+    the documents asked for, citing the claim documents clause, with no model call. The CRC
+    decides it. A later draft on the same inputs returns this reject, not a new query."""
+    claim_id = await env.reviewed(query_items=[CT_REPORT])
+    gateway = FakeModelGateway({"adjudication_decide": [query_reply("investigation_report")]})
+    service = env.service(gateway)
+    await service.draft(claim_id)
+
+    rejected = await service.draft_unanswered(claim_id, ["CT abdomen report"])
+
+    assert (rejected.decision, rejected.expected_decision) == ("reject", "reject")
+    assert rejected.amount == D("0.00") and rejected.query_items == []
+    [reason] = rejected.reasons
+    assert reason.clause_ref == DOCUMENTS_CLAUSE
+    assert "CT abdomen report" in reason.text
+    assert rejected.guardrail_passed is True
+    assert len(gateway.calls) == 1  # the query draft only
+    stored = await StageRecordRepository(env.sessions).latest(claim_id, Stage.ADJUDICATION)
+    assert stored is not None and stored.created_by == "code"
+    assert await service.draft(claim_id) == rejected
+    clause = await DefaultKnowledgeBase(env.sessions).get_clause(PRODUCT_UIN, DOCUMENTS_CLAUSE)
+    assert clause is not None

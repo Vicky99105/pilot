@@ -52,6 +52,22 @@ def map_head(heading: str | None, description: str | None) -> tuple[Head, bool]:
     return (head, False) if head else (Head.OTHER, True)
 
 
+# IRDAI Lists II to IV name items that are part of ("subsumed into") another charge: List II
+# into the room charge, List III into the procedure charge, List IV into the cost of
+# treatment. Such an item is never the charge it is part of, so it is never a candidate for
+# a line of that head. A package line is the whole treatment and holds every list.
+SUBSUMED_INTO: dict[str, frozenset[Head]] = {
+    "II": frozenset({Head.ROOM, Head.ICU, Head.PACKAGE}),
+    "III": frozenset({Head.OT, Head.PROFESSIONAL_FEES, Head.PACKAGE}),
+    "IV": frozenset({Head.PACKAGE}),
+}
+
+
+def fits_head(list_name: str, head: Head) -> bool:
+    """False when an item of this IRDAI list is part of the charge a line of this head is."""
+    return head not in SUBSUMED_INTO.get(list_name, frozenset())
+
+
 def money(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
 

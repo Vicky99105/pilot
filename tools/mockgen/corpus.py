@@ -1633,7 +1633,7 @@ def _write_cashless(case: Case, out: Path) -> dict[str, Any]:
 # query_reply (answer the query with the reply file), investigator (the verdict), and
 # fix_bank (an operator corrects the cheque account to the form's at "fix fields").
 # Hospitals and members are spread so RF5 and RF6 fire only where a case seeds them; the
-# unanswered-query case runs last, on an app restarted with QUERY_REPLY_DAYS=0.
+# unanswered-query case needs an app with a query clock in minutes (tools/eval/run_eval.py).
 _CHEQUE, _BILL, _SUMMARY = DocType.CANCELLED_CHEQUE, DocType.FINAL_BILL, DocType.DISCHARGE_SUMMARY
 CORPUS: list[CaseSpec] = [
     CaseSpec(
@@ -1794,7 +1794,7 @@ CORPUS: list[CaseSpec] = [
             "decision": "reject",
             "crc": True,
             "query_reply": False,
-            "query_reply_days": 0,
+            "query_reply_window": "PT6M",
         },
     ),
 ]

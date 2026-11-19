@@ -49,7 +49,11 @@ class Env:
     @property
     def service(self) -> QueryService:
         return DefaultQueryService(
-            self.sessions, self.communication, reply_days=15, reminder_days=[3, 7], now=lambda: NOW
+            self.sessions,
+            self.communication,
+            reply_window=timedelta(days=15),
+            reminders=[timedelta(days=3), timedelta(days=7)],
+            now=lambda: NOW,
         )
 
     async def claim(
@@ -120,7 +124,8 @@ async def test_raising_a_query_issues_a_query_letter_with_the_items(env: Env) ->
 
     assert query.status == "open"
     assert (query.raised_at, query.deadline) == (NOW, NOW + timedelta(days=15))
-    assert (query.reply_window_days, query.reminder_days) == (15, [3, 7])
+    assert query.reply_window == timedelta(days=15)
+    assert query.reminder_offsets == [timedelta(days=3), timedelta(days=7)]
     assert query.letter_id is not None
     [sent] = env.notifications.sent
     assert sent.to == "asha.verma@member.example"  # the submitter's address
@@ -187,19 +192,36 @@ async def test_reminders_and_the_deadline_are_recorded(env: Env) -> None:
     claim_id = await env.claim(missing=["payment_receipt"], received=[[]], medical=[])
     query = await env.service.raise_query(claim_id, [RECEIPT])
 
-    await env.service.record_reminder(query.query_id, 3)
-    await env.service.record_reminder(query.query_id, 3)  # a retried activity
-    await env.service.record_reminder(query.query_id, 7)
+    await env.service.record_reminder(query.query_id, 1)
+    await env.service.record_reminder(query.query_id, 1)  # a retried activity
+    await env.service.record_reminder(query.query_id, 2)
     overdue = await env.service.mark_overdue(query.query_id)
 
-    assert (overdue.status, overdue.reminders) == ("overdue", [3, 7])
+    assert (overdue.status, overdue.reminders) == ("overdue", [1, 2])
     assert await env.service.open_query(claim_id) == overdue  # still awaiting the claimant
     history: list[dict[str, Any]] = [
         r.payload for r in await env.records.history(claim_id, Stage.QUERY)
     ]
     assert [(p["status"], p["reminders"]) for p in history] == [
         ("open", []),
-        ("open", [3]),
-        ("open", [3, 7]),
-        ("overdue", [3, 7]),
+        ("open", [1]),
+        ("open", [1, 2]),
+        ("overdue", [1, 2]),
     ]
+
+
+async def test_the_reply_window_and_reminders_may_be_shorter_than_a_day(env: Env) -> None:
+    claim_id = await env.claim(missing=["payment_receipt"], received=[[]], medical=[])
+    service = DefaultQueryService(
+        env.sessions,
+        env.communication,
+        reply_window=timedelta(minutes=6),
+        reminders=[timedelta(minutes=4), timedelta(minutes=2), timedelta(minutes=9)],
+        now=lambda: NOW,
+    )
+
+    query = await service.raise_query(claim_id, [RECEIPT])
+
+    assert query.deadline == NOW + timedelta(minutes=6)
+    # In order; a reminder at or after the deadline is never sent.
+    assert query.reminder_offsets == [timedelta(minutes=2), timedelta(minutes=4)]

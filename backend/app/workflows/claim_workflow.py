@@ -4,7 +4,8 @@ Checkpoint pattern: the open_task activity, then wait for that task's outcome th
 task_completed signal. When the deadline passes, an escalation event is recorded and the
 workflow keeps waiting. A send-back outcome re-runs the named stage. An outcome the
 service refuses (a bad correction, a decision above the approver's limit, a release with
-failed payee checks) sends the same checkpoint back to the queue with the reason.
+failed payee checks) sends the same checkpoint back to the queue with the reason. A refused
+finance release reopens at most MAX_REFUSED_RELEASES times, then goes back to digitisation.
 
 Order at the end: decision (approver, then CRC for a partial or reject), communication,
 then settlement: payee checks, the finance release, then payment, block release, closure.
@@ -53,6 +54,10 @@ with workflow.unsafe.imports_passed_through():
     )
 
 CHECKPOINT_SLA = timedelta(hours=4)
+# A refused finance release reopens the finance task at most this many times; then the
+# claim goes back to digitisation, where the payee details are read and corrected.
+MAX_REFUSED_RELEASES = 3
+PAYEE_STAGE = Stage.DIGITISATION
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 RETRY = RetryPolicy(maximum_attempts=3, non_retryable_error_types=["PermanentError"])
 # Activities that call a model. The cap is per activity: the activity is the unit of work.
@@ -136,7 +141,6 @@ MEDICAL_FINDINGS = Checkpoint("medical_findings", Role.MEDICAL_OFFICER, "Confirm
 INVESTIGATE = Checkpoint("investigate", Role.INVESTIGATOR, "Investigate referred claim")
 APPROVE = Checkpoint("approve", Role.APPROVER, "Approve, override or send back")
 CRC = Checkpoint("crc", Role.CRC_REVIEWER, "Approve rejection or partial")
-QUERY_NO_REPLY = Checkpoint("query_no_reply", Role.CLAIMS_OPERATOR, "Handle query with no reply")
 RELEASE_PAYMENT = Checkpoint("release_payment", Role.FINANCE, "Release payment")
 
 # Stages whose checkpoint outcome can carry corrections, and the outcome key that holds them.
@@ -441,24 +445,13 @@ class ClaimWorkflow:
         return None
 
     async def _settle(self, reachable: list[Stage]) -> Stage | None:
-        """Payee checks, then the finance release for a paid claim, then settle."""
+        """Payee checks, then the finance release for a paid claim, then settle. A send-back
+        from any release task is honoured. A refused release reopens the task with the
+        reason, at most MAX_REFUSED_RELEASES times; after that the claim goes back to
+        PAYEE_STAGE, where the payee details are read and corrected."""
+        assert self._claim_id is not None
         checked = await self._run_stage(Stage.SETTLEMENT)
-        if checked.needs_checkpoint:  # something to pay: a reconsideration may add nothing
-            outcome = await self._checkpoint(
-                Stage.SETTLEMENT, RELEASE_PAYMENT, checked.checkpoint_payload
-            )
-            target = send_back_target(outcome, reachable)
-            if target is not None:
-                return target
-            await self._until_accepted(
-                Stage.SETTLEMENT,
-                RELEASE_PAYMENT,
-                checked.checkpoint_payload,
-                ClaimActivities.settle,
-                outcome=outcome,
-            )
-        else:
-            assert self._claim_id is not None
+        if not checked.needs_checkpoint:  # nothing to pay: a reconsideration may add nothing
             await workflow.execute_activity_method(
                 ClaimActivities.settle,
                 OutcomeInput(
@@ -467,7 +460,40 @@ class ClaimWorkflow:
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=RETRY,
             )
-        return None
+            return None
+        payload = checked.checkpoint_payload
+        for _ in range(MAX_REFUSED_RELEASES):
+            outcome = await self._checkpoint(Stage.SETTLEMENT, RELEASE_PAYMENT, payload)
+            target = send_back_target(outcome, reachable)
+            if target is not None:
+                return target
+            try:
+                await workflow.execute_activity_method(
+                    ClaimActivities.settle,
+                    OutcomeInput(
+                        claim_id=self._claim_id,
+                        stage=Stage.SETTLEMENT,
+                        task_id=UUID(self._last_task_id),
+                        outcome=outcome,
+                    ),
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=RETRY,
+                )
+                return None
+            except ActivityError as err:
+                error = _reason(err)
+                await self._event(
+                    Stage.SETTLEMENT,
+                    "outcome_refused",
+                    {"kind": RELEASE_PAYMENT.kind, "reason": error},
+                )
+                payload = {**checked.checkpoint_payload, "error": error}
+        await self._event(
+            Stage.SETTLEMENT,
+            "release_refused_limit",
+            {"refusals": MAX_REFUSED_RELEASES, "to": PAYEE_STAGE.value},
+        )
+        return PAYEE_STAGE
 
     async def _until_accepted(
         self,
@@ -477,18 +503,16 @@ class ClaimWorkflow:
         activity: Callable[..., Any],
         *,
         authority_amount: Decimal | None = None,
-        outcome: dict[str, Any] | None = None,
     ) -> Any:
-        """Open the checkpoint (unless its outcome is given) and record the outcome with
-        the activity. An outcome the service refuses reopens the checkpoint with the reason."""
+        """Open the checkpoint and record the outcome with the activity. An outcome the
+        service refuses reopens the checkpoint with the reason."""
         assert self._claim_id is not None
         error: str | None = None
         while True:
-            if outcome is None:
-                extra = {"error": error} if error else {}
-                outcome = await self._checkpoint(
-                    stage, checkpoint, {**payload, **extra}, authority_amount=authority_amount
-                )
+            extra = {"error": error} if error else {}
+            outcome = await self._checkpoint(
+                stage, checkpoint, {**payload, **extra}, authority_amount=authority_amount
+            )
             try:
                 return await workflow.execute_activity_method(
                     activity,
@@ -506,13 +530,13 @@ class ClaimWorkflow:
                 await self._event(
                     stage, "outcome_refused", {"kind": checkpoint.kind, "reason": error}
                 )
-                outcome = None
 
     async def _query_loop(self) -> Stage | None:
-        """Raise the query and wait for a reply, with reminders. A reply re-runs
-        classification and digitisation on it, then resumes at medical coding. With no
-        reply by the deadline, a claims operator decides: wait again ("extend", the
-        default) or go to the approver as the claim stands ("proceed")."""
+        """Raise the query and wait for a reply, with reminders at the query's offsets. A
+        reply re-runs classification and digitisation on it, then resumes at medical coding.
+        With no reply by the deadline, the query is overdue and adjudication drafts a reject
+        for non-submission of documents; the decision stage routes it to the approver and
+        the CRC, who decide. A TPA never repudiates on its own."""
         assert self._claim_id is not None
         raised: QueryRaised = await workflow.execute_activity_method(
             ClaimActivities.query,
@@ -523,34 +547,24 @@ class ClaimWorkflow:
         if raised.query_id is None:
             return None  # nothing new to ask: the approver decides on the draft
         step = QueryStepInput(claim_id=self._claim_id, query_id=raised.query_id)
-        reminders = raised.reminder_days
-        while True:
-            start = workflow.now()
-            reply = None
-            for day in reminders:
-                reply = await self._next_followup(until=start + timedelta(days=day))
-                if reply is not None:
-                    break
-                await self._query_step(ClaimActivities.query_reminder, step, day=day)
-            if reply is None:
-                reply = await self._next_followup(
-                    until=start + timedelta(days=raised.reply_window_days)
-                )
+        start = workflow.now()
+        reply = None
+        for number, offset in enumerate(raised.reminder_offsets, start=1):
+            reply = await self._next_followup(until=start + offset)
             if reply is not None:
-                await self._query_step(ClaimActivities.query_reply, step, submission_id=reply)
-                for stage in (Stage.CLASSIFICATION, Stage.DIGITISATION):
-                    result = await self._run_stage(stage, submission_id=reply)
-                    await self._checkpoints(stage, result, [])
-                return RESUME_AFTER_REPLY
-            await self._query_step(ClaimActivities.query_overdue, step)
-            outcome = await self._checkpoint(
-                Stage.QUERY, QUERY_NO_REPLY, {"query_id": str(raised.query_id)}
-            )
-            if outcome.get("action") == "proceed":
-                await self._event(Stage.QUERY, "query_closed_without_reply")
-                return None
-            await self._event(Stage.QUERY, "query_extended")
-            reminders = []  # the claimant was reminded already
+                break
+            await self._query_step(ClaimActivities.query_reminder, step, reminder=number)
+        if reply is None:
+            reply = await self._next_followup(until=start + raised.reply_window)
+        if reply is not None:
+            await self._query_step(ClaimActivities.query_reply, step, submission_id=reply)
+            for stage in (Stage.CLASSIFICATION, Stage.DIGITISATION):
+                result = await self._run_stage(stage, submission_id=reply)
+                await self._checkpoints(stage, result, [])
+            return RESUME_AFTER_REPLY
+        await self._query_step(ClaimActivities.query_overdue, step)
+        await self._query_step(ClaimActivities.query_unanswered, step)
+        return None
 
     async def _next_followup(self, *, until: datetime | None) -> UUID | None:
         """The next unused follow-up, waiting for one until the given time (or for as long
@@ -575,12 +589,12 @@ class ClaimWorkflow:
         activity: Callable[..., Any],
         step: QueryStepInput,
         *,
-        day: int | None = None,
+        reminder: int | None = None,
         submission_id: UUID | None = None,
     ) -> None:
         await workflow.execute_activity_method(
             activity,
-            step.model_copy(update={"day": day, "submission_id": submission_id}),
+            step.model_copy(update={"reminder": reminder, "submission_id": submission_id}),
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )

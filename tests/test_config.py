@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import pytest
 
 from app.config import Settings
@@ -41,3 +43,26 @@ def test_settings_read_phase_1_variables(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_config_dir_holds_models_yaml() -> None:
     assert (Settings().config_dir / "models.yaml").is_file()
+
+
+def test_the_query_clock_defaults_to_15_days_with_reminders_at_day_3_and_7(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("QUERY_REPLY_WINDOW", raising=False)
+    monkeypatch.delenv("QUERY_REMINDERS", raising=False)
+
+    settings = Settings()
+
+    assert settings.query_reply_window == timedelta(days=15)
+    assert settings.query_reminders == [timedelta(days=3), timedelta(days=7)]
+
+
+def test_the_query_clock_takes_sub_day_durations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An eval runs the full no-reply path in minutes: ISO 8601 durations."""
+    monkeypatch.setenv("QUERY_REPLY_WINDOW", "PT6M")
+    monkeypatch.setenv("QUERY_REMINDERS", '["PT2M", "PT4M"]')
+
+    settings = Settings()
+
+    assert settings.query_reply_window == timedelta(minutes=6)
+    assert settings.query_reminders == [timedelta(minutes=2), timedelta(minutes=4)]

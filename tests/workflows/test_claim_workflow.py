@@ -19,7 +19,7 @@ from app.services.adjudication.contract import Decision
 from app.shared.types import RequestType, Stage
 from app.workflows.claim_activities import ClaimActivities
 from app.workflows.claim_models import ClaimInput, ClaimResult, StageInput, StageResult
-from app.workflows.claim_workflow import CHECKPOINT_SLA, ClaimWorkflow
+from app.workflows.claim_workflow import CHECKPOINT_SLA, MAX_REFUSED_RELEASES, ClaimWorkflow
 from app.workflows.worker import build_worker
 from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.stages import (
@@ -73,6 +73,7 @@ class Harness:
     classification: FakeClassificationService
     medical: FakeMedicalReviewService
     risk: FakeRiskService
+    adjudication: FakeAdjudicationService
 
     async def start(self) -> WorkflowHandle[ClaimWorkflow, ClaimResult]:
         return await self.env.client.start_workflow(
@@ -116,12 +117,16 @@ async def _harness(
     refer: bool = False,
     decision: Decision = "approve",
     classification: FakeClassificationService | None = None,
+    query: FakeQueryService | None = None,
 ) -> AsyncIterator[Harness]:
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
         monitoring, tasks = FakeMonitoring(), FakeTaskService()
-        query, settlement = FakeQueryService(), FakeSettlementService(final=decision)
+        adjudication = FakeAdjudicationService(decision)
+        decisions = FakeDecisionService(decision, adjudication=adjudication)
+        query = query or FakeQueryService()
+        settlement = FakeSettlementService(final=decision, decisions=decisions)
         classification = classification or FakeClassificationService()
         medical, risk = FakeMedicalReviewService(adverse=adverse), FakeRiskService(refer=refer)
         activities = activities_cls(
@@ -134,8 +139,8 @@ async def _harness(
             bill_review=FakeBillReviewService(),
             medical_review=medical,
             risk=risk,
-            adjudication=FakeAdjudicationService(decision),
-            decision=FakeDecisionService(decision),
+            adjudication=adjudication,
+            decision=decisions,
             communication=FakeCommunicationService(),
             query=query,
             settlement=settlement,
@@ -143,7 +148,10 @@ async def _harness(
         )
         worker: Worker = build_worker(env.client, TASK_QUEUE, claim_activities=activities)
         async with worker:
-            yield Harness(env, tasks, monitoring, query, settlement, classification, medical, risk)
+            yield Harness(
+                env, tasks, monitoring, query, settlement, classification, medical, risk,
+                adjudication,
+            )  # fmt: skip
 
 
 @pytest.fixture
@@ -437,7 +445,7 @@ async def _to_query(h: Harness) -> WorkflowHandle[ClaimWorkflow, ClaimResult]:
 
 def _reminders(h: Harness) -> list[int]:
     return [
-        e.detail["day"]  # type: ignore[index]
+        e.detail["reminder"]  # type: ignore[index]
         for e in h.monitoring.recorded
         if e.action == "query_reminder"
     ]
@@ -450,9 +458,9 @@ async def test_query_reminders_at_day_3_and_7_then_a_reply_resumes_at_medical_co
     handle = await _to_query(h)
 
     await h.env.sleep(timedelta(days=3, minutes=1))
-    await h.wait_for(lambda: _reminders(h) == [3], "day 3 reminder")
+    await h.wait_for(lambda: _reminders(h) == [1], "day 3 reminder")
     await h.env.sleep(timedelta(days=4))
-    await h.wait_for(lambda: _reminders(h) == [3, 7], "day 7 reminder")
+    await h.wait_for(lambda: _reminders(h) == [1, 2], "day 7 reminder")
     assert h.monitoring.actions(Stage.MEDICAL_REVIEW).count("stage_completed") == 1
 
     reply = uuid.uuid4()
@@ -470,28 +478,46 @@ async def test_query_reminders_at_day_3_and_7_then_a_reply_resumes_at_medical_co
     assert (await handle.result()).status == "closed"
 
 
-async def test_no_reply_by_the_deadline_opens_the_operator_task_and_waits_again(
-    query_harness: Harness,
+@pytest.fixture
+async def short_query_harness() -> AsyncIterator[Harness]:
+    """The query clock in minutes, as the eval runs it: reply in 6, reminders at 2 and 4."""
+    QueryOnceActivities.adjudications = 0
+    query = FakeQueryService(
+        reply_window=timedelta(minutes=6), reminders=[timedelta(minutes=2), timedelta(minutes=4)]
+    )
+    async for h in _harness(QueryOnceActivities, query=query):
+        yield h
+
+
+async def test_no_reply_by_the_deadline_drafts_a_reject_for_the_crc_then_letter_and_close(
+    short_query_harness: Harness,
 ) -> None:
-    h = query_harness
+    """After the reminders and the deadline, the workflow drafts a reject for non-submission
+    of the documents asked for and routes it to the decision: the approver, then the CRC,
+    decides. A TPA never repudiates on its own. Then the letter, and the claim closes with
+    nothing to pay."""
+    h = short_query_harness
     handle = await _to_query(h)
 
-    await h.env.sleep(timedelta(days=15, minutes=1))
-    await h.wait_for(lambda: bool(h.tasks.unfinished("query_no_reply")), "operator task")
-    [task] = h.tasks.unfinished("query_no_reply")
+    await h.env.sleep(timedelta(minutes=2, seconds=10))
+    await h.wait_for(lambda: _reminders(h) == [1], "the first reminder")
+    await h.env.sleep(timedelta(minutes=4))
+    await h.wait_for(lambda: bool(h.tasks.unfinished("approve")), "the approver")
 
-    assert task.role.value == "claims_operator"
+    assert _reminders(h) == [1, 2]
     assert "query_deadline_passed" in h.monitoring.actions(Stage.QUERY)
-    assert ("overdue", task.payload and h.query.calls[0][1]) in h.query.calls
-    assert h.monitoring.actions(Stage.SETTLEMENT) == []  # never closed for a missing document
-
-    await h.complete(handle, "query_no_reply", {"action": "extend"})
-    await h.wait_for(lambda: "query_extended" in h.monitoring.actions(Stage.QUERY), "extended")
-    await handle.signal(ClaimWorkflow.followup_received, str(uuid.uuid4()))
-    for kind in ["confirm_deductions", "approve", "release_payment"]:
+    assert [docs for _, docs in h.adjudication.unanswered] == [["Payment receipt"]]
+    assert "query_no_reply" not in h.opened_kinds()
+    [task] = h.tasks.unfinished("approve")
+    assert task.payload["routing"]["draft_decision"] == "reject"
+    for kind in ["approve", "crc"]:
         await h.complete(handle, kind)
-    assert (await handle.result()).status == "closed"
-    assert _reminders(h) == [3, 7]  # no second round of reminders after the extension
+
+    result = await handle.result()
+    assert result.status == "closed"
+    assert "release_payment" not in h.opened_kinds()
+    assert "stage_completed" in h.monitoring.actions(Stage.COMMUNICATION)
+    assert h.monitoring.actions(Stage.SETTLEMENT)[-1] == "claim_closed"
 
 
 async def test_a_partial_needs_the_crc_and_the_crc_can_send_it_back(
@@ -554,6 +580,64 @@ async def test_a_release_without_the_release_action_reopens_the_finance_task(
 
     await harness.complete(handle, "release_payment")
     assert (await handle.result()).status == "closed"
+
+
+async def refused_release(h: Harness, handle: WorkflowHandle[ClaimWorkflow, ClaimResult]) -> None:
+    """Release once against a failing payee check, and wait for the reopened task."""
+    await h.complete(handle, "release_payment")
+    await h.wait_for(
+        lambda: h.monitoring.actions(Stage.SETTLEMENT).count("outcome_refused") >= 1,
+        "refusal",
+    )
+    await h.wait_for(lambda: bool(h.tasks.unfinished("release_payment")), "release again")
+
+
+async def test_a_send_back_from_any_reopened_release_task_is_honoured(harness: Harness) -> None:
+    """A failed payee check refuses the release and reopens the finance task. A send-back
+    from that reopened task re-runs the named stage, as it would from the first one."""
+    h = harness
+    h.settlement.payee_fails = True
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions", "approve"]:
+        await h.complete(handle, kind)
+    await refused_release(h, handle)
+    [again] = h.tasks.unfinished("release_payment")
+    assert "payee checks failed" in again.payload["error"]
+
+    send_back = {"action": "send_back", "stage": "digitisation", "note": "fix the account"}
+    await h.complete(handle, "release_payment", send_back)
+    h.settlement.payee_fails = False  # the operator corrects the account
+    for kind in ["confirm_registration", "confirm_deductions", "approve", "release_payment"]:
+        await h.complete(handle, kind)
+
+    assert (await handle.result()).status == "closed"
+    assert ("settlement", "sent_back") in [(e.stage.value, e.action) for e in h.monitoring.recorded]
+    assert h.settlement.calls[-1] == ("settle", uuid.UUID(PERSON))
+
+
+async def test_refused_releases_are_bounded_then_the_claim_goes_back_for_the_payee(
+    harness: Harness,
+) -> None:
+    """The finance task reopens at most MAX_REFUSED_RELEASES times. After the last refusal
+    the workflow sends the claim back to digitisation, where the payee details are read
+    and corrected, and records why."""
+    h = harness
+    h.settlement.payee_fails = True
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions", "approve"]:
+        await h.complete(handle, kind)
+    for _ in range(MAX_REFUSED_RELEASES):
+        await h.complete(handle, "release_payment")
+    await h.wait_for(
+        lambda: "release_refused_limit" in h.monitoring.actions(Stage.SETTLEMENT), "the limit"
+    )
+    h.settlement.payee_fails = False
+    for kind in ["confirm_registration", "confirm_deductions", "approve", "release_payment"]:
+        await h.complete(handle, kind)
+
+    assert (await handle.result()).status == "closed"
+    refused = h.monitoring.actions(Stage.SETTLEMENT).count("outcome_refused")
+    assert refused == MAX_REFUSED_RELEASES
 
 
 async def test_a_rejection_skips_the_finance_release_and_closes(reject_harness: Harness) -> None:

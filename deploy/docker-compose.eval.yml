@@ -23,8 +23,11 @@ services:
       NOTIFICATIONS_GRAPH_ENABLED: "false"
       # Repoint model roles without editing config/models.yaml: "role=provider:model,...".
       MODEL_ROLE_OVERRIDES: ${MODEL_ROLE_OVERRIDES:-}
-      # The query loop's clock, in days (an unanswered-query case needs a short one).
-      QUERY_REPLY_DAYS: ${EVAL_QUERY_REPLY_DAYS:-15}
+      # The query loop's clock, as ISO 8601 durations. The unanswered-query case runs the
+      # full path (reminders, deadline, reject for the CRC) with a clock in minutes:
+      # EVAL_QUERY_REPLY_WINDOW=PT6M EVAL_QUERY_REMINDERS='["PT2M","PT4M"]'.
+      QUERY_REPLY_WINDOW: ${EVAL_QUERY_REPLY_WINDOW:-P15D}
+      QUERY_REMINDERS: '${EVAL_QUERY_REMINDERS:-["P3D","P7D"]}'
     ports:
       - "127.0.0.1:8001:8000"
     volumes:

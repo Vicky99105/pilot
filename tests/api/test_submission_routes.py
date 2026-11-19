@@ -1,5 +1,6 @@
 import json
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -90,7 +91,12 @@ async def api(sessions: async_sessionmaker[AsyncSession]) -> AsyncIterator[Api]:
     communication = DefaultCommunicationService(
         sessions, files, FakeModelGateway({}), FakeNotificationService()
     )
-    queries = DefaultQueryService(sessions, communication, reply_days=15, reminder_days=[3, 7])
+    queries = DefaultQueryService(
+        sessions,
+        communication,
+        reply_window=timedelta(days=15),
+        reminders=[timedelta(days=3), timedelta(days=7)],
+    )
     app = create_app(
         UNREACHABLE,
         health_service=FakeHealthService(),

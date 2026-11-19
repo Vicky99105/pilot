@@ -333,6 +333,12 @@ class DefaultKnowledgeBase:
         async with self._sessions() as session:
             return await _reference.package_crosswalk(session, scheme, package_code)
 
+    async def packages_for_diagnoses(
+        self, scheme: str, diagnosis_codes: list[str]
+    ) -> list[PackageCrosswalk]:
+        async with self._sessions() as session:
+            return await _reference.packages_for_diagnoses(session, scheme, diagnosis_codes)
+
     async def city_tier(self, hospital_id: str) -> str | None:
         async with self._sessions() as session:
             return await _reference.hospital_tier(session, hospital_id)

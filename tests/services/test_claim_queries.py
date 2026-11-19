@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -113,7 +113,9 @@ async def test_get_shows_letters_and_the_open_query_and_letters_resolve_as_files
     communication = DefaultCommunicationService(
         env.sessions, env.files, FakeModelGateway({}), FakeNotificationService()
     )
-    queries = DefaultQueryService(env.sessions, communication, reply_days=15, reminder_days=[3])
+    queries = DefaultQueryService(
+        env.sessions, communication, reply_window=timedelta(days=15), reminders=[timedelta(days=3)]
+    )
     item = QueryItem(text="Payment receipt", source="missing_document")
     query = await queries.raise_query(submission.claim_id, [item])
 

@@ -19,7 +19,10 @@ against the corpus's current ground truth and writes one report, with no model s
 
 Model choice: the app reads MODEL_ROLE_OVERRIDES at start (deploy/docker-compose.eval.yml);
 the report records the models each role actually used, from model_calls. The unanswered-
-query case needs the app started with EVAL_QUERY_REPLY_DAYS=0 (its `expect` says so).
+query case runs the real deadline path (reminders, overdue, the reject for non-submission,
+the CRC): start the app with a short query clock, EVAL_QUERY_REPLY_WINDOW=PT6M and
+EVAL_QUERY_REMINDERS='["PT2M","PT4M"]'. Cases that answer their query reply at once, so the
+short clock does not change them.
 """
 
 import argparse
@@ -101,17 +104,9 @@ def outcome(task: dict[str, Any], truth: dict[str, Any]) -> dict[str, Any]:
     if kind == "investigate":
         return {"action": expect.get("investigator", "cleared"), "note": NOTE}
     if kind == "approve":
-        if (payload.get("draft") or {}).get("decision") == "query":
-            # The query closed without a reply: the approver rejects the claim.
-            return {
-                "action": "override",
-                "decision": "reject",
-                "amount": "0",
-                "reason": "Query unanswered after the reply period",
-            }
+        # The approver accepts the draft as the system wrote it, including the reject for
+        # non-submission the workflow drafts when a query passes its deadline unanswered.
         return {"action": "approve"}
-    if kind == "query_no_reply":
-        return {"action": "extend" if expect.get("query_reply", True) else "proceed"}
     return {"crc": {"action": "uphold"}, "release_payment": {"action": "release"}}.get(
         kind, {"action": "confirm"}
     )

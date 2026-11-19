@@ -287,6 +287,13 @@ class KnowledgeBase(Protocol):
         """Our crosswalk row for a package, or None when the package is not in it."""
         ...
 
+    async def packages_for_diagnoses(
+        self, scheme: str, diagnosis_codes: list[str]
+    ) -> list[PackageCrosswalk]:
+        """Our crosswalk rows of the scheme whose ICD-10-CM ranges hold any of the codes, in
+        package code order. Empty when no code is given."""
+        ...
+
     async def city_tier(self, hospital_id: str) -> str | None:
         """The CGHS city tier (X, Y or Z) of the hospital's city, or None when the rate list
         names no tier for it."""

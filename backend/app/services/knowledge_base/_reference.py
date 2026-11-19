@@ -43,6 +43,7 @@ from app.services.knowledge_base.contract import (
     TariffCandidate,
     TariffRate,
 )
+from app.shared.codes import code_in_ranges
 
 CENTS = Decimal("0.01")
 FIXTURE = "fixture"
@@ -498,8 +499,32 @@ async def package_crosswalk(
         .order_by(PackageCrosswalkRow.id.desc())
         .limit(1)
     )
-    if row is None:
-        return None
+    return None if row is None else _crosswalk(row)
+
+
+async def packages_for_diagnoses(
+    session: AsyncSession, scheme: str, codes: list[str]
+) -> list[PackageCrosswalk]:
+    """The latest crosswalk row of each package of the scheme, kept when its ranges hold
+    any of the codes."""
+    if not codes:
+        return []
+    rows = await session.scalars(
+        select(PackageCrosswalkRow)
+        .where(PackageCrosswalkRow.scheme == scheme.strip().upper())
+        .order_by(PackageCrosswalkRow.package_code, PackageCrosswalkRow.id.desc())
+    )
+    latest: dict[str, PackageCrosswalkRow] = {}
+    for row in rows:
+        latest.setdefault(row.package_code, row)
+    return [
+        _crosswalk(row)
+        for row in latest.values()
+        if any(code_in_ranges(c, list(row.icd10cm or [])) for c in codes)
+    ]
+
+
+def _crosswalk(row: PackageCrosswalkRow) -> PackageCrosswalk:
     return PackageCrosswalk(
         scheme=row.scheme,
         package_code=row.package_code,

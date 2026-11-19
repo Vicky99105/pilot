@@ -21,6 +21,8 @@ from app.services.medical_review.contract import DocumentRequest
 from app.shared.errors import PermanentError
 
 Decision = Literal["approve", "partial", "query", "reject"]
+# The policy clause a reject for non-submission of documents cites (seeded policy_clauses).
+DOCUMENTS_CLAUSE = "CLAIM-DOCS"
 
 
 class Reason(BaseModel):
@@ -55,4 +57,11 @@ class NotReadyForAdjudication(PermanentError):
 class AdjudicationService(Protocol):
     async def draft(self, claim_id: UUID) -> DraftDecision:
         """Idempotent per set of input record versions."""
+        ...
+
+    async def draft_unanswered(self, claim_id: UUID, documents: list[str]) -> DraftDecision:
+        """The claim's query passed its deadline with no reply: a reject for non-submission
+        of the documents asked for (their names as the query wrote them), citing
+        DOCUMENTS_CLAUSE. Written by code with no model call, on the inputs of the latest
+        draft, so draft() on the same inputs returns this reject. The CRC decides it."""
         ...

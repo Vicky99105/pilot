@@ -154,8 +154,8 @@ def create_app(
             app.state.query_service = DefaultQueryService(
                 sessions,
                 communication,
-                reply_days=settings.query_reply_days,
-                reminder_days=settings.query_reminder_days,
+                reply_window=settings.query_reply_window,
+                reminders=settings.query_reminders,
             )
         activities = ClaimActivities(
             app.state.monitoring,

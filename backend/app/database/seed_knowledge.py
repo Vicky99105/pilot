@@ -68,6 +68,14 @@ POLICY_CLAUSES: list[tuple[str, str, str]] = [
         "after all other limits and deductions.",
     ),
     (
+        "CLAIM-DOCS",
+        "Claim documents",
+        "A claim must be supported by the documents the claim procedure lists and by any "
+        "further documents asked for to decide it. When documents asked for are not "
+        "submitted within the time allowed, after reminders, the claim may be rejected for "
+        "non-submission of documents.",
+    ),
+    (
         "FRAUD",
         "Fraudulent claims",
         "Nothing is paid on a claim that is fraudulent, or that is backed by a false "

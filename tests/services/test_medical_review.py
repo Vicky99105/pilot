@@ -343,25 +343,42 @@ async def test_a_document_type_an_earlier_query_asked_for_is_never_asked_again(
     assert findings.adverse is False
 
 
-async def test_without_a_guideline_the_options_are_the_medical_documents_not_held(
+async def test_without_a_guideline_only_the_checklists_required_medical_documents_are_offered(
+    env: Env,
+) -> None:
+    """c07: no package, so no guideline. The reimbursement checklist requires the discharge
+    summary and nothing else medical, so with the summary held there is no source for any
+    query item: the reply must keep query_items empty. A prescription is never required."""
+    claim_id = await env.claim()
+    await add_coding(env.sessions, claim_id)
+    await add_sheet(env.sessions, claim_id, packages=())
+    await env.held(claim_id, "discharge_summary", "ot_notes")
+    gateway = FakeModelGateway({"medical_findings": [NO_FINDINGS]})
+
+    findings = await env.service(gateway).review(claim_id)
+
+    assert findings.guideline is None
+    query_items = gateway.calls[-1].schema.model_json_schema()["properties"]["query_items"]
+    assert query_items.get("maxItems") == 0
+    assert findings.query_items == []
+
+
+async def test_without_a_guideline_a_missing_required_medical_document_is_offered(
     env: Env,
 ) -> None:
     claim_id = await env.claim()
     await add_coding(env.sessions, claim_id)
     await add_sheet(env.sessions, claim_id, packages=())
-    await env.held(claim_id, "discharge_summary", "ot_notes")
+    await env.held(claim_id, "ot_notes")
     gateway = FakeModelGateway(
-        {"medical_findings": [{"findings": [], "query_items": ["Investigation report"]}]}
+        {"medical_findings": [{"findings": [], "query_items": ["Discharge summary"]}]}
     )
 
     findings = await env.service(gateway).review(claim_id)
 
-    assert findings.guideline is None
-    assert enum_at(gateway.calls[-1].schema, "query_items") == [
-        "Investigation report", "Prescription",
-    ]  # fmt: skip
+    assert enum_at(gateway.calls[-1].schema, "query_items") == ["Discharge summary"]
     assert findings.query_items == [
-        DocumentRequest(doc_type=DocType.INVESTIGATION_REPORT, text="Investigation report")
+        DocumentRequest(doc_type=DocType.DISCHARGE_SUMMARY, text="Discharge summary")
     ]
 
 
@@ -396,12 +413,16 @@ def test_with_every_missing_document_requested_nothing_is_offered() -> None:
     assert document_options({"alos": ["3 Days"]}, held=set(), requested=set()) == []
 
 
-def test_without_a_guideline_the_medical_document_types_not_held_or_requested() -> None:
-    options = document_options(None, held={DocType.DISCHARGE_SUMMARY}, requested={INVESTIGATION})
-    assert offered(options) == [
-        ("Operation theatre notes", DocType.OT_NOTES, False),
-        ("Prescription", DocType.PRESCRIPTION, False),
-    ]
+def test_without_a_guideline_only_required_medical_documents_not_held_or_requested() -> None:
+    required = [DocType.CLAIM_FORM_PART_A, DocType.PAYMENT_RECEIPT, DocType.DISCHARGE_SUMMARY,
+                DocType.OT_NOTES, INVESTIGATION]  # fmt: skip
+    options = document_options(
+        None, held={DocType.OT_NOTES}, requested={INVESTIGATION}, required=required
+    )
+    # Non-medical documents are intake's to ask for; a held or asked type is never offered.
+    assert offered(options) == [("Discharge summary", DocType.DISCHARGE_SUMMARY, False)]
+    # Nothing required, nothing offered: a prescription has no source.
+    assert document_options(None, held=set(), requested=set(), required=[]) == []
 
 
 def test_the_request_text_is_built_from_the_chosen_options() -> None:

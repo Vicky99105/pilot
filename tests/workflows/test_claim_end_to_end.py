@@ -15,7 +15,7 @@ import asyncio
 import copy
 import re
 from collections.abc import AsyncIterator, Callable
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -233,7 +233,10 @@ class Harness:
             sessions, self.files, self.gateway, self.notifications
         )
         self.queries = DefaultQueryService(
-            sessions, communication, reply_days=15, reminder_days=[3, 7]
+            sessions,
+            communication,
+            reply_window=timedelta(days=15),
+            reminders=[timedelta(days=3), timedelta(days=7)],
         )
         self.activities = ClaimActivities(
             self.monitoring,

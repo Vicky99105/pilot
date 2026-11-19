@@ -48,20 +48,15 @@ def test_fields_are_fixed_to_the_ground_truth_and_the_bank_only_on_request() -> 
     assert fixed["fields"]["bank.account_number"] == "11122233434"
 
 
-def test_the_approver_accepts_the_draft_unless_a_query_closed_without_reply() -> None:
-    assert outcome(task("approve", {"draft": {"decision": "partial"}}), TRUTH) == {
-        "action": "approve"
-    }
-    closed = outcome(task("approve", {"draft": {"decision": "query"}}), TRUTH)
-    assert (closed["action"], closed["decision"]) == ("override", "reject")
-    assert closed["reason"]
+def test_the_approver_accepts_the_draft_as_written() -> None:
+    """Including the reject for non-submission drafted after an unanswered query: no
+    override stands in for the workflow's own path."""
+    for draft in ("partial", "reject"):
+        approve = task("approve", {"draft": {"decision": draft}})
+        assert outcome(approve, TRUTH) == {"action": "approve"}
 
 
-def test_the_query_timeout_and_the_investigator_follow_the_case() -> None:
-    assert outcome(task("query_no_reply"), TRUTH | {"expected": {"query_reply": False}}) == {
-        "action": "proceed"
-    }
-    assert outcome(task("query_no_reply"), TRUTH)["action"] == "extend"
+def test_the_investigator_follows_the_case() -> None:
     verdict = outcome(
         task("investigate"), TRUTH | {"expected": {"investigator": "fraud_confirmed"}}
     )

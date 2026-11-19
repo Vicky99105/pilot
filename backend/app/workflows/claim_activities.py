@@ -560,24 +560,48 @@ class ClaimActivities:
         )
         return QueryRaised(
             query_id=query.query_id,
-            reply_window_days=query.reply_window_days,
-            reminder_days=query.reminder_days,
+            reply_window=query.reply_window,
+            reminder_offsets=query.reminder_offsets,
         )
 
     @activity.defn(name="query_reminder")
     async def query_reminder(self, inp: QueryStepInput) -> None:
-        assert inp.day is not None
+        assert inp.reminder is not None
         await self._run(
-            inp.claim_id, Stage.QUERY, self._query.record_reminder(inp.query_id, inp.day)
+            inp.claim_id, Stage.QUERY, self._query.record_reminder(inp.query_id, inp.reminder)
         )
         await self._event(
-            _query(inp), "query_reminder", {"query_id": str(inp.query_id), "day": inp.day}
+            _query(inp),
+            "query_reminder",
+            {"query_id": str(inp.query_id), "reminder": inp.reminder},
         )
 
     @activity.defn(name="query_overdue")
     async def query_overdue(self, inp: QueryStepInput) -> None:
         await self._run(inp.claim_id, Stage.QUERY, self._query.mark_overdue(inp.query_id))
         await self._event(_query(inp), "query_deadline_passed", {"query_id": str(inp.query_id)})
+
+    @activity.defn(name="query_unanswered")
+    async def query_unanswered(self, inp: QueryStepInput) -> None:
+        """No reply by the deadline: adjudication drafts a reject for non-submission of the
+        documents the query asked for. The decision stage routes it; the CRC decides."""
+        query = await self._run(inp.claim_id, Stage.QUERY, self._query.get(inp.query_id))
+        documents = [i.text for i in query.items] if query else []
+        draft = await self._run(
+            inp.claim_id,
+            Stage.ADJUDICATION,
+            self._adjudication.draft_unanswered(inp.claim_id, documents),
+        )
+        await self._event(
+            StageInput(claim_id=inp.claim_id, stage=Stage.ADJUDICATION),
+            "non_submission_drafted",
+            {
+                "query_id": str(inp.query_id),
+                "decision": draft.decision,
+                "documents": documents,
+                "clause_refs": [r.clause_ref for r in draft.reasons if r.clause_ref],
+            },
+        )
 
     @activity.defn(name="query_reply")
     async def query_reply(self, inp: QueryStepInput) -> None:
@@ -748,6 +772,7 @@ class ClaimActivities:
             "reconcile_claims",
             "query_reminder",
             "query_overdue",
+            "query_unanswered",
             "query_reply",
             "settle",
             "begin_request",

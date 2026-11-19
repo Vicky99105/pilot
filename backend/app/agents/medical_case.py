@@ -44,7 +44,8 @@ class CaseFact(BaseModel):
 
 class DocumentOption(BaseModel):
     """A document a query may ask for: a mandatory document of the package's guideline that
-    the claim does not hold, or, with no guideline, a medical document type. label is the
+    the claim does not hold, or, with no guideline, a medical document type the product's
+    checklist requires for the request. label is the
     value the reply schema allows and the text the claimant reads; doc_type is the type it
     asks for."""
 

@@ -16,9 +16,11 @@ These guarantees hold for every MedicalCoding and MedicalFindings:
 - Every finding cites a page of the claim or a clause or ICD reference. Uncited items go back
   to the model once, then are dropped with the reason recorded.
 - Every query item names a document type the claim does not hold and no earlier query asked
-  for, answered or not. With a guideline for the package, it is one of the guideline's
-  mandatory documents; without one, one of MEDICAL_DOCUMENTS. Code writes its text from the
-  option's label. Free-text concerns are findings, never query items.
+  for, answered or not, and that a source requires for this claim. With a guideline for the
+  package, it is one of the guideline's mandatory documents; without one, one of
+  MEDICAL_DOCUMENTS that the product's document checklist marks required for the claim's
+  current request. With no such source, the reply allows no query item. Code writes its
+  text from the option's label. Free-text concerns are findings, never query items.
 - A mandatory document an earlier query asked for and the claim still does not hold is a
   "documents" finding for the approver, never a second query.
 - Document findings are code-only: the findings model call cannot write the "documents"
@@ -52,8 +54,9 @@ MODEL_FINDING_KINDS: tuple[ModelFindingKind, ...] = ("clinical", "coding")
 LookupTool = Literal["search_icd_index", "get_icd_tabular", "pcs_options", "pcs_validate"]
 PED_CLAUSE = "Excl01"
 
-# The documents medical review may ask the claimant for when the package has no guideline.
-# A query item also excludes any of these the claim already holds or a query asked for.
+# The document types medical review may ask the claimant for when the package has no
+# guideline, and then only those the product's checklist requires for the request. A query
+# item also excludes any of these the claim already holds or a query asked for.
 MEDICAL_DOCUMENTS = (
     DocType.DISCHARGE_SUMMARY,
     DocType.OT_NOTES,

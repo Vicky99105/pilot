@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
-from app.database.models import NonPayableItemRow
+from app.database.models import NonPayableItemRow, PackageMasterRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.bill_review.contract import (
@@ -501,6 +501,45 @@ async def test_unclear_lines_are_read_once_from_an_enum_of_their_own_candidates(
         schema.model_validate({"line_1": {"choice": "List I item 56: GLOVES", "confidence": 1}})
 
 
+NURSING_IN_ROOM = "List II item 38: Nursing, DMO/ RMO charges included in room rent"
+
+
+async def test_an_item_subsumed_into_room_charges_is_never_offered_for_the_room_line(
+    env: Env,
+) -> None:
+    """c09: the "Room" line was read as List II item 38 (nursing is part of room rent) and
+    deducted whole. A List II item is part of the room charge, so it can never be the room
+    line itself: code filters it out by the line's head before the model call. A nursing
+    line of the same text still gets the item."""
+    lines = [
+        bill_line(1, "Room Charges", "Room rent", "30000", qty="4"),
+        bill_line(2, "Nursing Charges", "Nursing charges in room rent", "3600", qty="4"),
+    ]
+    claim_id = await env.registered(ClaimSpec(lines=lines, claimed=D("33600.00")))
+    async with env.sessions.begin() as session:
+        session.add(
+            NonPayableItemRow(list_name="II", item_number=38,
+                              item="Nursing, DMO/ RMO charges included in room rent",
+                              condition=None, payable_in_product="not_payable",
+                              source="non_payable", source_version="W")
+        )  # fmt: skip
+    reading = {"choice": NURSING_IN_ROOM, "confidence": 0.95}
+    env.script(bill_non_payable=[{"line_1": reading}])
+
+    sheet = await env.service.review(claim_id)
+
+    [call] = env.gateway.calls
+    assert call.schema is not None
+    defs = call.schema.model_json_schema()["$defs"]
+    offered = [d["properties"]["choice"]["enum"] for d in defs.values() if "choice" in
+               d.get("properties", {})]  # fmt: skip
+    assert offered == [[NURSING_IN_ROOM, "payable"]]  # one line only: the nursing line
+    room = next(ln for ln in sheet.lines if ln.line_id == 1)
+    assert not any(d.rule_id == "R12" for d in room.deductions)
+    nursing = next(ln for ln in sheet.lines if ln.line_id == 2)
+    assert (nursing.admissible, nursing.rule_id) == (D("0.00"), "R12")
+
+
 async def test_an_unsure_reading_is_left_to_the_bill_processor(env: Env) -> None:
     lines = [*WORKED_BILL, bill_line(8, "Consumables", "Urine bag", "150")]
     claim_id = await env.registered(ClaimSpec(lines=lines, claimed=D("170150.00")))
@@ -534,6 +573,39 @@ async def test_pharmacy_lines_above_the_ceiling_plus_gst_are_findings_not_deduct
     assert [f.line_id for f in drugs] == [6]
     assert "23.52" in drugs[0].text
     assert not any(d.rule_id == "DRUG-PRICE" for ln in sheet.lines for d in ln.deductions)
+
+
+async def test_the_crosswalk_offers_the_package_for_the_verified_diagnosis(env: Env) -> None:
+    """c03: at Ganga (PM-JAY), "Laparoscopic appendectomy" never found HBP SG017B by name
+    (the HBP spells it "Lap- Appendicectomy"), and only a name-near SO023A laparoscopic
+    adhesiolysis was offered. Our crosswalk lists the packages that treat a diagnosis, so
+    the packages it gives for the verified K35.80 in the agreement's scheme are candidates
+    too, ahead of name matches."""
+    async with env.sessions.begin() as session:
+        session.add(
+            PackageMasterRow(scheme="PMJAY", version="HBP2022", package_code="SO023",
+                             procedure_code="SO023A", name="Laparoscopic adhesiolysis",
+                             search_text="laparoscopic adhesiolysis", rate=D("16900"),
+                             extra={}, source="pmjay", source_version="v")
+        )  # fmt: skip
+    lines = [  # c03's procedure lines name no procedure
+        bill_line(1, "Room Charges", "General Ward Bed", "6000", qty="3"),
+        bill_line(2, "OT Charges", "Operation Theatre Charges - Major (up to 2 hrs)", "18500"),
+        bill_line(3, "OT Charges", "Laparoscopy Equipment Charges", "6000"),
+        bill_line(4, "Professional Fees", "Surgeon Fee", "18000"),
+    ]
+    spec = ClaimSpec(lines=lines, claimed=D("48500.00"), hospital_id=HOSPITAL_ROHINI_IDS[2],
+                     hospital_name="Ganga Medical Centre", hospital_city="Lucknow")  # fmt: skip
+    american = (("Laparoscopic appendectomy", "0DTJ4ZZ",
+                 "Resection of Appendix, Percutaneous Endoscopic Approach"),)  # fmt: skip
+    claim_id = await env.registered(spec, american)
+    env.script(bill_package_choice=[{"procedure_1": "SG017B"}])
+
+    sheet = await env.service.review(claim_id)
+
+    assert sheet.package is not None
+    assert sheet.package.candidates[0].package_code == "SG017B"
+    assert [p.package_code for p in sheet.package.packages] == ["SG017B"]
 
 
 async def test_the_diagnosis_package_fit_is_checked_against_our_crosswalk(env: Env) -> None:

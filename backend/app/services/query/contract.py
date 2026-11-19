@@ -4,11 +4,13 @@ reply, reminders and the deadline.
 One query is open on a claim at a time. An item already answered in an earlier query is
 never asked again: items match on document type, or on their words when either has no type.
 A requested document type the claim already holds is never asked for. A query whose deadline
-passes stays open as "overdue" for an operator: it is never closed automatically.
+passes is marked "overdue"; the claim workflow then drafts a reject for non-submission of
+documents for the CRC to decide. The reply window and the reminder points are durations, so
+they may be shorter than a day.
 Callers import this module only.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, Protocol
 from uuid import UUID
 
@@ -35,9 +37,9 @@ class Query(BaseModel):
     letter_id: UUID | None
     raised_at: datetime
     deadline: datetime
-    reply_window_days: int
-    reminder_days: list[int]  # days after raising when a reminder is due
-    reminders: list[int]  # reminder days already sent
+    reply_window: timedelta  # the deadline is raised_at plus this
+    reminder_offsets: list[timedelta]  # after raising, in order, each before the deadline
+    reminders: list[int]  # the reminders already sent, by number (1 is the first offset)
     reply_submission_id: UUID | None
     answered_at: datetime | None
 
@@ -68,7 +70,10 @@ class QueryService(Protocol):
 
     async def attach_reply(self, query_id: UUID, submission_id: UUID) -> Query: ...
 
-    async def record_reminder(self, query_id: UUID, day: int) -> Query: ...
+    async def record_reminder(self, query_id: UUID, number: int) -> Query:
+        """Record that reminder `number` (1-based, in reminder_offsets order) was sent.
+        A repeat is a no-op."""
+        ...
 
     async def mark_overdue(self, query_id: UUID) -> Query: ...
 

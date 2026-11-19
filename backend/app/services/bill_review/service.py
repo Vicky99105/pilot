@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.database.models import ClaimRow, NonPayableItemRow
 from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import StageRecordRepository
-from app.services.bill_review._helpers import ZERO, map_head, money
+from app.services.bill_review._helpers import ZERO, fits_head, map_head, money
 from app.services.bill_review._prompts import (
     NON_PAYABLE_PURPOSE,
     PACKAGE_PURPOSE,
@@ -344,36 +344,42 @@ class DefaultBillReviewService:
 
     async def _judge_unclear_lines(self, review: "_Review", unmatched: list[_Line]) -> None:
         """Lines R11 matched no list item for that may still be one: one closed model call
-        for every distinct description, then R12 on each line."""
-        unclear: dict[str, list[NonPayableCandidate]] = {}
+        for every distinct (description, head), then R12 on each line. A line's candidates
+        are only the items its head can be: an item subsumed into a charge is never offered
+        for a line of that charge's head."""
+        unclear: dict[tuple[str, Head], list[NonPayableCandidate]] = {}
+        found_by_text: dict[str, list[NonPayableCandidate]] = {}
         for line in unmatched:
-            text = line.sheet.description
-            if text not in unclear:
-                unclear[text] = await self._kb.match_non_payable(text)
-        unclear = {text: found for text, found in unclear.items() if found}
+            text, head = line.sheet.description, line.sheet.head
+            if text not in found_by_text:
+                found_by_text[text] = await self._kb.match_non_payable(text)
+            if (text, head) not in unclear:
+                unclear[(text, head)] = [
+                    c for c in found_by_text[text] if fits_head(c.list_name, head)
+                ]
+        unclear = {key: found for key, found in unclear.items() if found}
         if not unclear:
             return
-        texts = list(unclear)
-        heads = {ln.sheet.description: ln.sheet.head.value for ln in review.lines}
+        keys = list(unclear)
         reply = await self._gateway.structured(
             ModelRole.REASONING,
-            readings_messages([(t, heads[t]) for t in texts], list(unclear.values())),
+            readings_messages([(t, h.value) for t, h in keys], list(unclear.values())),
             readings_schema(list(unclear.values())),
             claim_id=review.claim_id,
             purpose=NON_PAYABLE_PURPOSE,
         )
         review.model_used = True
         readings = reply.model_dump()
-        judgements: dict[str, NonPayableJudgement] = {}
-        for index, text in enumerate(texts, start=1):
+        judgements: dict[tuple[str, Head], NonPayableJudgement] = {}
+        for index, key in enumerate(keys, start=1):
             reading = readings[line_field(index)]
-            chosen = next((c for c in unclear[text] if item_label(c) == reading["choice"]), None)
-            judgements[text] = NonPayableJudgement(
+            chosen = next((c for c in unclear[key] if item_label(c) == reading["choice"]), None)
+            judgements[key] = NonPayableJudgement(
                 item=None if reading["choice"] == PAYABLE or chosen is None else _item(chosen),
                 confidence=float(reading["confidence"]),
             )
         for line in unmatched:
-            judgement = judgements.get(line.sheet.description)
+            judgement = judgements.get((line.sheet.description, line.sheet.head))
             if judgement is None:
                 continue
             result = review.apply("R12", line, Facts(line=line.facts(), judgement=judgement))
@@ -392,7 +398,9 @@ class DefaultBillReviewService:
         hospital_id: str | None,
     ) -> PackageMapping | None:
         """The packages the verified procedures map to, priced for the agreement. None when
-        no package can apply: no agreement, the hospital's own tariff, or no procedure."""
+        no package can apply: no agreement, the hospital's own tariff, or no procedure.
+        Candidates: the agreement scheme's packages our crosswalk lists for the verified
+        diagnoses, then packages named like the procedures."""
         if agreement is None or agreement.scheme == OWN_TARIFF or not coding.procedure_codes:
             return None
         procedures = [
@@ -401,7 +409,12 @@ class DefaultBillReviewService:
         names = [p.phrase for p in coding.procedure_codes]
         names += [p.code.display for p in coding.procedure_codes if p.code.display]
         names += [ln.sheet.description for ln in review.lines if ln.sheet.head in PROCEDURE_HEADS]
-        found = await self._kb.tariff_candidates([], list(dict.fromkeys(names)), hospital_id)
+        # The packages our crosswalk gives for the verified diagnoses come first (by code),
+        # then the packages whose names are near the procedure's.
+        treating = await self._kb.packages_for_diagnoses(agreement.scheme, diagnoses_codes(coding))
+        found = await self._kb.tariff_candidates(
+            [c.package_code for c in treating], list(dict.fromkeys(names)), hospital_id
+        )
         candidates = [_option(c, agreement) for c in found if c.scheme == agreement.scheme]
         billed_as_package = any(ln.sheet.head is Head.PACKAGE for ln in review.lines)
         if not candidates:

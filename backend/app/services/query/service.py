@@ -53,14 +53,14 @@ class DefaultQueryService:
         sessions: async_sessionmaker[AsyncSession],
         communication: CommunicationService,
         *,
-        reply_days: int,
-        reminder_days: list[int],
+        reply_window: timedelta,
+        reminders: list[timedelta],
         now: Callable[[], datetime] = utcnow,
     ) -> None:
         self._sessions = sessions
         self._communication = communication
-        self._reply_days = reply_days
-        self._reminder_days = sorted(d for d in reminder_days if 0 < d < reply_days)
+        self._reply_window = reply_window
+        self._reminders = sorted(r for r in reminders if timedelta(0) < r < reply_window)
         self._records = StageRecordRepository(sessions)
         self._now = now
 
@@ -102,7 +102,7 @@ class DefaultQueryService:
             claim_id=claim_id,
             items=[i.model_dump(mode="json") for i in new],
             status="open",
-            deadline=now + timedelta(days=self._reply_days),
+            deadline=now + self._reply_window,
             reminders=[],
             raised_at=now,
         )
@@ -132,11 +132,11 @@ class DefaultQueryService:
             query_id, status="answered", reply_submission_id=submission_id, answered_at=self._now()
         )
 
-    async def record_reminder(self, query_id: UUID, day: int) -> Query:
+    async def record_reminder(self, query_id: UUID, number: int) -> Query:
         current = await self._get_row(query_id)
-        if day in current.reminders:
+        if number in current.reminders:
             return self._to_query(current)
-        return await self._change(query_id, reminders=sorted([*current.reminders, day]))
+        return await self._change(query_id, reminders=sorted([*current.reminders, number]))
 
     async def mark_overdue(self, query_id: UUID) -> Query:
         current = await self._get_row(query_id)
@@ -201,8 +201,8 @@ class DefaultQueryService:
             letter_id=row.letter_id,
             raised_at=row.raised_at,
             deadline=row.deadline,
-            reply_window_days=self._reply_days,
-            reminder_days=self._reminder_days,
+            reply_window=self._reply_window,
+            reminder_offsets=self._reminders,
             reminders=list(row.reminders),
             reply_submission_id=row.reply_submission_id,
             answered_at=row.answered_at,

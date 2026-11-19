@@ -6,6 +6,8 @@ re-read the cited history pages for pre-existing disease, run the review graph, 
 R5 to R9 on the verified codes."""
 
 import re
+from collections.abc import Sequence
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import select
@@ -29,7 +31,8 @@ from app.agents.prompts import (
     reread_prompt,
     reread_schema,
 )
-from app.database.models import PolicyClauseRow
+from app.database.models import ClaimRow, PolicyClauseRow, SubmissionRow
+from app.database.repositories.document_checklists import checklist
 from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import StageRecord, StageRecordRepository
 from app.integrations.core.contract import MemberPolicy, PolicyService
@@ -53,7 +56,7 @@ from app.services.model_gateway.contract import ModelGateway, ModelRole
 from app.services.overrides.contract import OverrideEntry
 from app.services.registration.contract import RegistrationResult
 from app.services.rules.contract import Facts, RulesEngine
-from app.shared.types import DocType, PageRef, RuleResult, Stage
+from app.shared.types import DocType, PageRef, RequestType, RuleResult, Stage
 
 RERUN_RULES = ["R5", "R6", "R7", "R8", "R9"]
 # The names the claimant reads for the medical document types.
@@ -64,6 +67,13 @@ DOCUMENT_NAMES = {
     DocType.PRESCRIPTION: "Prescription",
 }
 PMJAY = "PMJAY"
+# The requests that have a checklist of their own; a query reply answers the claim's request.
+CHECKLIST_REQUESTS = (
+    RequestType.REIMBURSEMENT,
+    RequestType.PREAUTH,
+    RequestType.ENHANCEMENT,
+    RequestType.DISCHARGE,
+)
 # The guideline sections the review reads: what the treatment needs and what a claim must
 # hold. Pre-auth and doctor-qualification sections are for other stages.
 REVIEW_SECTIONS = ("clinical_pointers", "claim_checks", "claim_documents", "tms_rules", "alos")
@@ -164,7 +174,8 @@ class DefaultMedicalReviewService:
         missing = _mandatory_missing(loaded or {}, held)
         if guideline is not None:
             guideline.mandatory_missing = [label for label, _ in missing]
-        case.documents = document_options(loaded, held=held, requested=requested)
+        required = [] if loaded else await self._checklist_required(claim_id)
+        case.documents = document_options(loaded, held=held, requested=requested, required=required)
 
         reread = await self._reread_history(claim_id, case)
         looked_up = {code for call in coding.lookups for code in call.returned_codes}
@@ -438,6 +449,32 @@ class DefaultMedicalReviewService:
             for document in record.payload.get("documents", [])
         }
 
+    async def _checklist_required(self, claim_id: UUID) -> list[DocType]:
+        """The documents the product's checklist requires for the claim's current request:
+        the latest submission that is a request of its own (not a query reply), at the
+        amount its form claims."""
+        requests = [t.value for t in CHECKLIST_REQUESTS]
+        async with self._sessions() as session:
+            submission = await session.scalar(
+                select(SubmissionRow)
+                .where(
+                    SubmissionRow.claim_id == claim_id,
+                    SubmissionRow.request_type.in_(requests),
+                )
+                .order_by(SubmissionRow.created_at.desc())
+                .limit(1)
+            )
+            if submission is None:
+                claim = await session.get(ClaimRow, claim_id)
+                if claim is None:
+                    return []
+                request, form = RequestType(claim.request_type), {}
+            else:
+                request, form = RequestType(submission.request_type), submission.form
+            amount = Decimal(str(form.get("claimed_amount") or "0"))
+            required, _ = await checklist(session, request, amount)
+            return required
+
     async def _clause_refs(self, product_uin: str) -> list[str]:
         async with self._sessions() as session:
             refs = await session.scalars(
@@ -478,11 +515,17 @@ def _mandatory_missing(
 
 
 def document_options(
-    guideline: dict[str, list[str]] | None, *, held: set[DocType], requested: set[DocType]
+    guideline: dict[str, list[str]] | None,
+    *,
+    held: set[DocType],
+    requested: set[DocType],
+    required: Sequence[DocType] = (),
 ) -> list[DocumentOption]:
     """The documents a query may ask for, never a type the claim holds or an earlier query
-    asked for. With a guideline (its sections by name): exactly its mandatory documents.
-    Without one: the medical document types."""
+    asked for. Each option has a source that requires it for this claim. With a guideline
+    (its sections by name): exactly its mandatory documents. Without one: the medical
+    document types the product's checklist requires for this request (`required`). A
+    document no source requires is never offered."""
     if guideline is not None:
         return [
             DocumentOption(label=label, doc_type=t, from_guideline=True)
@@ -491,8 +534,8 @@ def document_options(
         ]
     return [
         DocumentOption(label=DOCUMENT_NAMES[d], doc_type=d)
-        for d in MEDICAL_DOCUMENTS
-        if d not in held | requested
+        for d in dict.fromkeys(required)
+        if d in MEDICAL_DOCUMENTS and d not in held | requested
     ]
 
 

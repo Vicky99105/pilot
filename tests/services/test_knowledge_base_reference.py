@@ -225,6 +225,18 @@ async def test_every_seeded_hospital_has_an_agreement(kb: KnowledgeBase) -> None
     assert await kb.hospital_agreement("0000000000000") is None
 
 
+async def test_packages_for_diagnoses_gives_the_schemes_packages_that_treat_them(
+    kb: KnowledgeBase,
+) -> None:
+    pmjay = await kb.packages_for_diagnoses("pmjay", ["K35.80"])
+    cghs = await kb.packages_for_diagnoses("CGHS", ["E11.9", "K35.32"])
+
+    assert [p.package_code for p in pmjay] == ["SG017A", "SG017B"]
+    assert [p.package_code for p in cghs] == ["AG045", "AG095"]
+    assert await kb.packages_for_diagnoses("PMJAY", ["E11.9"]) == []
+    assert await kb.packages_for_diagnoses("PMJAY", []) == []
+
+
 async def test_package_crosswalk_gives_the_diagnoses_and_the_guideline_code(
     kb: KnowledgeBase,
 ) -> None:
