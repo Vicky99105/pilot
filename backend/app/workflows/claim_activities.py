@@ -260,6 +260,18 @@ class ClaimActivities:
             checkpoint_payload=result.model_dump(mode="json"),
         )
 
+    @activity.defn(name="medical_coding")
+    async def medical_coding(self, inp: StageInput) -> StageResult:
+        coding = await self._run(inp.claim_id, inp.stage, self._medical_review.code(inp.claim_id))
+        return await self._stage_done(
+            inp,
+            {
+                "verified_codes": [v.code.code for v in coding.verified_codes],
+                "procedure_codes": [p.code.code for p in coding.procedure_codes],
+                "dropped": len(coding.dropped),
+            },
+        )
+
     @activity.defn(name="bill_review")
     async def bill_review(self, inp: StageInput) -> StageResult:
         sheet = await self._run(inp.claim_id, inp.stage, self._bill_review.review(inp.claim_id))
@@ -270,6 +282,10 @@ class ClaimActivities:
                 "admissible": str(sheet.admissible_total),
                 "payable": str(sheet.payable),
                 "flagged_lines": sheet.flagged_lines,
+                "packages": [p.package_code for p in sheet.package.packages]
+                if sheet.package
+                else [],
+                "findings": len(sheet.findings),
             },
             needs_checkpoint=True,  # "confirm deductions" is always on
             checkpoint_payload=sheet.model_dump(mode="json"),

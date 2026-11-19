@@ -71,6 +71,7 @@ class Stage(StrEnum):
     CLASSIFICATION = "classification"
     DIGITISATION = "digitisation"
     REGISTRATION = "registration"
+    MEDICAL_CODING = "medical_coding"  # medical review step 1, before bill review
     BILL_REVIEW = "bill_review"
     MEDICAL_REVIEW = "medical_review"
     RISK = "risk"

@@ -466,15 +466,45 @@ def score(claim_id: str, truth: dict[str, Any], driver: Driver, api: Api) -> dic
                 "clause_ref": line["clause_ref"],
             }
         )
+    # Every rule's deductions, summed over the lines it touched (a line can carry several).
     fired: defaultdict[tuple[str, str], Decimal] = defaultdict(Decimal)
     for line in sheet["lines"]:
-        if line["rule_id"]:
-            fired[(line["rule_id"], line["clause_ref"])] += Decimal(line["deducted"])
+        for taken in line.get("deductions", []):
+            fired[(taken["rule_id"], taken["clause_ref"])] += Decimal(taken["amount"])
     fired[("R21", "CO-PAY")] += Decimal(sheet["co_pay"])
     want_fired: defaultdict[tuple[str, str], Decimal] = defaultdict(Decimal)
-    for line in want_sheet["deductions"]:
-        want_fired[(line["rule_id"], line["clause_ref"])] += Decimal(line["deducted"])
+    for line in want_sheet["lines"]:
+        for taken in line.get("deductions", []):
+            want_fired[(taken["rule_id"], taken["clause_ref"])] += Decimal(taken["amount"])
     want_fired[("R21", "CO-PAY")] += Decimal(want_sheet["co_pay"])
+    package = sheet.get("package") or {}
+    report["package"] = {
+        "agreement": sheet.get("agreement"),
+        "candidates": [
+            (c["package_code"], c["name"], c["rate"], c["rate_basis"])
+            for c in package.get("candidates", [])
+        ],
+        "choices": [(c["procedure"], c["chosen"]) for c in package.get("choices", [])],
+        "packages": [
+            (p["package_code"], p["name"], p["rate"]) for p in package.get("packages", [])
+        ],
+        "expected": truth["expected"]["package"],
+        "billed_as_package": package.get("billed_as_package"),
+    }
+    report["bill_findings"] = [
+        (f["kind"], f.get("line_id"), f["text"]) for f in sheet.get("findings", [])
+    ]
+    report["bill_findings_expected"] = [
+        ("drug_price", f["line_id"], f["description"]) for f in truth["drug_price_findings"]
+    ]
+    report["r12"] = [
+        (r["passed"], r["amount_effect"], r["reason"], r["judged_by"])
+        for r in sheet["rule_results"]
+        if r["rule_id"] == "R12"
+    ]
+    report["rules_failed"] = sorted(
+        {r["rule_id"] for r in sheet["rule_results"] if not r["passed"]}
+    )
     report["deductions"] = {
         "rules_fired": {f"{r} {c}": str(a) for (r, c), a in fired.items()},
         "rules_expected": {f"{r} {c}": str(a) for (r, c), a in want_fired.items()},
@@ -539,6 +569,8 @@ def score(claim_id: str, truth: dict[str, Any], driver: Driver, api: Api) -> dic
         "findings": [(f["kind"], f["severity"], f["text"]) for f in medical.get("findings", [])],
         "query_items": medical.get("query_items", []),
         "dropped": medical.get("dropped", []),
+        "guideline": medical.get("guideline"),
+        "rule_results": [(r["rule_id"], r["passed"]) for r in medical.get("rule_results", [])],
         "lookups": len(calls),
         "adverse": medical.get("adverse"),
     }
@@ -692,6 +724,14 @@ def markdown(report: dict[str, Any], outcome: str, wall: float) -> str:
         f"(expected {b['grand_total_expected']})"
     )
     d = r["deductions"]
+    pk = r["package"]
+    out.append(
+        f"- Package: {pk['packages']} (expected {pk['expected']}); choices {pk['choices']}; "
+        f"candidates {pk['candidates']}"
+    )
+    out.append(f"- Bill findings: {r['bill_findings']}")
+    out.append(f"- Bill findings expected: {r['bill_findings_expected']}")
+    out.append(f"- R12 readings: {r['r12']}; rules failed {r['rules_failed']}")
     out.append(f"- Rules fired: {d['rules_fired']}")
     out.append(f"- Rules expected: {d['rules_expected']}")
     out.append(
@@ -714,6 +754,10 @@ def markdown(report: dict[str, Any], outcome: str, wall: float) -> str:
             f"offered by pcs_options {p['every_step_offered']}, validated {p['validated']}, "
             f"0DTJ family {p['family_ok']}; steps {p['steps']}"
         )
+    out.append(
+        f"- Guideline: {r['medical']['guideline']}; eligibility re-run "
+        f"{r['medical']['rule_results']}"
+    )
     out.append(
         f"- Medical findings: {r['medical']['findings']}; query items "
         f"{r['medical']['query_items']}; dropped {r['medical']['dropped']}"

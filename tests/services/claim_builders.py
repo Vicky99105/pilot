@@ -8,10 +8,14 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import ClaimRow, SubmissionRow
+from app.config import Settings
+from app.database.models import ClaimRow, HospitalAgreementRow, SubmissionRow
 from app.database.repositories.stage_records import StageRecordRepository
+from app.services.bill_review.contract import DeductionSheet, PackageMapping
+from app.services.bill_review.service import DefaultBillReviewService
 from app.services.digitisation.contract import (
     Admission,
     Bill,
@@ -23,8 +27,19 @@ from app.services.digitisation.contract import (
     HospitalDetails,
     Identity,
 )
+from app.services.knowledge_base.service import DefaultKnowledgeBase
+from app.services.medical_review.contract import (
+    Citation,
+    LookupCall,
+    MedicalCoding,
+    VerifiedCode,
+    VerifiedProcedure,
+)
+from app.services.rules.contract import MappedPackage
+from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import HOSPITAL_ROHINI_IDS
 from app.shared.types import Code, DocType, Field, PageRef, RequestType, Stage
+from tests.fakes.model_gateway import FakeModelGateway
 
 POLICY = "MOCK/AS/2026/000101"
 MEMBER = "MOCK-M-000101-01"
@@ -184,3 +199,124 @@ async def add_digitised_claim(
         created_by="model",
     )
     return claim_id
+
+
+# --- Medical coding (step 1 of medical review), as bill review and the review read it -----
+
+LAP_APPENDICECTOMY = ("Laparoscopic appendicectomy", "0DTJ4ZZ",
+                      "Resection of Appendix, Percutaneous Endoscopic Approach")  # fmt: skip
+K35_80 = ("K35.80", "Unspecified acute appendicitis")
+
+
+async def add_coding(
+    sessions: async_sessionmaker[AsyncSession],
+    claim_id: UUID,
+    *,
+    procedures: tuple[tuple[str, str, str], ...] = (LAP_APPENDICECTOMY,),
+    diagnoses: tuple[tuple[str, str], ...] = (K35_80,),
+) -> MedicalCoding:
+    """A MedicalCoding record for the claim's latest record versions, with one lookup per
+    code so every reference in it holds."""
+    records = StageRecordRepository(sessions)
+    digitised = await records.latest(claim_id, Stage.DIGITISATION)
+    registered = await records.latest(claim_id, Stage.REGISTRATION)
+    assert digitised is not None and registered is not None
+    lookups, codes, built = [], [], []
+    for code, display in diagnoses:
+        call = LookupCall(call_id=len(lookups) + 1, tool="search_icd_index", argument=display,
+                          returned_codes=[code])  # fmt: skip
+        lookups.append(call)
+        codes.append(
+            VerifiedCode(code=Code(system="ICD-10-CM", version="FY2027", code=code,
+                                   display=display),
+                         phrase=DIAGNOSIS, lookup_call_id=call.call_id,
+                         citations=[Citation(page=page(1))], rationale="test")
+        )  # fmt: skip
+    for phrase, code, display in procedures:
+        call = LookupCall(call_id=len(lookups) + 1, tool="pcs_validate", argument=code,
+                          returned_codes=[code])  # fmt: skip
+        lookups.append(call)
+        built.append(
+            VerifiedProcedure(code=Code(system="ICD-10-PCS", version="FY2027", code=code,
+                                        display=display),
+                              phrase=phrase, steps=[], validate_call_id=call.call_id,
+                              citations=[Citation(page=page(1))])
+        )  # fmt: skip
+    coding = MedicalCoding(
+        claim_id=claim_id,
+        digitisation_version=digitised.version,
+        registration_version=registered.version,
+        verified_codes=codes,
+        procedure_codes=built,
+        lookups=lookups,
+        dropped=[],
+        revisions=0,
+    )
+    await records.append(
+        claim_id, Stage.MEDICAL_CODING, coding.model_dump(mode="json"), created_by="test"
+    )
+    return coding
+
+
+AG095 = ("CGHS", "AG095", "Laparoscopic Appendectomy", "33000")
+
+
+async def add_sheet(
+    sessions: async_sessionmaker[AsyncSession],
+    claim_id: UUID,
+    *,
+    packages: tuple[tuple[str, str, str, str], ...] = (AG095,),
+) -> DeductionSheet:
+    """A deduction sheet whose package mapping names the packages (scheme, code, name,
+    rate), as the full medical review reads it."""
+    records = StageRecordRepository(sessions)
+    digitised = await records.latest(claim_id, Stage.DIGITISATION)
+    registered = await records.latest(claim_id, Stage.REGISTRATION)
+    coded = await records.latest(claim_id, Stage.MEDICAL_CODING)
+    assert digitised is not None and registered is not None and coded is not None
+    zero = Decimal("0.00")
+    sheet = DeductionSheet(
+        claim_id=claim_id,
+        digitisation_version=digitised.version,
+        registration_version=registered.version,
+        coding_version=coded.version,
+        product_uin="PLACEHOLDER-AROGYA-SANJEEVANI-UIN",
+        package=PackageMapping(
+            candidates=[],
+            choices=[],
+            packages=[
+                MappedPackage(scheme=s, package_code=c, name=n, rate=Decimal(r))
+                for s, c, n, r in packages
+            ],
+            billed_as_package=False,
+        )
+        if packages
+        else None,
+        lines=[],
+        rule_results=[],
+        claimed_total=zero,
+        admissible_total=zero,
+        co_pay=zero,
+        payable=zero,
+        flagged_lines=[],
+    )
+    await records.append(claim_id, Stage.BILL_REVIEW, sheet.model_dump(mode="json"),
+                         created_by="test")  # fmt: skip
+    return sheet
+
+
+async def without_agreements(sessions: async_sessionmaker[AsyncSession]) -> None:
+    """No hospital has an agreement on file: no package and no non-package discount. Tests of
+    later stages use this so the worked example keeps its Rs 1,33,000."""
+    async with sessions.begin() as session:
+        await session.execute(delete(HospitalAgreementRow))
+
+
+async def reviewed_bill(sessions: async_sessionmaker[AsyncSession], claim_id: UUID) -> None:
+    """Medical coding with no procedure, then a real bill review with no model calls."""
+    await add_coding(sessions, claim_id, procedures=())
+    rules = DefaultRulesEngine(Settings().config_dir / "products")
+    service = DefaultBillReviewService(
+        sessions, rules, FakeModelGateway({}), DefaultKnowledgeBase(sessions)
+    )
+    await service.review(claim_id)

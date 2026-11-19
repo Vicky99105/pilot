@@ -28,11 +28,7 @@ REWRITE = {"items": [{"phrase": DIAGNOSIS, "main_term": "appendicitis", "modifie
 
 
 def k35_80() -> dict[str, Any]:
-    return {
-        "codes": [{"code": "K35.80", "phrase": DIAGNOSIS, "citations": [cite(1)]}],
-        "findings": [],
-        "query_items": [],
-    }
+    return {"codes": [{"code": "K35.80", "phrase": DIAGNOSIS, "citations": [cite(1)]}]}
 
 
 def step(value: str) -> dict[str, str]:
@@ -75,7 +71,7 @@ async def test_the_procedure_is_coded_one_valid_character_at_a_time(
     claim_id = await env.claim()
     model = gateway(*LAPAROSCOPIC_APPENDICECTOMY)
 
-    findings = await env.service(model).review(claim_id)
+    findings = await env.service(model).code(claim_id)
 
     [procedure] = findings.procedure_codes
     assert procedure.code.code == "0DTJ4ZZ"
@@ -114,7 +110,7 @@ async def test_each_step_schema_is_exactly_the_valid_options_for_the_prefix(
     model = gateway(*LAPAROSCOPIC_APPENDICECTOMY)
     kb = DefaultKnowledgeBase(sessions)
 
-    await env.service(model).review(claim_id)
+    await env.service(model).code(claim_id)
 
     steps = [c for c in model.calls if c.purpose == PCS]
     for call, prefix in zip(steps, ["", "0D", "0DT", "0DTJ", "0DTJ4Z"], strict=True):
@@ -141,14 +137,14 @@ async def test_an_invalid_choice_cannot_be_returned(env: Env) -> None:
     )
 
     with pytest.raises(ValidationError):
-        await env.service(model).review(claim_id)
+        await env.service(model).code(claim_id)
 
 
 async def test_no_procedure_performed_leaves_no_procedure_code(env: Env) -> None:
     claim_id = await env.claim()
     model = gateway(step("none: no procedure was performed"))
 
-    findings = await env.service(model).review(claim_id)
+    findings = await env.service(model).code(claim_id)
 
     assert findings.procedure_codes == []
     [dropped] = [d for d in findings.dropped if d.item == "procedure"]
@@ -159,7 +155,7 @@ async def test_diagnosis_codes_are_billable_codes_the_lookups_returned(env: Env)
     claim_id = await env.claim()
     model = gateway(*LAPAROSCOPIC_APPENDICECTOMY)
 
-    findings = await env.service(model).review(claim_id)
+    findings = await env.service(model).code(claim_id)
 
     choose = next(c for c in model.calls if c.purpose == "medical_choose_codes")
     # The index gives K35.80 and the subcategory K35.89-; the subcategory is not billable, so
@@ -198,7 +194,7 @@ async def test_index_queries_are_built_from_the_main_term_and_its_modifiers(env:
         }
     )
 
-    findings = await env.service(model).review(claim_id)
+    findings = await env.service(model).code(claim_id)
 
     searches = [c.argument for c in findings.lookups if c.tool == "search_icd_index"]
     # The whole phrase first, then the main term with each modifier on its own. Every query
@@ -226,7 +222,7 @@ async def test_the_main_term_alone_is_searched_when_nothing_else_matches(env: En
         }
     )
 
-    findings = await env.service(model).review(claim_id)
+    findings = await env.service(model).code(claim_id)
 
     searches = [c.argument for c in findings.lookups if c.tool == "search_icd_index"]
     assert searches == ["appendicitis x", "appendicitis"]

@@ -699,3 +699,41 @@ class HospitalRow(Base):
     registered_on: Mapped[date | None] = mapped_column(Date)
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))
+
+
+class HospitalAgreementRow(Base):
+    """What a network hospital agreed with the insurer: the scheme its packages are priced
+    from (CGHS at an accreditation and ward, PM-JAY HBP, MEDISEP, or its own tariff) and the
+    discount on non-package charges. One row per agreement period."""
+
+    __tablename__ = "hospital_agreements"
+    __table_args__ = (UniqueConstraint("hospital_id", "valid_from"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    hospital_id: Mapped[str] = mapped_column(String(13), ForeignKey("hospitals.rohini_id"))
+    scheme: Mapped[str] = mapped_column(String(20))  # CGHS, PMJAY, MEDISEP or OWN
+    accreditation: Mapped[str | None] = mapped_column(String(30))  # CGHS: nabh, non_nabh, ...
+    package_ward: Mapped[str | None] = mapped_column(String(20))  # the ward packages are at
+    non_package_discount_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2))
+    valid_from: Mapped[date] = mapped_column(Date)
+    valid_to: Mapped[date | None] = mapped_column(Date)
+    note: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))
+
+
+class PackageCrosswalkRow(Base):
+    """Our own crosswalk from a package to the diagnoses it treats (ICD-10-CM ranges) and the
+    PM-JAY HBP code whose guideline and length of stay apply to it."""
+
+    __tablename__ = "package_crosswalk"
+    __table_args__ = (UniqueConstraint("scheme", "package_code", "source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scheme: Mapped[str] = mapped_column(String(20))
+    package_code: Mapped[str] = mapped_column(String(20))
+    icd10cm: Mapped[list[str]] = mapped_column(JsonType, default=list)
+    guideline_code: Mapped[str | None] = mapped_column(String(20))
+    note: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(60))
+    source_version: Mapped[str] = mapped_column(String(40))

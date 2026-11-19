@@ -7,6 +7,7 @@ Python, so ranking is the same on Postgres and on SQLite.
 """
 
 import re
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
@@ -18,10 +19,12 @@ from app.database.models import (
     DrugPriceRow,
     ExclusionRow,
     GuidelineSectionRow,
+    HospitalAgreementRow,
     HospitalRow,
     LosNormRow,
     NlemMedicineRow,
     NonPayableItemRow,
+    PackageCrosswalkRow,
     PackageItemRow,
     PackageMasterRow,
     RateFactorRow,
@@ -33,8 +36,10 @@ from app.services.knowledge_base.contract import (
     DrugPrice,
     Exclusion,
     GuidelineSection,
+    HospitalAgreement,
     LosNorm,
     NonPayableCandidate,
+    PackageCrosswalk,
     TariffCandidate,
     TariffRate,
 )
@@ -450,5 +455,56 @@ async def exclusion(session: AsyncSession, code: str) -> Exclusion | None:
         title=row.title,
         summary=row.summary,
         page=row.page,
+        source=row.source,
+    )
+
+
+# --- Hospital agreements and the package crosswalk ----------------------------------------
+
+
+async def hospital_agreement(
+    session: AsyncSession, hospital_id: str, as_of: date | None
+) -> HospitalAgreement | None:
+    query = select(HospitalAgreementRow).where(HospitalAgreementRow.hospital_id == hospital_id)
+    if as_of is not None:
+        query = query.where(
+            HospitalAgreementRow.valid_from <= as_of,
+            or_(HospitalAgreementRow.valid_to.is_(None), HospitalAgreementRow.valid_to >= as_of),
+        )
+    row = await session.scalar(query.order_by(HospitalAgreementRow.valid_from.desc()).limit(1))
+    if row is None:
+        return None
+    return HospitalAgreement(
+        hospital_id=row.hospital_id,
+        scheme=row.scheme,
+        accreditation=row.accreditation,
+        package_ward=row.package_ward,
+        non_package_discount_percent=Decimal(row.non_package_discount_percent).quantize(CENTS),
+        valid_from=row.valid_from,
+        note=row.note,
+        source=row.source,
+    )
+
+
+async def package_crosswalk(
+    session: AsyncSession, scheme: str, package_code: str
+) -> PackageCrosswalk | None:
+    row = await session.scalar(
+        select(PackageCrosswalkRow)
+        .where(
+            PackageCrosswalkRow.scheme == scheme.strip().upper(),
+            PackageCrosswalkRow.package_code == package_code.strip().upper(),
+        )
+        .order_by(PackageCrosswalkRow.id.desc())
+        .limit(1)
+    )
+    if row is None:
+        return None
+    return PackageCrosswalk(
+        scheme=row.scheme,
+        package_code=row.package_code,
+        icd10cm=list(row.icd10cm or []),
+        guideline_code=row.guideline_code,
+        note=row.note,
         source=row.source,
     )

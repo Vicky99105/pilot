@@ -399,12 +399,6 @@ def test_r13_no_proportionate_deduction_without_differential_billing(
     ("line", "effect", "clause"),
     [
         (
-            LineFacts(line_id=1, head=Head.ICU, description="ICU", qty=D(2), rate=D(12000),
-                      claimed=D("24000")),
-            D("-4000.00"),
-            "ICU-CAP",
-        ),
-        (
             LineFacts(line_id=1, head=Head.ROOM, description="General ward", qty=D(3),
                       rate=D(4000), claimed=D("12000")),
             D("0"),
@@ -418,7 +412,7 @@ def test_r13_no_proportionate_deduction_without_differential_billing(
             "ROOM-CAP",
         ),
     ],
-    ids=["icu_cap", "room_under_cap", "two_percent_of_small_si"],
+    ids=["room_under_cap", "two_percent_of_small_si"],  # ICU lines: R14
 )  # fmt: skip
 def test_r13_daily_caps(
     engine: RulesEngine,

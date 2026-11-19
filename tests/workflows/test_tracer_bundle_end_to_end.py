@@ -3,8 +3,8 @@
 The merged PDF goes through every real stage service, with a gateway scripted from
 ground_truth.json: a perfect reader. So this checks the bundle and the workflow together:
 the missing payment receipt in a merged upload raises a query, the reply answers it, and
-the payable, the per-line deductions and the payment equal the ground truth that the
-generator computed with the rules engine.
+the package, the payable, the per-line deductions and the payment equal the ground truth
+that the generator computed with the rules engine.
 """
 
 from collections.abc import AsyncIterator
@@ -21,11 +21,15 @@ from temporalio.testing import WorkflowEnvironment
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.database.seed_icd_fixture import seed_icd_fixture
+from app.knowledge.loaders.icd10pcs import load_icd10pcs
 from app.services.intake.contract import ClaimForm, SubmissionInput, UploadedFile
 from app.shared.seed_ids import DOCTOR_USER_ID, FINANCE_USER_ID, MEMBER_USER_ID, OPS_USER_ID
 from app.shared.types import DocType, RequestType, Stage
 from app.workflows.claim_workflow import ClaimWorkflow
 from app.workflows.worker import build_worker
+from tests.knowledge import sources
+from tests.services.reference_rows import add_reference_rows
+from tests.services.test_medical_review_coding import LAPAROSCOPIC_APPENDICECTOMY
 from tests.services.test_registration import asha_policy
 from tests.workflows.test_claim_end_to_end import TASK_QUEUE, Gateway, Harness
 from tools.mockgen import tracer_claim as gen
@@ -130,8 +134,6 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
                 "rationale": "Acute appendicitis without perforation",
             }
         ],
-        "findings": [],
-        "query_items": [],
     }
     query = {
         "decision": "query",
@@ -150,16 +152,22 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
             }
             for ln in truth["sheet"]["deductions"]
         ],
-        "summary": "Room above its cap, proportionate deduction, one non-payable item.",
+        "summary": "Paid at the agreed package rate; one non-payable item.",
     }
+    package = truth["expected"]["package"]
     return {
         "classify_page": [*labels, {"doc_type": "payment_receipt", "confidence": 0.97}],
         "extract_claim_form_part_a": [part_a],
         "extract_discharge_summary": [summary],
         "extract_final_bill": [final_bill],
         "extract_cancelled_cheque": [cheque],
+        # Coding, bill review and the full review run again after the reply.
         "medical_rewrite_terms": [rewrite, rewrite],
+        "medical_pcs_step": [*LAPAROSCOPIC_APPENDICECTOMY] * 2,
         "medical_choose_codes": [choose, choose],
+        "bill_package_choice": [{"procedure_1": package}] * 2,
+        "medical_ped_reread": [{"statements": []}] * 2,
+        "medical_findings": [{"findings": [], "query_items": []}] * 2,
         "adjudication_decide": [query, partial],
     }
 
@@ -171,6 +179,8 @@ async def run(
     truth = gen.generate(tmp_path, ADMITTED)
     await seed_claims_db(sessions)
     await seed_icd_fixture(sessions)
+    await load_icd10pcs(sessions, sources.write_sources(tmp_path / "icd-2027"))
+    await add_reference_rows(sessions)
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
@@ -219,6 +229,7 @@ async def test_the_generated_bundle_runs_from_a_merged_upload_to_closed(
             )
         ],
     )
+    await h.complete("confirm_deductions", OPS_USER_ID, {"action": "confirm"})  # after the reply
     await h.complete("approve", DOCTOR_USER_ID, {"action": "approve"})
     await h.complete("crc", DOCTOR_USER_ID, {"action": "uphold"})
     await h.complete("release_payment", FINANCE_USER_ID, {"action": "release"})
@@ -228,7 +239,13 @@ async def test_the_generated_bundle_runs_from_a_merged_upload_to_closed(
     sheet = await records.latest(claim_id, Stage.BILL_REVIEW)
     assert sheet is not None
     expected = truth["sheet"]
+    assert [p["package_code"] for p in sheet.payload["package"]["packages"]] == [
+        truth["expected"]["package"]
+    ]
     assert sheet.payload["payable"] == expected["payable"]
+    assert [f["line_id"] for f in sheet.payload["findings"] if f["kind"] == "drug_price"] == [
+        f["line_id"] for f in truth["drug_price_findings"]
+    ]
     assert [
         (ln["line_id"], ln["head"], ln["rule_id"], ln["clause_ref"], ln["deducted"])
         for ln in sheet.payload["lines"]
@@ -240,6 +257,11 @@ async def test_the_generated_bundle_runs_from_a_merged_upload_to_closed(
     assert medical is not None
     assert [c["code"]["code"] for c in medical.payload["verified_codes"]] == [CODE]
     assert medical.payload["adverse"] is False  # the duration phrase is after inception
+    guideline = medical.payload["guideline"]
+    assert (guideline["guideline_code"], guideline["los_norm_days"]) == (
+        truth["expected"]["guideline_code"],
+        truth["expected"]["los_norm_days"],
+    )
 
     letters = [r.payload["kind"] for r in await records.history(claim_id, Stage.COMMUNICATION)]
     assert letters == truth["expected"]["letters"]

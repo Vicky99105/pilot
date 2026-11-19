@@ -40,8 +40,18 @@ from tests.database.factories import add_claim
 from tests.fakes.adjudication import FakeAdjudicationTools
 from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.model_gateway import FakeModelGateway
-from tests.services.claim_builders import ClaimSpec, add_digitised_claim
+from tests.services.claim_builders import (
+    LAP_APPENDICECTOMY,
+    ClaimSpec,
+    add_coding,
+    add_digitised_claim,
+    reviewed_bill,
+    without_agreements,
+)
+from tests.services.reference_rows import add_reference_rows
 from tests.services.test_registration import asha_policy
+
+LAP = (LAP_APPENDICECTOMY,)
 
 D = Decimal
 PAYABLE = D("133000.00")  # the worked example: admissible Rs 1,40,000 less 5% co-pay
@@ -111,7 +121,8 @@ class Env:
         await DefaultRegistrationService(
             self.sessions, self.policies, FakeMoneyService(), rules
         ).register(claim_id)
-        await DefaultBillReviewService(self.sessions, rules).review(claim_id)
+        await without_agreements(self.sessions)
+        await reviewed_bill(self.sessions, claim_id)
         await add_medical(self.sessions, claim_id, query_items)
         return claim_id
 
@@ -411,3 +422,35 @@ async def test_overruled_findings_are_ignored(env: Env) -> None:
     assert spec is not None
     reason = spec.model_json_schema()["$defs"]["ReasonClosed"]["properties"]
     assert "Excl03" not in reason["clause_ref"]["anyOf"][0]["enum"]
+
+
+async def test_one_reason_naming_a_spread_rule_explains_every_line_it_spread_over(
+    env: Env,
+) -> None:
+    """R20 spreads one package cap over many lines; one reason naming R20 explains them all.
+    A line-specific deduction still needs its own reason."""
+    claim_id = await add_digitised_claim(env.sessions, ClaimSpec())  # the worked bill
+    rules = DefaultRulesEngine(Settings().config_dir / "products")
+    await DefaultRegistrationService(
+        env.sessions, env.policies, FakeMoneyService(), rules
+    ).register(claim_id)
+    await add_reference_rows(env.sessions)
+    await add_coding(env.sessions, claim_id, procedures=LAP)
+    bill = DefaultBillReviewService(
+        env.sessions,
+        rules,
+        FakeModelGateway({"bill_package_choice": [{"procedure_1": "AG095"}]}),
+        DefaultKnowledgeBase(env.sessions),
+    )
+    sheet = await bill.review(claim_id)
+    await add_medical(env.sessions, claim_id)
+    assert {ln.rule_id for ln in sheet.lines if ln.deducted > 0} == {"R20"}
+    package = {"text": "Paid at the agreed AG095 package rate", "clause_ref": "AGREED-TARIFF",
+               "rule_id": "R20", "line_id": None}  # fmt: skip
+    reply = {"decision": "partial", "reasons": [package], "summary": "Package rate."}
+    gateway = FakeModelGateway({"adjudication_decide": [reply]})
+
+    draft = await env.service(gateway).draft(claim_id)
+
+    assert (draft.self_check_errors, draft.guardrail_passed) == ([], True)
+    assert draft.amount == sheet.payable

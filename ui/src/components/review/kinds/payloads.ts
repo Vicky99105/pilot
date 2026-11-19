@@ -101,6 +101,23 @@ export type DeductionLine = {
   reason: string | null
   judged_by: 'code' | 'model' | 'person'
   flagged: boolean
+  flag_reason?: string | null
+  in_package?: boolean
+}
+
+export type MappedPackage = { scheme: string; package_code: string; name: string; rate: Money }
+
+export type PackageMapping = {
+  candidates: { package_code: string; name: string; rate: Money | null; rate_basis: string | null }[]
+  choices: { procedure: string; chosen: string }[]
+  packages: MappedPackage[]
+  billed_as_package: boolean
+}
+
+export type BillFinding = {
+  kind: 'drug_price' | 'package' | 'diagnosis_package'
+  text: string
+  line_id: number | null
 }
 
 export type DeductionsPayload = Common & {
@@ -111,6 +128,8 @@ export type DeductionsPayload = Common & {
   co_pay: Money
   payable: Money
   flagged_lines: number[]
+  package?: PackageMapping | null
+  findings?: BillFinding[]
 }
 
 export type Citation = { page: PageRef | null; ref: string | null }

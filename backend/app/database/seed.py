@@ -1,5 +1,5 @@
-"""Seed the claims database: Phase 1 users, mock hospitals, document checklists, policy
-clauses and non-payable items.
+"""Seed the claims database: Phase 1 users, mock hospitals and their agreements, the package
+crosswalk, document checklists, policy clauses and non-payable items.
 
 ICD codes are not seeded: the full CMS release is loaded with python -m app.knowledge.load.
 The hand-made ICD-10-CM fixture (seed_icd_fixture) is for unit tests only.
@@ -21,8 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.config import Settings
 from app.database.models import (
     DocumentChecklistRow,
+    HospitalAgreementRow,
     HospitalRow,
     NonPayableItemRow,
+    PackageCrosswalkRow,
     PolicyClauseRow,
     UserRoleRow,
     UserRow,
@@ -114,6 +116,51 @@ HOSPITALS = [
     )
 ]
 
+# Mock agreements, one per hospital: (scheme, accreditation, ward packages are priced at,
+# non-package discount %, valid from, note). Assumptions, stated so they can be checked:
+# - CGHS hospitals take CGHS 2025 package rates (in force from 13.10.2025) for their city
+#   tier, at their accreditation, for a semi-private ward: the ward the rate list is priced
+#   at. A stay in a better room does not raise the package; the patient bears the difference.
+# - Non-package charges carry a 10 to 12% discount on the hospital's own tariff, a typical
+#   PPN figure. Medicines and implants are never discounted (product config).
+# - Ganga prices packages from PM-JAY HBP 2022 at the base (general ward) rate.
+# - The nursing home has no package agreement: its own tariff, no discount.
+_AGREEMENTS = [
+    ("CGHS", "nabh", "semi_private", "10", date(2025, 10, 13), "CGHS NABH rates, city tier X"),
+    ("CGHS", "nabh", "semi_private", "12", date(2025, 10, 13), "CGHS NABH rates, city tier X"),
+    ("PMJAY", None, "general", "8", date(2025, 4, 1), "PM-JAY HBP 2022 base rates"),
+    ("OWN", None, None, "0", date(2024, 4, 1), "own tariff; no package agreement"),
+    ("CGHS", "non_nabh", "semi_private", "10", date(2025, 10, 13),
+     "CGHS non-NABH rates, city tier X"),
+]  # fmt: skip
+
+AGREEMENTS = [
+    HospitalAgreementRow(
+        hospital_id=rohini,
+        scheme=scheme,
+        accreditation=accreditation,
+        package_ward=ward,
+        non_package_discount_percent=Decimal(discount),
+        valid_from=valid_from,
+        note=note,
+        source=SOURCE,
+        source_version=SOURCE_VERSION,
+    )
+    for rohini, (scheme, accreditation, ward, discount, valid_from, note) in zip(
+        HOSPITAL_ROHINI_IDS, _AGREEMENTS, strict=True
+    )
+]
+
+# Our own crosswalk for the packages the mock claims use: (scheme, package, ICD-10-CM
+# ranges it treats, the HBP 2022 code whose guideline and length of stay apply, note).
+# K35-K38: acute and other appendicitis and other diseases of the appendix.
+PACKAGE_CROSSWALK = [
+    ("CGHS", "AG095", ["K35-K38"], "SG017B", "Laparoscopic appendectomy"),
+    ("CGHS", "AG045", ["K35-K38"], "SG017A", "Open appendicectomy"),
+    ("PMJAY", "SG017B", ["K35-K38"], "SG017B", "Lap appendicectomy"),
+    ("PMJAY", "SG017A", ["K35-K38"], "SG017A", "Open appendicectomy"),
+]
+
 
 # Reimbursement checklist: (document, required, required only from this claimed amount, note).
 # Documents marked not required are asked for only when they apply to the claim.
@@ -141,9 +188,43 @@ async def seed_claims_db(sessions: async_sessionmaker[AsyncSession]) -> None:
             await session.merge(_copy(role))
         for hospital in HOSPITALS:
             await session.merge(_copy(hospital))
+        await session.flush()
+        await _seed_agreements(session)
+        await _seed_crosswalk(session)
         await _seed_checklist(session, RequestType.REIMBURSEMENT, REIMBURSEMENT_CHECKLIST)
         await _seed_clauses(session)
         await _seed_non_payable(session)
+
+
+async def _seed_agreements(session: AsyncSession) -> None:
+    existing = {
+        (row.hospital_id, row.valid_from): row
+        for row in await session.scalars(select(HospitalAgreementRow))
+    }
+    for agreement in AGREEMENTS:
+        row = existing.get((agreement.hospital_id, agreement.valid_from)) or HospitalAgreementRow(
+            hospital_id=agreement.hospital_id, valid_from=agreement.valid_from
+        )
+        for column in ("scheme", "accreditation", "package_ward", "note", "source",
+                       "source_version", "non_package_discount_percent"):  # fmt: skip
+            setattr(row, column, getattr(agreement, column))
+        session.add(row)
+
+
+async def _seed_crosswalk(session: AsyncSession) -> None:
+    existing = {
+        (row.scheme, row.package_code): row
+        for row in await session.scalars(
+            select(PackageCrosswalkRow).where(PackageCrosswalkRow.source == SOURCE)
+        )
+    }
+    for scheme, code, ranges, guideline, note in PACKAGE_CROSSWALK:
+        row = existing.get((scheme, code)) or PackageCrosswalkRow(
+            scheme=scheme, package_code=code, source=SOURCE
+        )
+        row.icd10cm, row.guideline_code, row.note = list(ranges), guideline, note
+        row.source_version = SOURCE_VERSION
+        session.add(row)
 
 
 async def _seed_clauses(session: AsyncSession) -> None:
@@ -221,6 +302,7 @@ async def main() -> None:
         await engine.dispose()
     print(
         f"Seeded {len(USERS)} users, {len(ROLES)} roles, {len(HOSPITALS)} hospitals, "
+        f"{len(AGREEMENTS)} hospital agreements, {len(PACKAGE_CROSSWALK)} crosswalk rows, "
         f"{len(REIMBURSEMENT_CHECKLIST)} reimbursement checklist items, "
         f"{len(POLICY_CLAUSES)} policy clauses, {len(NON_PAYABLE_ITEMS)} non-payable items"
     )

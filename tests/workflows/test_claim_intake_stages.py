@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from datetime import date
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -33,6 +34,8 @@ from app.services.intake.contract import (
     WorkflowAlreadyStarted,
 )
 from app.services.intake.service import DefaultIntakeService, DefaultWorkflowStarter
+from app.services.knowledge_base.service import DefaultKnowledgeBase
+from app.services.medical_review.contract import MedicalCoding
 from app.services.page_prep.service import DefaultPagePreparer
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.service import DefaultRulesEngine
@@ -56,10 +59,22 @@ from tests.fakes.stages import (
     FakeSettlementService,
 )
 from tests.fakes.tasks import FakeTaskService
+from tests.services.claim_builders import add_coding
 from tests.services.test_digitisation import BILL, CHEQUE, DISCHARGE, PAGES, PART_A, v
 from tests.services.test_registration import asha_policy
 
 TASK_QUEUE = "test-claims-slice-2"
+
+
+class CodingMedicalReview(FakeMedicalReviewService):
+    """Stores a coding record with no procedure, so the real bill review can run."""
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        super().__init__()
+        self.sessions = sessions
+
+    async def code(self, claim_id: UUID) -> MedicalCoding:
+        return await add_coding(self.sessions, claim_id, procedures=())
 
 
 class Harness:
@@ -95,8 +110,10 @@ class Harness:
             registration=DefaultRegistrationService(
                 self.sessions, FakePolicyService([asha_policy()]), self.money, rules
             ),
-            bill_review=DefaultBillReviewService(self.sessions, rules),
-            medical_review=FakeMedicalReviewService(),
+            bill_review=DefaultBillReviewService(
+                self.sessions, rules, gateway, DefaultKnowledgeBase(self.sessions)
+            ),
+            medical_review=CodingMedicalReview(self.sessions),
             risk=FakeRiskService(),
             adjudication=FakeAdjudicationService(),
             decision=FakeDecisionService(),
@@ -335,8 +352,9 @@ async def test_registration_and_bill_review_open_their_checkpoints_with_the_reco
         )
         [deductions] = h.tasks.unfinished("confirm_deductions")
         assert deductions.role.value == "bill_processor"
-        assert deductions.payload["admissible_total"] == "48250.00"
-        assert deductions.payload["payable"] == "45837.50"  # after the 5% co-pay
+        # Sunrise's agreement: 10% off room, fees and investigations (R24), not medicines.
+        assert deductions.payload["admissible_total"] == "44250.00"
+        assert deductions.payload["payable"] == "42037.50"  # after the 5% co-pay
         assert len(h.money.blocks) == 1
         await env.client.get_workflow_handle(str(submission.claim_id)).terminate()
 
@@ -358,7 +376,7 @@ async def test_a_person_edit_at_confirm_deductions_is_a_new_version_by_a_person(
         assert [r.created_by for r in history] == ["code", f"task:{task_id}"]
         line = next(ln for ln in history[-1].payload["lines"] if ln["line_id"] == 4)
         assert (line["judged_by"], line["admissible"]) == ("person", "20000.00")
-        assert history[-1].payload["payable"] == "43937.50"
+        assert history[-1].payload["payable"] == "42227.50"
         assert "corrections_applied" in h.monitoring.actions(Stage.BILL_REVIEW)
 
         # A send-back from a later stage re-runs bill review and keeps the person's version.
@@ -367,7 +385,7 @@ async def test_a_person_edit_at_confirm_deductions_is_a_new_version_by_a_person(
         )
         await h.wait_for(lambda: bool(h.tasks.unfinished("confirm_deductions")), "deductions again")
         [again] = h.tasks.unfinished("confirm_deductions")
-        assert again.payload["payable"] == "43937.50"
+        assert again.payload["payable"] == "42227.50"
         assert h.monitoring.actions(Stage.BILL_REVIEW).count("stage_completed") == 2
         await env.client.get_workflow_handle(str(submission.claim_id)).terminate()
 

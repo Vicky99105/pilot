@@ -1,7 +1,8 @@
 """The public reference loaders on the full downloaded sources, on real Postgres: counts in
 plausible ranges, known entries, the tracer's deductions against the full non-payable lists,
-the waiting-period ICD mapping against the FY2027 release, and every new lookup under the
-50 ms budget.
+the tracer's package, guideline, norm and drug prices against the loaded sources, the
+waiting-period and exclusion ICD mapping against the FY2027 release, and every new lookup
+under the 50 ms budget.
 
 Needs PG_TEST_DATABASE_URL and the source inventory in KB_REFERENCE_DIR (default
 .local/kb_sources). Skipped when either is missing. Everything is loaded once for the module.
@@ -251,9 +252,19 @@ def test_the_tracer_ground_truth_holds_against_the_full_non_payable_lists(loaded
     ]
     rules = DefaultRulesEngine(Settings().config_dir / "products")
     claim = gen.TracerClaim(admission=date(2026, 10, 29))
+    descriptions = sorted({i.description for i in claim.items})
+
+    async def unclear(kb: KnowledgeBase) -> set[str]:
+        return {d for d in descriptions if await kb.match_non_payable(d)}
+
+    # The lines bill review would send to R12 against the loaded lists, which the generator
+    # reads as R12_READINGS says. Gloves matches R11 itself and is never unclear.
+    near = _run(loaded, unclear) - {gen.NON_PAYABLE_ITEM}
+    print(f"\nTracer lines near a list item (R12): {sorted(near)}")
+    assert near <= set(gen.R12_READINGS)
 
     fixture_sheet = gen.expected_sheet(claim, rules)
-    full_sheet = gen.expected_sheet(claim, rules, full)
+    full_sheet = gen.expected_sheet(claim, rules, full, near)
 
     deducted = [
         (ln["description"], ln["deducted"], ln["rule_id"]) for ln in full_sheet["deductions"]
@@ -262,7 +273,96 @@ def test_the_tracer_ground_truth_holds_against_the_full_non_payable_lists(loaded
     assert [ln["deducted"] for ln in full_sheet["lines"]] == [
         ln["deducted"] for ln in fixture_sheet["lines"]
     ]
-    assert full_sheet["payable"] == fixture_sheet["payable"] == D("62924.52")
+    assert full_sheet["payable"] == fixture_sheet["payable"] == D("31350.00")
+
+
+# --- Slice P2-4: the tracer's package, guideline, norm and drug prices ---------------------
+
+
+def test_the_tracer_package_and_rate_come_from_the_agreement_and_the_cghs_list(
+    loaded: Loaded,
+) -> None:
+    async def go(kb: KnowledgeBase) -> Any:
+        agreement = await kb.hospital_agreement(gen.HOSPITAL_ROHINI)
+        found = await kb.tariff_candidates([], [gen.PROCEDURE], gen.HOSPITAL_ROHINI)
+        return agreement, found
+
+    agreement, found = _run(loaded, go)
+    assert agreement is not None
+    assert (agreement.scheme, agreement.accreditation, agreement.package_ward) == (
+        gen.PACKAGE.scheme, "nabh", "semi_private",
+    )  # fmt: skip
+    assert agreement.non_package_discount_percent == gen.NON_PACKAGE_DISCOUNT
+    [ag095] = [c for c in found if c.scheme == "CGHS" and c.procedure_code == "AG095"]
+    print(f"\nCandidates for {gen.PROCEDURE!r}: "
+          f"{[(c.scheme, c.procedure_code, c.name, str(c.rate)) for c in found]}")  # fmt: skip
+    assert ag095.tier == "X"  # Delhi
+    [rate] = [r.rate for r in ag095.rates
+              if (r.accreditation, r.ward) == ("nabh", "semi_private")]  # fmt: skip
+    assert rate == gen.PACKAGE.rate
+
+
+def test_the_tracer_guideline_and_norm_come_through_our_crosswalk(loaded: Loaded) -> None:
+    async def go(kb: KnowledgeBase) -> Any:
+        crosswalk = await kb.package_crosswalk(gen.PACKAGE.scheme, gen.PACKAGE.package_code)
+        assert crosswalk is not None and crosswalk.guideline_code is not None
+        sections = await kb.get_guideline(crosswalk.guideline_code)
+        norm = await kb.get_los_norm(crosswalk.guideline_code)
+        return crosswalk, sections, norm
+
+    crosswalk, sections, norm = _run(loaded, go)
+    assert crosswalk.guideline_code == gen.GUIDELINE_CODE
+    assert crosswalk.icd10cm == ["K35-K38"]
+    names = {s.section for s in sections}
+    assert {"claim_documents", "clinical_pointers"} <= names
+    assert norm is not None and norm.los_days == gen.LOS_NORM_DAYS
+
+
+def test_the_tracer_drug_ceilings_are_the_loaded_nppa_prices(loaded: Loaded) -> None:
+    claim = gen.TracerClaim(admission=date(2026, 10, 29))
+    rates = {i.description: i.rate for i in claim.items}
+
+    async def go(kb: KnowledgeBase) -> dict[str, Any]:
+        return {d: await kb.check_drug(d, rates[d]) for d in gen.DRUG_CEILINGS}
+
+    checks = _run(loaded, go)
+    for description, expected in gen.DRUG_CEILINGS.items():
+        check = checks[description]
+        [match] = [m for m in check.matches if m.ceiling_price == check.ceiling_price]
+        assert (match.medicine, match.dosage_form, match.unit) == (
+            expected.medicine, expected.dosage_form, expected.unit,
+        ), description  # fmt: skip
+        assert check.ceiling_price == expected.ceiling_price, description
+
+
+def test_every_pcs_prefix_and_icd_range_the_product_config_names_exists(loaded: Loaded) -> None:
+    """R9, R16 and R17 read ICD ranges and PCS prefixes from the product config. Each must
+    name something in the FY2027 release."""
+    if "icd10cm" not in loaded.reports:
+        pytest.skip(f"no ICD release at {ICD_DIR}")
+    product = DefaultRulesEngine(Settings().config_dir / "products").product(PRODUCT_UIN)
+
+    async def go(kb: KnowledgeBase) -> list[str]:
+        missing = []
+        prefixes = [*product.cataract_pcs]
+        prefixes += [p for t in product.modern_treatments for p in t.icd10pcs]
+        prefixes += [p for e in product.exclusions for p in e.icd10pcs]
+        for prefix in prefixes:
+            valid = (
+                await kb.pcs_validate(prefix)
+                if len(prefix) == 7
+                else bool(await kb.pcs_options(prefix))
+            )
+            if not valid:
+                missing.append(f"PCS {prefix}")
+        for exclusion in product.exclusions:
+            for item in exclusion.icd10cm:
+                for end in item.split("-") if "-" in item.strip("-") else [item]:
+                    if await kb.get_icd_tabular(end.strip()) is None:
+                        missing.append(f"{exclusion.code}: {end}")
+        return missing
+
+    assert _run(loaded, go) == []
 
 
 # --- Waiting-period ICD mapping -----------------------------------------------------------

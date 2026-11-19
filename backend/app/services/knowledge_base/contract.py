@@ -183,6 +183,36 @@ class Exclusion(BaseModel):
     source: str
 
 
+# --- Hospital agreements and the package crosswalk (slice P2-4) -------------------------
+
+AgreementScheme = Literal["CGHS", "PMJAY", "MEDISEP", "OWN"]
+
+
+class HospitalAgreement(BaseModel):
+    """The scheme a hospital's packages are priced from, and its non-package discount."""
+
+    hospital_id: str
+    scheme: AgreementScheme  # OWN: the hospital's own tariff, no package agreement
+    accreditation: str | None  # CGHS: nabh, non_nabh or super_speciality
+    package_ward: str | None  # the ward the agreed package rate is for
+    non_package_discount_percent: Decimal
+    valid_from: date
+    note: str | None = None
+    source: str
+
+
+class PackageCrosswalk(BaseModel):
+    """Our own crosswalk for one package: the diagnoses it treats and the HBP 2022 code whose
+    guideline and length of stay apply."""
+
+    scheme: str
+    package_code: str
+    icd10cm: list[str]  # ranges, as code_in_ranges reads them
+    guideline_code: str | None
+    note: str | None = None
+    source: str
+
+
 class KnowledgeBase(Protocol):
     async def search_icd_index(
         self, term: str, index: IndexName = "diseases", *, as_of: date | None = None
@@ -244,4 +274,15 @@ class KnowledgeBase(Protocol):
 
     async def exclusion(self, code: str) -> Exclusion | None:
         """A standard exclusion (Excl01 to Excl18) or a product's specific one, by code."""
+        ...
+
+    async def hospital_agreement(
+        self, hospital_id: str, *, as_of: date | None = None
+    ) -> HospitalAgreement | None:
+        """The hospital's agreement in force on as_of (the latest when as_of is None), or None
+        when it has none."""
+        ...
+
+    async def package_crosswalk(self, scheme: str, package_code: str) -> PackageCrosswalk | None:
+        """Our crosswalk row for a package, or None when the package is not in it."""
         ...

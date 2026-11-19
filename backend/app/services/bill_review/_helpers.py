@@ -11,6 +11,7 @@ ZERO = Decimal("0.00")
 # Patterns per head, matched on whole words of the lower-cased text. Order matters: the
 # first head whose pattern matches wins, so ICU comes before room.
 HEAD_PATTERNS: list[tuple[Head, str]] = [
+    (Head.PACKAGE, r"packages?"),
     (Head.ICU, r"icu|iccu|nicu|picu|hdu|intensive care|critical care"),
     (Head.AMBULANCE, r"ambulance"),
     (Head.IMPLANTS, r"implants?|stents?|prosthe\w*|plates?|screws?|pacemaker"),

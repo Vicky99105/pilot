@@ -181,6 +181,23 @@ async def test_happy_path_opens_always_on_checkpoints_and_closes(harness: Harnes
     assert completed == [s for s in Stage if s is not Stage.QUERY]
 
 
+async def test_medical_coding_runs_before_bill_review_and_the_full_review_after_it(
+    harness: Harness,
+) -> None:
+    """Bill review maps the verified procedures to a package; the full medical review reads
+    that package's guideline. So: registration, coding, bill review, then the review."""
+    handle = await harness.start()
+    for kind in ALWAYS_ON:
+        await harness.complete(handle, kind)
+    await handle.result()
+
+    completed = [e.stage for e in harness.monitoring.recorded if e.action == "stage_completed"]
+    order = [Stage.REGISTRATION, Stage.MEDICAL_CODING, Stage.BILL_REVIEW, Stage.MEDICAL_REVIEW]
+    assert [s for s in completed if s in order] == order
+    assert harness.medical.coded and harness.medical.reviewed
+    assert harness.medical.coded[0] < harness.medical.reviewed[0]
+
+
 async def test_waits_at_checkpoint_until_task_completed_arrives(harness: Harness) -> None:
     handle = await harness.start()
     await harness.wait_for(
@@ -226,15 +243,19 @@ async def test_query_path_passes_all_13_stages(query_harness: Harness) -> None:
     await h.wait_for(lambda: "stage_completed" in h.monitoring.actions(Stage.QUERY), "query")
 
     await handle.signal(ClaimWorkflow.followup_received, str(uuid.uuid4()))
-    for kind in ["approve", "release_payment"]:
+    for kind in ["confirm_deductions", "approve", "release_payment"]:
         await h.complete(handle, kind)
     result = await handle.result()
 
     assert result.status == "closed"
     assert {e.stage for e in h.monitoring.recorded if e.action == "stage_completed"} == set(Stage)
-    # The reply re-ran classification and digitisation, then resumed at medical review.
+    # The reply re-ran classification and digitisation, then resumed at medical coding: new
+    # documents can change the codes, so the package and the deductions, so the bill
+    # processor confirms the sheet again.
     assert h.monitoring.actions(Stage.CLASSIFICATION).count("stage_completed") == 2
     assert h.monitoring.actions(Stage.DIGITISATION).count("stage_completed") == 2
+    assert h.monitoring.actions(Stage.MEDICAL_CODING).count("stage_completed") == 2
+    assert h.monitoring.actions(Stage.BILL_REVIEW).count("stage_completed") == 2
     assert h.monitoring.actions(Stage.MEDICAL_REVIEW).count("stage_completed") == 2
     assert h.monitoring.actions(Stage.RISK).count("stage_completed") == 2
     assert h.monitoring.actions(Stage.ADJUDICATION).count("stage_completed") == 2
@@ -417,7 +438,7 @@ def _reminders(h: Harness) -> list[int]:
     ]
 
 
-async def test_query_reminders_at_day_3_and_7_then_a_reply_resumes_at_medical_review(
+async def test_query_reminders_at_day_3_and_7_then_a_reply_resumes_at_medical_coding(
     query_harness: Harness,
 ) -> None:
     h = query_harness
@@ -431,6 +452,7 @@ async def test_query_reminders_at_day_3_and_7_then_a_reply_resumes_at_medical_re
 
     reply = uuid.uuid4()
     await handle.signal(ClaimWorkflow.followup_received, str(reply))
+    await h.complete(handle, "confirm_deductions")  # the sheet again, after the new coding
     await h.wait_for(lambda: bool(h.tasks.unfinished("approve")), "approve after the reply")
 
     assert ("reply", reply) in h.query.calls
@@ -461,7 +483,7 @@ async def test_no_reply_by_the_deadline_opens_the_operator_task_and_waits_again(
     await h.complete(handle, "query_no_reply", {"action": "extend"})
     await h.wait_for(lambda: "query_extended" in h.monitoring.actions(Stage.QUERY), "extended")
     await handle.signal(ClaimWorkflow.followup_received, str(uuid.uuid4()))
-    for kind in ["approve", "release_payment"]:
+    for kind in ["confirm_deductions", "approve", "release_payment"]:
         await h.complete(handle, kind)
     assert (await handle.result()).status == "closed"
     assert _reminders(h) == [3, 7]  # no second round of reminders after the extension

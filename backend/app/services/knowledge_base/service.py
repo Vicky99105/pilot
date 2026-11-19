@@ -36,15 +36,18 @@ from app.services.knowledge_base.contract import (
     DrugCheck,
     Exclusion,
     GuidelineSection,
+    HospitalAgreement,
     IcdIndexHit,
     IcdTabularEntry,
     IndexName,
     LosNorm,
     NonPayableCandidate,
+    PackageCrosswalk,
     PcsOption,
     PolicyClause,
     TariffCandidate,
 )
+from app.shared.codes import code_in_ranges
 from app.shared.types import Code
 
 # Words too common in index paths to narrow a search.
@@ -75,10 +78,6 @@ def _cm_code(code: str) -> str:
     """K3580, k35.80 and K35.80- all become K35.80."""
     key = code.strip().upper().rstrip("-").rstrip(".").replace(".", "")
     return key if len(key) <= 3 else f"{key[:3]}.{key[3:]}"
-
-
-def _range_key(code: str) -> str:
-    return code.strip().upper().rstrip("-").replace(".", "")
 
 
 class DefaultKnowledgeBase:
@@ -298,13 +297,7 @@ class DefaultKnowledgeBase:
     # --- Ranges --------------------------------------------------------------------------
 
     def code_in_ranges(self, code: str, ranges: list[str]) -> bool:
-        key = _range_key(code)
-        for item in ranges:
-            low, _, high = item.partition("-") if _is_span(item) else (item, "", item)
-            low, high = _range_key(low), _range_key(high)
-            if low <= key and (key <= high or key.startswith(high)):
-                return True
-        return False
+        return code_in_ranges(code, ranges)
 
     # --- Policy --------------------------------------------------------------------------
 
@@ -330,6 +323,16 @@ class DefaultKnowledgeBase:
         async with self._sessions() as session:
             return await _reference.tariff_candidates(session, procedure_codes, names, hospital_id)
 
+    async def hospital_agreement(
+        self, hospital_id: str, *, as_of: date | None = None
+    ) -> HospitalAgreement | None:
+        async with self._sessions() as session:
+            return await _reference.hospital_agreement(session, hospital_id, as_of)
+
+    async def package_crosswalk(self, scheme: str, package_code: str) -> PackageCrosswalk | None:
+        async with self._sessions() as session:
+            return await _reference.package_crosswalk(session, scheme, package_code)
+
     async def get_guideline(self, package_code: str) -> list[GuidelineSection]:
         async with self._sessions() as session:
             return await _reference.get_guideline(session, package_code)
@@ -354,10 +357,3 @@ class DefaultKnowledgeBase:
 def _row_holds(axes: list[Any], chars: str) -> bool:
     """True when every character is one of the row's values at its position."""
     return all(any(value == char for value, _ in axes[i][1]) for i, char in enumerate(chars))
-
-
-def _is_span(item: str) -> bool:
-    """True for two codes joined by a hyphen, such as K35-K38. K35.- and K35- are one code
-    with the codes below it."""
-    low, sep, high = item.strip().partition("-")
-    return bool(sep and low and high.strip())

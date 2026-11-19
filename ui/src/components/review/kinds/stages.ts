@@ -5,6 +5,7 @@ const PIPELINE: Stage[] = [
   'classification',
   'digitisation',
   'registration',
+  'medical_coding',
   'bill_review',
   'medical_review',
   'risk',

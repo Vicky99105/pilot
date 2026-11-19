@@ -52,11 +52,14 @@ MODEL_RETRY = RetryPolicy(
 )
 PAID: tuple[FinalDecision, ...] = ("approve", "partial")
 
-# Stages after intake, in order. Query and monitoring run outside this list.
+# Stages after intake, in order. Query and monitoring run outside this list. Medical review
+# runs in two steps around bill review: coding first, because bill review maps the verified
+# procedures to a package; the full review after, because it reads that package's guideline.
 PIPELINE = [
     Stage.CLASSIFICATION,
     Stage.DIGITISATION,
     Stage.REGISTRATION,
+    Stage.MEDICAL_CODING,
     Stage.BILL_REVIEW,
     Stage.MEDICAL_REVIEW,
     Stage.RISK,
@@ -69,19 +72,23 @@ PIPELINE = [
 MODEL_STAGES = {
     Stage.CLASSIFICATION,
     Stage.DIGITISATION,
+    Stage.MEDICAL_CODING,
+    Stage.BILL_REVIEW,
     Stage.MEDICAL_REVIEW,
     Stage.RISK,
     Stage.ADJUDICATION,
     Stage.DECISION,
     Stage.COMMUNICATION,
 }
-# Where a query reply resumes: medical review onward, so its query items are re-evaluated.
-RESUME_AFTER_REPLY = Stage.MEDICAL_REVIEW
+# Where a query reply resumes: medical coding onward. The reply's documents can change the
+# codes, so the package and the deductions, and the query items are re-evaluated.
+RESUME_AFTER_REPLY = Stage.MEDICAL_CODING
 
 STAGE_ACTIVITIES = {
     Stage.CLASSIFICATION: ClaimActivities.classification,
     Stage.DIGITISATION: ClaimActivities.digitisation,
     Stage.REGISTRATION: ClaimActivities.registration,
+    Stage.MEDICAL_CODING: ClaimActivities.medical_coding,
     Stage.BILL_REVIEW: ClaimActivities.bill_review,
     Stage.MEDICAL_REVIEW: ClaimActivities.medical_review,
     Stage.RISK: ClaimActivities.risk,
@@ -366,7 +373,7 @@ class ClaimWorkflow:
 
     async def _query_loop(self) -> Stage | None:
         """Raise the query and wait for a reply, with reminders. A reply re-runs
-        classification and digitisation on it, then resumes at medical review. With no
+        classification and digitisation on it, then resumes at medical coding. With no
         reply by the deadline, a claims operator decides: wait again ("extend", the
         default) or go to the approver as the claim stands ("proceed")."""
         assert self._claim_id is not None

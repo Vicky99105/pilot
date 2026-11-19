@@ -202,3 +202,35 @@ async def test_exclusion_by_code(kb: KnowledgeBase) -> None:
 
     assert excl is not None and (excl.code, excl.title, excl.page) == ("Excl03", "First 30 days", 7)
     assert await kb.exclusion("Excl99") is None
+
+
+# --- Slice P2-4: hospital agreements and the diagnosis-to-package crosswalk -------------
+
+
+async def test_every_seeded_hospital_has_an_agreement(kb: KnowledgeBase) -> None:
+    agreements = {h: await kb.hospital_agreement(h) for h in HOSPITAL_ROHINI_IDS}
+
+    sunrise = agreements[SUNRISE_DELHI]
+    assert sunrise is not None
+    assert (sunrise.scheme, sunrise.accreditation, sunrise.package_ward) == (
+        "CGHS",
+        "nabh",
+        "semi_private",
+    )
+    assert sunrise.non_package_discount_percent == D("10.00")
+    assert all(a is not None for a in agreements.values())
+    nursing_home = agreements[HOSPITAL_ROHINI_IDS[3]]
+    assert nursing_home is not None and nursing_home.scheme == "OWN"
+    assert nursing_home.non_package_discount_percent == D("0.00")
+    assert await kb.hospital_agreement("0000000000000") is None
+
+
+async def test_package_crosswalk_gives_the_diagnoses_and_the_guideline_code(
+    kb: KnowledgeBase,
+) -> None:
+    lap = await kb.package_crosswalk("CGHS", "AG095")
+    unknown = await kb.package_crosswalk("CGHS", "AG001")
+
+    assert lap is not None
+    assert (lap.icd10cm, lap.guideline_code) == (["K35-K38"], "SG017B")
+    assert unknown is None

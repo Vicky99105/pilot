@@ -12,12 +12,17 @@ from app.integrations.core.contract import InsuredMember, MemberPolicy
 from app.services.rules.contract import (
     PAID_FLAGS,
     Claimant,
+    DrugFacts,
     Facts,
     Head,
+    LineFacts,
+    MappedPackage,
     MemberMatch,
     NonPayableItem,
     ProductConfig,
+    RoomFacts,
 )
+from app.shared.codes import code_in_ranges, has_prefix
 from app.shared.types import RuleResult
 
 CENTS = Decimal("0.01")
@@ -261,11 +266,13 @@ def r11_non_payable(facts: Facts, product: ProductConfig) -> RuleResult:
     if item is None:
         return RuleResult(rule_id="R11", passed=True, reason="not on the non-payable lists")
     condition = f"; {item.condition}" if item.condition else ""
+    clause = product.clauses.non_payable.get(item.list_name)
     if item.payable_in_product in PAID_FLAGS:
         return RuleResult(
             rule_id="R11",
             passed=True,
             reason=f"paid: List {item.list_name} item {item.item_number} {item.item!r}{condition}",
+            clause_ref=clause,
         )
     return RuleResult(
         rule_id="R11",
@@ -274,7 +281,7 @@ def r11_non_payable(facts: Facts, product: ProductConfig) -> RuleResult:
         reason=(
             f"non-payable: List {item.list_name} item {item.item_number} {item.item!r}{condition}"
         ),
-        clause_ref=product.clauses.non_payable.get(item.list_name),
+        clause_ref=clause,
     )
 
 
@@ -290,24 +297,12 @@ def r13_room_cap(facts: Facts, product: ProductConfig) -> RuleResult:
         return _missing("R13", *_absent(line=facts.line, room=facts.room))
     line, room = facts.line, facts.room
     clauses = product.clauses
-    if line.head in (Head.ROOM, Head.ICU):
-        limits = product.room_rent if line.head is Head.ROOM else product.icu
-        clause = clauses.room_cap if line.head is Head.ROOM else clauses.icu_cap
-        cap = daily_cap(limits.percent_of_sum_insured, limits.max_per_day, room.sum_insured)
-        days = line.qty if line.qty and line.qty > 0 else Decimal(1)
-        rate = line.rate if line.rate is not None else line.claimed / days
-        if rate <= cap:
-            reason = f"{_rupees(rate)} a day is within the {_rupees(cap)} cap"
-            return RuleResult(rule_id="R13", passed=True, reason=reason, clause_ref=clause)
-        admissible = money(min(line.claimed, cap * days))
-        reason = f"{_rupees(rate)} a day for {days} days exceeds the {_rupees(cap)} cap"
-        return RuleResult(
-            rule_id="R13",
-            passed=False,
-            amount_effect=admissible - money(line.claimed),
-            reason=reason,
-            clause_ref=clause,
-        )
+    if in_package(line.head, facts, product):
+        return _priced_by_package("R13", facts)
+    if line.head is Head.ICU:
+        return RuleResult(rule_id="R13", passed=True, reason="an ICU line: R14 caps it")
+    if line.head is Head.ROOM:
+        return _daily_cap("R13", line, room, product)
     rules = product.proportionate_deduction
     if line.head not in rules.linked_heads:
         kind = "excluded from" if line.head in rules.excluded_heads else "not subject to"
@@ -339,6 +334,498 @@ def r13_room_cap(facts: Facts, product: ProductConfig) -> RuleResult:
     )
 
 
+def _daily_cap(rule_id: str, line: LineFacts, room: RoomFacts, product: ProductConfig
+               ) -> RuleResult:  # fmt: skip
+    """The room (R13) or ICU (R14) cap a day, times the days on the line."""
+    limits = product.room_rent if line.head is Head.ROOM else product.icu
+    clauses = product.clauses
+    clause = clauses.room_cap if line.head is Head.ROOM else clauses.icu_cap
+    cap = daily_cap(limits.percent_of_sum_insured, limits.max_per_day, room.sum_insured)
+    days = line.qty if line.qty and line.qty > 0 else Decimal(1)
+    rate = line.rate if line.rate is not None else line.claimed / days
+    if rate <= cap:
+        reason = f"{_rupees(rate)} a day is within the {_rupees(cap)} cap"
+        return RuleResult(rule_id=rule_id, passed=True, reason=reason, clause_ref=clause)
+    admissible = money(min(line.claimed, cap * days))
+    reason = f"{_rupees(rate)} a day for {days} days exceeds the {_rupees(cap)} cap"
+    return RuleResult(
+        rule_id=rule_id,
+        passed=False,
+        amount_effect=admissible - money(line.claimed),
+        reason=reason,
+        clause_ref=clause,
+    )
+
+
+# --- R14: ICU cap -------------------------------------------------------------------------
+
+
+def r14_icu_cap(facts: Facts, product: ProductConfig) -> RuleResult:
+    if facts.line is None or facts.room is None:
+        return _missing("R14", *_absent(line=facts.line, room=facts.room))
+    line = facts.line
+    if line.head is not Head.ICU:
+        return RuleResult(rule_id="R14", passed=True, reason=f"not an ICU line ({line.head})")
+    if in_package(line.head, facts, product):
+        return _priced_by_package("R14", facts)
+    return _daily_cap("R14", line, facts.room, product)
+
+
+# --- Packages: R20, R23, R24 --------------------------------------------------------------
+
+
+def in_package(head: Head, facts: Facts, product: ProductConfig) -> bool:
+    """True when a package applies and prices this head: a package charge line, or a head the
+    package covers."""
+    return facts.package is not None and (
+        head is Head.PACKAGE or head in product.packages.included_heads
+    )
+
+
+def _codes(facts: Facts) -> str:
+    assert facts.package is not None
+    return ", ".join(p.package_code for p in facts.package.packages)
+
+
+def _priced_by_package(rule_id: str, facts: Facts) -> RuleResult:
+    return RuleResult(
+        rule_id=rule_id, passed=True, reason=f"priced by the package ({_codes(facts)})"
+    )
+
+
+def package_shares(packages: list[MappedPackage], product: ProductConfig
+                   ) -> list[tuple[MappedPackage, Decimal]]:  # fmt: skip
+    """Each package with the percent of its rate paid. A stand-alone package is paid alone
+    (the highest-rated one when there are several); add-ons are paid at the add-on percent;
+    the rest at the first, second and later percents, highest rate first."""
+    percents = product.packages.multi_procedure_percent
+    standalone = [p for p in packages if p.standalone]
+    if standalone and len(packages) > 1:
+        kept = max(standalone, key=lambda p: p.rate)
+        return [(p, HUNDRED if p is kept else ZERO) for p in packages]
+    shares: list[tuple[MappedPackage, Decimal]] = [(p, percents.addon) for p in packages if p.addon]
+    main = sorted((p for p in packages if not p.addon), key=lambda p: p.rate, reverse=True)
+    for index, package in enumerate(main):
+        percent = (percents.first, percents.second)[index] if index < 2 else percents.rest
+        shares.append((package, percent))
+    return shares
+
+
+def r20_package_cap(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.package_tariff
+    if facts.package is None or not facts.package.packages:
+        return RuleResult(rule_id="R20", passed=True, reason="no package applies to the claim")
+    shares = package_shares(facts.package.packages, product)
+    total = money(sum((p.rate * pct / HUNDRED for p, pct in shares), ZERO))
+    parts = [f"{p.package_code} at {pct.normalize():f}% of {_rupees(p.rate)}" for p, pct in shares]
+    if any(p.standalone for p in facts.package.packages) and len(shares) > 1:
+        parts.append("a stand-alone package is paid alone")
+    billed = money(facts.package.package_total)
+    what = "package charges" if facts.package.billed_as_package else "charges the package covers"
+    detail = f"{'; '.join(parts)}: package total {_rupees(total)}"
+    if billed <= total:
+        reason = f"{what} {_rupees(billed)} within the {detail}"
+        return RuleResult(rule_id="R20", passed=True, reason=reason, clause_ref=clause)
+    return RuleResult(
+        rule_id="R20",
+        passed=False,
+        amount_effect=total - billed,
+        reason=f"{what} {_rupees(billed)} capped at the agreed {detail}",
+        clause_ref=clause,
+    )
+
+
+def r23_package_inclusions(facts: Facts, product: ProductConfig) -> RuleResult:
+    if facts.line is None:
+        return _missing("R23", "line")
+    line = facts.line
+    package = facts.package
+    if package is None or not package.billed_as_package:
+        return RuleResult(rule_id="R23", passed=True, reason="no package charge on the bill")
+    if line.head not in product.packages.included_heads:
+        reason = f"{line.head.value} is not inside the package"
+        return RuleResult(rule_id="R23", passed=True, reason=reason)
+    return RuleResult(
+        rule_id="R23",
+        passed=False,
+        amount_effect=-money(line.claimed),
+        reason=(
+            f"{line.head.value} is already inside package {_codes(facts)}, which the bill "
+            "charges separately"
+        ),
+        clause_ref=product.clauses.package_inclusions,
+    )
+
+
+def r24_non_package_discount(facts: Facts, product: ProductConfig) -> RuleResult:
+    if facts.line is None:
+        return _missing("R24", "line")
+    line = facts.line
+    percent = facts.non_package_discount_percent
+    if not percent:
+        return RuleResult(rule_id="R24", passed=True, reason="no agreed non-package discount")
+    if in_package(line.head, facts, product):
+        return _priced_by_package("R24", facts)
+    if line.head in product.packages.discount_excluded_heads:
+        reason = f"{line.head.value} is never discounted"
+        return RuleResult(rule_id="R24", passed=True, reason=reason)
+    discount = money(line.claimed * percent / HUNDRED)
+    return RuleResult(
+        rule_id="R24",
+        passed=False,
+        amount_effect=-discount,
+        reason=f"agreed {percent.normalize():f}% discount on non-package charges",
+        clause_ref=product.clauses.non_package_discount,
+    )
+
+
+# --- R12: the model's reading of an unclear line -------------------------------------------
+
+
+def r12_unclear_line(facts: Facts, product: ProductConfig) -> RuleResult:
+    if facts.line is None or facts.judgement is None:
+        return _missing("R12", *_absent(line=facts.line, judgement=facts.judgement))
+    line, judgement = facts.line, facts.judgement
+    item = judgement.item
+    if judgement.confidence < product.non_payable_judging.min_confidence:
+        read = "payable" if item is None else f"List {item.list_name} item {item.item_number}"
+        return RuleResult(
+            rule_id="R12",
+            passed=False,
+            reason=(
+                f"model unsure ({judgement.confidence:.2f}) whether the line is {read}; "
+                "a person decides"
+            ),
+            judged_by="model",
+        )
+    if item is None:
+        reason = "read as payable: not a non-payable list item"
+        return RuleResult(rule_id="R12", passed=True, reason=reason, judged_by="model")
+    named = f"List {item.list_name} item {item.item_number} {item.item!r}"
+    if item.payable_in_product in PAID_FLAGS:
+        return RuleResult(rule_id="R12", passed=True, reason=f"paid: {named}", judged_by="model")
+    return RuleResult(
+        rule_id="R12",
+        passed=False,
+        amount_effect=-money(line.claimed),
+        reason=f"non-payable: {named}",
+        clause_ref=product.clauses.non_payable.get(item.list_name),
+        judged_by="model",
+    )
+
+
+# --- R16, R17, R19: sub-limits -----------------------------------------------------------
+
+
+def r16_cataract(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.cataract
+    if product.sub_limits is None:
+        return _missing("R16", "sub_limits")
+    eyes = {
+        code.strip().upper()[3]
+        for code in facts.procedure_codes
+        if has_prefix(code, product.cataract_pcs)
+    }
+    if not eyes:
+        return RuleResult(rule_id="R16", passed=True, reason="no cataract surgery")
+    if facts.sum_insured is None or facts.admissible_total is None:
+        return _missing(
+            "R16", *_absent(sum_insured=facts.sum_insured, admissible=facts.admissible_total)
+        )
+    limit = product.sub_limits.cataract
+    per_eye = money(
+        min(facts.sum_insured * limit.percent_of_sum_insured / HUNDRED, limit.max_per_eye)
+    )
+    cap = per_eye * len(eyes)
+    total = money(facts.admissible_total)
+    which = "both eyes" if len(eyes) == 2 else "one eye"
+    if total <= cap:
+        reason = f"{_rupees(total)} within the cataract limit of {_rupees(cap)} ({which})"
+        return RuleResult(rule_id="R16", passed=True, reason=reason, clause_ref=clause)
+    return RuleResult(
+        rule_id="R16",
+        passed=False,
+        amount_effect=cap - total,
+        reason=f"cataract limit {_rupees(per_eye)} an eye, {which}: {_rupees(total)} capped",
+        clause_ref=clause,
+    )
+
+
+def r17_modern_treatments(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.modern_treatments
+    found = [
+        t.item
+        for t in product.modern_treatments
+        if any(has_prefix(code, t.icd10pcs) for code in facts.procedure_codes)
+    ]
+    if not found:
+        return RuleResult(rule_id="R17", passed=True, reason="no modern treatment coded")
+    if product.sub_limits is None or facts.sum_insured is None or facts.admissible_total is None:
+        return _missing(
+            "R17",
+            *_absent(
+                sub_limits=product.sub_limits,
+                sum_insured=facts.sum_insured,
+                admissible=facts.admissible_total,
+            ),
+        )
+    percent = product.sub_limits.modern_treatments_percent_of_sum_insured
+    cap = money(facts.sum_insured * percent / HUNDRED)
+    total = money(facts.admissible_total)
+    named = ", ".join(found)
+    if total <= cap:
+        reason = f"{named}: {_rupees(total)} within {percent}% of the sum insured"
+        return RuleResult(rule_id="R17", passed=True, reason=reason, clause_ref=clause)
+    return RuleResult(
+        rule_id="R17",
+        passed=False,
+        amount_effect=cap - total,
+        reason=f"{named}: capped at {percent}% of the sum insured, {_rupees(cap)}",
+        clause_ref=clause,
+    )
+
+
+def r19_ambulance(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.ambulance
+    if product.sub_limits is None or facts.ambulance_total is None:
+        return _missing("R19", *_absent(sub_limits=product.sub_limits,
+                                        ambulance=facts.ambulance_total))  # fmt: skip
+    cap = money(product.sub_limits.ambulance_max_per_hospitalisation)
+    total = money(facts.ambulance_total)
+    if total <= cap:
+        reason = f"ambulance {_rupees(total)} within the {_rupees(cap)} limit"
+        return RuleResult(rule_id="R19", passed=True, reason=reason, clause_ref=clause)
+    return RuleResult(
+        rule_id="R19",
+        passed=False,
+        amount_effect=cap - total,
+        reason=f"ambulance {_rupees(total)} capped at {_rupees(cap)} a hospitalisation",
+        clause_ref=clause,
+    )
+
+
+# --- R18: pre and post hospitalisation windows -------------------------------------------
+
+
+def r18_pre_post(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.pre_post
+    if facts.line is None or facts.admission_date is None:
+        return _missing("R18", *_absent(line=facts.line, admission_date=facts.admission_date))
+    line = facts.line
+    served = line.service_date
+    if served is None:
+        reason = "no service date on the line; not checked"
+        return RuleResult(rule_id="R18", passed=True, reason=reason, clause_ref=clause)
+    admitted = facts.admission_date
+    discharged = facts.discharge_date or admitted
+    pre, post = product.pre_hospitalisation_days, product.post_hospitalisation_days
+    if pre is not None and served < admitted - timedelta(days=pre):
+        reason = f"served {served}, more than {pre} days before admission on {admitted}"
+    elif post is not None and served > discharged + timedelta(days=post):
+        reason = f"served {served}, more than {post} days after discharge on {discharged}"
+    else:
+        reason = f"served {served}, within the pre and post hospitalisation windows"
+        return RuleResult(rule_id="R18", passed=True, reason=reason, clause_ref=clause)
+    return RuleResult(
+        rule_id="R18",
+        passed=False,
+        amount_effect=-money(line.claimed),
+        reason=reason,
+        clause_ref=clause,
+    )
+
+
+# --- R26: final bill against the approved pre-auth ----------------------------------------
+
+
+def r26_preauth(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.preauth
+    preauth = facts.preauth
+    if preauth is None:
+        reason = "no pre-auth on the claim; nothing to compare"
+        return RuleResult(rule_id="R26", passed=True, reason=reason, clause_ref=clause)
+    if facts.admissible_total is None:
+        return _missing("R26", "admissible_total")
+    approved, total = money(preauth.approved_total), money(facts.admissible_total)
+    approved_families = {c.strip().upper()[:3] for c in preauth.diagnosis_codes}
+    verified_families = {c.strip().upper()[:3] for c in facts.diagnosis_codes}
+    if total > approved:
+        return RuleResult(
+            rule_id="R26",
+            passed=False,
+            amount_effect=approved - total,
+            reason=f"final bill {_rupees(total)} exceeds the approved {_rupees(approved)}",
+            clause_ref=clause,
+        )
+    if approved_families and verified_families and not approved_families & verified_families:
+        return RuleResult(
+            rule_id="R26",
+            passed=False,
+            reason=(
+                f"diagnosis changed since the pre-auth: approved "
+                f"{', '.join(sorted(preauth.diagnosis_codes))}, verified "
+                f"{', '.join(sorted(facts.diagnosis_codes))}"
+            ),
+            clause_ref=clause,
+        )
+    reason = f"final bill {_rupees(total)} within the approved {_rupees(approved)}"
+    return RuleResult(rule_id="R26", passed=True, reason=reason, clause_ref=clause)
+
+
+# --- R6, R7, R9: eligibility on verified codes -------------------------------------------
+
+
+def r6_pre_existing(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.pre_existing
+    if facts.policy is None or facts.admission_date is None:
+        return _missing("R6", *_absent(policy=facts.policy, admission_date=facts.admission_date))
+    policy, admitted = facts.policy, facts.admission_date
+    before = sorted(d for d in facts.pre_existing_onsets if d < policy.inception_date)
+    declared = [c.code for c in policy.declared_peds]
+    treated = [c for c in facts.diagnosis_codes if declared and code_in_ranges(c, declared)]
+    if not before and not treated:
+        reason = "no pre-existing disease found or declared for this treatment"
+        return RuleResult(rule_id="R6", passed=True, reason=reason, clause_ref=clause)
+    found = (
+        f"declared pre-existing {', '.join(treated)}"
+        if treated
+        else f"a condition that started by {before[0]}, before inception {policy.inception_date}"
+    )
+    months = product.pre_existing_waiting_months
+    if months is None:
+        return _missing("R6", "pre_existing_waiting_months")
+    served_from = add_months(policy.continuous_cover_start, months)
+    passed = admitted >= served_from
+    state = "served" if passed else "not served"
+    reason = (
+        f"{found}; the {months}-month wait from {policy.continuous_cover_start} is {state} "
+        f"(ends {served_from})"
+    )
+    return RuleResult(rule_id="R6", passed=passed, reason=reason, clause_ref=clause)
+
+
+def r7_specific_waiting(facts: Facts, product: ProductConfig) -> RuleResult:
+    waiting = product.specific_waiting
+    if waiting is None:
+        return RuleResult(rule_id="R7", passed=True, reason="no specific waiting list")
+    clause = waiting.clause
+    if facts.policy is None or facts.admission_date is None:
+        return _missing("R7", *_absent(policy=facts.policy, admission_date=facts.admission_date))
+    if facts.accident and waiting.accident_exempt:
+        reason = "hospitalisation due to an accident is exempt from the specific waits"
+        return RuleResult(rule_id="R7", passed=True, reason=reason, clause_ref=clause)
+    start = facts.policy.continuous_cover_start
+    for condition in waiting.conditions:
+        cm = [c for c in facts.diagnosis_codes if code_in_ranges(c, condition.icd10cm)]
+        pcs = [c for c in facts.procedure_codes if has_prefix(c, condition.icd10pcs)]
+        if not cm and not pcs:
+            continue
+        ends = add_months(start, condition.months)
+        if facts.admission_date < ends:
+            return RuleResult(
+                rule_id="R7",
+                passed=False,
+                reason=(
+                    f"{condition.item} ({', '.join([*cm, *pcs])}): {condition.months}-month "
+                    f"wait from {start} ends {ends}, after admission on {facts.admission_date}"
+                ),
+                clause_ref=clause,
+            )
+    reason = "no listed condition is in its waiting period"
+    return RuleResult(rule_id="R7", passed=True, reason=reason, clause_ref=clause)
+
+
+def r9_exclusions(facts: Facts, product: ProductConfig) -> RuleResult:
+    for exclusion in product.exclusions:
+        cm = [c for c in facts.diagnosis_codes if code_in_ranges(c, exclusion.icd10cm)]
+        pcs = [c for c in facts.procedure_codes if has_prefix(c, exclusion.icd10pcs)]
+        if cm or pcs:
+            return RuleResult(
+                rule_id="R9",
+                passed=False,
+                reason=f"{exclusion.title} ({exclusion.code}): {', '.join([*cm, *pcs])}",
+                clause_ref=exclusion.code,
+            )
+    return RuleResult(rule_id="R9", passed=True, reason="no excluded condition in the codes")
+
+
+# --- Drug price check: a finding, never a deduction ---------------------------------------
+
+_COUNTED = {"vial", "tablet", "capsule", "ampoule", "amp", "pack", "bottle", "sachet", "tube"}
+_STRENGTH = re.compile(r"(\d+(?:\.\d+)?)\s*(mg|g|gm|mcg|ml)\b", re.IGNORECASE)
+_PER_ML = re.compile(r"(\d+(?:\.\d+)?)\s*(mg|mcg)\s*/\s*(\d+(?:\.\d+)?)?\s*ml\b",
+                     re.IGNORECASE)  # fmt: skip
+
+
+def _amounts(text: str) -> dict[str, Decimal]:
+    """The first mg (grams converted) and mL amounts written in the text."""
+    found: dict[str, Decimal] = {}
+    for number, unit in _STRENGTH.findall(text):
+        unit = unit.lower()
+        value = Decimal(number)
+        if unit in ("g", "gm"):
+            value, unit = value * 1000, "mg"
+        found.setdefault(unit, value)
+    return found
+
+
+def _units_billed(line: LineFacts, drug: DrugFacts) -> Decimal | None:
+    """How many of the ceiling's units one billed unit holds, or None when the units cannot
+    be compared."""
+    unit = drug.unit.lower().split()
+    if len(unit) == 2 and unit[0] == "1" and unit[1] in _COUNTED:
+        return Decimal(1)
+    if unit != ["1", "ml"]:
+        return None
+    written = _amounts(line.description)
+    if "ml" in written:
+        return written["ml"]
+    concentration = _PER_ML.search(drug.dosage_form)
+    if concentration and "mg" in written:
+        mg = Decimal(concentration.group(1))
+        per_ml = Decimal(concentration.group(3) or 1)
+        return written["mg"] * per_ml / mg
+    return None
+
+
+def drug_price(facts: Facts, product: ProductConfig) -> RuleResult:
+    if facts.line is None or facts.drug is None:
+        return _missing("DRUG-PRICE", *_absent(line=facts.line, drug=facts.drug))
+    line, drug = facts.line, facts.drug
+    units = _units_billed(line, drug)
+    qty = line.qty if line.qty and line.qty > 0 else Decimal(1)
+    unit_price = line.rate if line.rate is not None else line.claimed / qty
+    gst = product.drug_price.gst_percent
+    if units is None:
+        reason = (
+            f"cannot compare {line.description!r} with the NPPA ceiling per {drug.unit} "
+            f"({drug.dosage_form}); GST not applied"
+        )
+        return RuleResult(rule_id="DRUG-PRICE", passed=True, reason=reason)
+    ceiling = money(drug.ceiling_price * units * (HUNDRED + gst) / HUNDRED)
+    basis = (
+        f"NPPA ceiling {drug.ceiling_price} per {drug.unit} ({drug.medicine} {drug.dosage_form})"
+        f" x {units.normalize():f}, plus {gst.normalize():f}% GST = {_rupees(ceiling)}"
+    )
+    over = money(unit_price) > ceiling
+    state = "above" if over else "within"
+    reason = f"{_rupees(unit_price)} a unit is {state} the {basis}"
+    return RuleResult(rule_id="DRUG-PRICE", passed=not over, reason=reason)
+
+
+# --- Spreading a claim-level amount over lines ------------------------------------------
+
+
+def allocate(amount: Decimal, weights: list[Decimal]) -> list[Decimal]:
+    total = sum((w for w in weights if w > 0), ZERO)
+    if total <= 0:
+        return [ZERO for _ in weights]
+    last = max(i for i, w in enumerate(weights) if w > 0)
+    shares = [money(amount * w / total) if w > 0 else ZERO for w in weights]
+    shares[last] = money(amount - sum((s for i, s in enumerate(shares) if i != last), ZERO))
+    return shares
+
+
 # --- R21: co-pay, applied last ------------------------------------------------------------
 
 
@@ -361,8 +848,22 @@ RULES: dict[str, Rule] = {
     "R2": r2_in_force,
     "R3": r3_member_match,
     "R5": r5_initial_wait,
+    "R6": r6_pre_existing,
+    "R7": r7_specific_waiting,
+    "R9": r9_exclusions,
     "R10": r10_sum_insured,
     "R11": r11_non_payable,
+    "R12": r12_unclear_line,
     "R13": r13_room_cap,
+    "R14": r14_icu_cap,
+    "R16": r16_cataract,
+    "R17": r17_modern_treatments,
+    "R18": r18_pre_post,
+    "R19": r19_ambulance,
+    "R20": r20_package_cap,
     "R21": r21_co_pay,
+    "R23": r23_package_inclusions,
+    "R24": r24_non_package_discount,
+    "R26": r26_preauth,
+    "DRUG-PRICE": drug_price,
 }

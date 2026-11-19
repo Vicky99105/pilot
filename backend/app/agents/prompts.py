@@ -8,12 +8,12 @@ line of defence."""
 
 import json
 from collections.abc import Sequence
-from typing import Annotated, Any, Literal, TypeVar
+from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field, WithJsonSchema, create_model
+from pydantic import BaseModel
 
-from app.agents.medical_case import CaseFile
+from app.agents.medical_case import CaseFile, stay_days, stay_limit, stg_key, stg_refs
 from app.services.adjudication.contract import Decision
 from app.services.knowledge_base.contract import (
     IcdTabularEntry,
@@ -23,43 +23,21 @@ from app.services.knowledge_base.contract import (
 )
 from app.services.medical_review.contract import CLAUSE_PREFIX, ICD_PREFIX, Citation, Severity
 from app.services.model_gateway.contract import Message
+from app.shared.closed_schema import closed_schema, list_of, one_of
 from app.shared.types import PageRef
 
 REWRITE_PURPOSE = "medical_rewrite_terms"
 CHOOSE_PURPOSE = "medical_choose_codes"
 PCS_PURPOSE = "medical_pcs_step"
+FINDINGS_PURPOSE = "medical_findings"
+REREAD_PURPOSE = "medical_ped_reread"
 NO_PROCEDURE = "none: no procedure was performed"
 DECIDE_PURPOSE = "adjudication_decide"
 PAGE_PREFIX = "page:"
 
-ModelT = TypeVar("ModelT", bound=BaseModel)
-
 
 def _json(value: Any) -> str:
     return json.dumps(value, indent=1, default=str)
-
-
-# --- Closed answer spaces --------------------------------------------------------------------
-
-
-def one_of(values: Sequence[str | int]) -> Any:
-    """A type that accepts exactly these values. Its JSON schema is always an enum (pydantic
-    would write a single value as const)."""
-    kind = "integer" if all(isinstance(v, int) for v in values) else "string"
-    allowed = Literal.__getitem__(tuple(values))  # Literal["a", "b"], built at run time
-    return Annotated[allowed, WithJsonSchema({"type": kind, "enum": list(values)})]
-
-
-def list_of(values: Sequence[str | int]) -> Any:
-    """A list of the given values; a list that must stay empty when there are none."""
-    if not values:
-        return Annotated[list[str], Field(max_length=0)]
-    return list.__class_getitem__(one_of(values))  # list[<the enum>], built at run time
-
-
-def closed_schema(base: type[ModelT], name: str, **fields: Any) -> type[ModelT]:
-    """A subclass of base whose named fields are replaced, for one call."""
-    return create_model(name, __base__=base, **fields)
 
 
 # --- Medical review ------------------------------------------------------------------------
@@ -78,12 +56,13 @@ def to_citation(key: str) -> Citation:
     return Citation(ref=key)
 
 
-def citation_keys(case: CaseFile, candidates: list[IcdTabularEntry]) -> list[str]:
-    """Everything the choose call may cite: the claim's pages, the policy clauses and the
-    codes the lookups returned."""
+def citation_keys(case: CaseFile, codes: list[str]) -> list[str]:
+    """Everything a medical call may cite: the claim's pages, the policy clauses, the codes
+    looked up or verified, and the sections of the package's guideline."""
     keys = [page_key(p) for p in case.known_pages]
     keys += [f"{CLAUSE_PREFIX}{ref}" for ref in case.clause_refs]
-    keys += [f"{ICD_PREFIX}{c.code.code}" for c in candidates]
+    keys += [f"{ICD_PREFIX}{code}" for code in codes]
+    keys += stg_refs(case)
     return list(dict.fromkeys(keys))
 
 
@@ -120,44 +99,59 @@ class StayReason(BaseModel):
 
 
 class DocumentRequestReply(BaseModel):
-    doc_type: str
+    document: str  # one of the case's document options
     text: str  # the request as the claimant reads it
 
 
 class ChooseCodesReply(BaseModel):
     codes: list[CodeChoice]
+
+
+class FindingsReply(BaseModel):
     findings: list[FindingReply] = []
     query_items: list[DocumentRequestReply] = []
     long_stay_reason: StayReason | None = None
 
 
 def choose_schema(case: CaseFile, candidates: list[IcdTabularEntry]) -> type[ChooseCodesReply]:
-    """The choose reply for this case: codes are the billable codes the lookups returned,
-    citations are the case's pages, clauses and looked-up codes, and query items name only
-    the document types the claim may still be asked for."""
+    """The choose reply for this case: codes are the billable codes the lookups returned;
+    citations are the case's pages, clauses and looked-up codes."""
     billable = [c.code.code for c in candidates if c.billable]
-    cites = list_of(citation_keys(case, candidates))
+    cites = list_of(citation_keys(case, [c.code.code for c in candidates]))
     code = closed_schema(
         CodeChoice,
         "CodeChoiceClosed",
         code=(one_of(billable), ...) if billable else (str, ...),
         citations=(cites, []),
     )
-    finding = closed_schema(FindingReply, "FindingClosed", citations=(cites, []))
-    stay = closed_schema(StayReason, "StayReasonClosed", citations=(cites, []))
-    requestable = [d.value for d in case.requestable]
-    request = closed_schema(
-        DocumentRequestReply,
-        "DocumentRequestClosed",
-        doc_type=(one_of(requestable), ...) if requestable else (str, ...),
-    )
     return closed_schema(
         ChooseCodesReply,
         "ChooseCodesReply",
         codes=(list[code] if billable else list_of([]), ...),  # type: ignore[valid-type]
+    )
+
+
+def findings_schema(case: CaseFile) -> type[FindingsReply]:
+    """The findings reply for this case: citations are the case's pages, clauses, verified
+    codes and guideline sections; query items name only the case's document options; a
+    long-stay reason only when the stay is over its norm."""
+    cites = list_of(citation_keys(case, case.verified_codes))
+    finding = closed_schema(FindingReply, "FindingClosed", citations=(cites, []))
+    labels = [d.label for d in case.documents]
+    request = closed_schema(
+        DocumentRequestReply,
+        "DocumentRequestClosed",
+        document=(one_of(labels), ...) if labels else (str, ...),
+    )
+    days, (limit, _) = stay_days(case), stay_limit(case)
+    long_stay = days is not None and days > limit
+    stay = closed_schema(StayReason, "StayReasonClosed", citations=(cites, []))
+    return closed_schema(
+        FindingsReply,
+        "FindingsReply",
         findings=(list[finding], []),  # type: ignore[valid-type]
-        query_items=(list[request] if requestable else list_of([]), []),  # type: ignore[valid-type]
-        long_stay_reason=(stay | None, None),
+        query_items=(list[request] if labels else list_of([]), []),  # type: ignore[valid-type]
+        long_stay_reason=(stay | None, None) if long_stay else (None, None),
     )
 
 
@@ -213,12 +207,9 @@ def choose_messages(
         Message(
             role="system",
             content=(
-                "You are a medical reviewer for an Indian health insurer. Code each diagnosis "
-                "in ICD-10-CM from the candidates, which came from index and tabular lookups. "
-                "List findings a medical officer should see (severity: info, query or adverse), "
-                "each citing its evidence. List as query items the documents the case needs "
-                "and does not contain. If the stay is longer than 7 days, give "
-                "long_stay_reason when a page states one."
+                "You are a medical coder for an Indian health insurer. Code each diagnosis "
+                "in ICD-10-CM from the candidates, which came from index and tabular lookups, "
+                "citing the pages that support each code."
             ),
         ),
         Message(
@@ -237,6 +228,82 @@ def choose_messages(
             )
         )
     return messages
+
+
+def findings_messages(case: CaseFile, feedback: list[str]) -> list[Message]:
+    days, (limit, which) = stay_days(case), stay_limit(case)
+    view = {
+        **_case_view(case),
+        "verified_codes": case.verified_codes,
+        "guideline": {
+            "code": case.guideline_code,
+            "sections": {
+                stg_key(case.guideline_code, section): items
+                for section, items in case.guideline.items()
+            }
+            if case.guideline_code
+            else {},
+        },
+        "stay": {"days": days, "norm_days": limit, "norm": which},
+        "documents_that_may_be_requested": [
+            {"document": d.label, "mandatory_in_guideline": d.from_guideline}
+            for d in case.documents
+        ],
+    }
+    messages = [
+        Message(
+            role="system",
+            content=(
+                "You are a medical reviewer for an Indian health insurer. Check the case "
+                "against the package's treatment guideline. List findings a medical officer "
+                "should see (severity: info, query or adverse), each citing its evidence. List "
+                "as query items the documents the case needs. Give long_stay_reason when a page "
+                "states why the stay was longer than its norm."
+            ),
+        ),
+        Message(role="user", content=f"Case:\n{_json(view)}"),
+    ]
+    if feedback:
+        messages.append(
+            Message(
+                role="user",
+                content=(
+                    "Your previous answer was rejected for these reasons. Answer again in full, "
+                    "fixing them; anything still wrong will be dropped:\n- " + "\n- ".join(feedback)
+                ),
+            )
+        )
+    return messages
+
+
+# --- Medical review: pre-existing disease re-read -----------------------------------------
+
+
+class OnsetStatement(BaseModel):
+    condition: str  # as written
+    onset: str  # the onset or duration as written, e.g. "since 5 years", "in 2019"
+    page: str  # one of the page keys read
+
+
+class RereadReply(BaseModel):
+    statements: list[OnsetStatement] = []
+
+
+def reread_schema(pages: list[PageRef]) -> type[RereadReply]:
+    statement = closed_schema(
+        OnsetStatement, "OnsetStatementClosed", page=(one_of([page_key(p) for p in pages]), ...)
+    )
+    return closed_schema(RereadReply, "RereadReply", statements=(list[statement], []))  # type: ignore[valid-type]
+
+
+def reread_prompt(pages: list[PageRef]) -> str:
+    keys = ", ".join(f"image {i}: {page_key(p)}" for i, p in enumerate(pages, start=1))
+    return (
+        "These pages are from a hospital record. List each condition the patient's history "
+        "says they had before this admission, with its onset or duration exactly as written "
+        "(for example 'since 5 years' or 'diagnosed in 2019'), and the page it is on. "
+        f"The pages, in order: {keys}."
+    )
 
 
 # --- Medical review: ICD-10-PCS builder ---------------------------------------------------
@@ -352,9 +419,10 @@ def decide_messages(
             content=(
                 "You write the reasons for a claim decision for an approver. The decision is "
                 "set by the rules in code. Give reasons, each tied to a clause_ref, rule_id or "
-                "bill line_id, and one reason for every bill line with a deduction. A reject "
-                "or partial cites at least one clause. For a query, list the documents to ask "
-                "for."
+                "bill line_id, and one reason for every bill line with a deduction. One reason "
+                "with the rule_id and no line_id covers every line a claim-level rule (R16, "
+                "R17, R19, R20) spread its deduction over. A reject or partial cites at least "
+                "one clause. For a query, list the documents to ask for."
             ),
         ),
         Message(

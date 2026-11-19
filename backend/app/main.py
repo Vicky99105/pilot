@@ -135,8 +135,10 @@ def create_app(
             ),
             digitisation=DefaultDigitisationService(sessions, files, gateway),
             registration=DefaultRegistrationService(sessions, policies, money, rules),
-            bill_review=DefaultBillReviewService(sessions, rules),
-            medical_review=DefaultMedicalReviewService(sessions, gateway, kb, rules, policies),
+            bill_review=DefaultBillReviewService(sessions, rules, gateway, kb),
+            medical_review=DefaultMedicalReviewService(
+                sessions, gateway, kb, rules, policies, files
+            ),
             risk=DefaultRiskService(sessions, gateway, policies),
             adjudication=DefaultAdjudicationService(sessions, gateway, kb),
             decision=DefaultDecisionService(

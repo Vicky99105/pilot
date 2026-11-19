@@ -2,9 +2,12 @@
 
 Time-skipping Temporal, SQLite, an in-memory file store, a scripted model gateway, fake
 core policy and money services, and a fake notification sender. The claim is a member's
-reimbursement with a room-rent breach and a missing payment receipt: the breach is deducted
-under R13, a query is raised and answered by a reply upload, the partial is approved and
-upheld by the CRC, a letter is issued, finance releases the payment, and the claim closes.
+reimbursement for a laparoscopic appendicectomy at Sunrise (CGHS NABH, X tier) with a missing
+payment receipt. Medical coding builds 0DTJ4ZZ; bill review maps it to package AG095 and
+caps the bill at the Rs 33,000 package (R20); the full medical review reads the SG017B
+guideline; a query is raised and answered by a reply upload, which re-runs coding and bill
+review; the partial is approved and upheld by the CRC, a letter is issued, finance releases
+the payment, and the claim closes.
 """
 
 import asyncio
@@ -13,6 +16,7 @@ import re
 from collections.abc import AsyncIterator, Callable
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -27,6 +31,7 @@ from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.database.seed_icd_fixture import seed_icd_fixture
 from app.integrations.core.contract import MemberPolicy
+from app.knowledge.loaders.icd10pcs import load_icd10pcs
 from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
 from app.services.classification.service import DefaultClassificationService
@@ -63,15 +68,18 @@ from tests.fakes.file_store import FakeFileStore
 from tests.fakes.model_gateway import FakeModelGateway
 from tests.fakes.notifications import FakeNotificationService
 from tests.fakes.tasks import FakeTaskService
+from tests.knowledge import sources
 from tests.services.claim_builders import DIAGNOSIS
+from tests.services.reference_rows import add_reference_rows
 from tests.services.test_digitisation import CHEQUE, PART_A, line, section, v
 from tests.services.test_medical_review import APPENDIX_ITEM
+from tests.services.test_medical_review_coding import LAPAROSCOPIC_APPENDICECTOMY
 from tests.services.test_registration import asha_policy
 
 TASK_QUEUE = "test-claims-end-to-end"
 D = Decimal
 
-# Room Rs 6,000 a day for 3 days against the Rs 5,000 cap (2% of Rs 3 lakh, capped).
+# Rs 42,250, every line a head the package covers.
 BILL: dict[str, Any] = {
     "bill_number": v("SMH/IP/2026/1190"),
     "patient_name": v("Asha Verma"),
@@ -129,8 +137,6 @@ CHOOSE = {
             "rationale": "Perforation with localised peritonitis on CT",
         }
     ],
-    "findings": [],
-    "query_items": [],
 }
 QUERY_DRAFT = {
     "decision": "query",
@@ -141,12 +147,13 @@ QUERY_DRAFT = {
 PARTIAL_DRAFT = {
     "decision": "partial",
     "reasons": [
-        {"text": "Room above the cap", "clause_ref": "ROOM-CAP", "rule_id": "R13", "line_id": 1},
-        {"text": "Fees in proportion", "clause_ref": "PROP-DED", "rule_id": "R13", "line_id": 2},
+        {"text": "Paid at the package rate", "clause_ref": "AGREED-TARIFF", "rule_id": "R20",
+         "line_id": n}
+        for n in (1, 2, 3, 4)
     ],
-    "summary": "Room cap breached; proportionate deduction applied.",
-}
-PAYABLE = D("36337.50")  # admissible Rs 38,250 less the 5% co-pay
+    "summary": "Paid at the agreed AG095 package rate.",
+}  # fmt: skip
+PAYABLE = D("31350.00")  # the Rs 33,000 package less the 5% co-pay
 
 
 class Gateway(FakeModelGateway):
@@ -178,9 +185,12 @@ def _gateway() -> Gateway:
             "extract_discharge_summary": [DISCHARGE],
             "extract_final_bill": [BILL],
             "extract_cancelled_cheque": [CHEQUE],
-            # Medical review runs again after the reply.
+            # Coding, bill review and the full review run again after the reply.
             "medical_rewrite_terms": [REWRITE, REWRITE],
+            "medical_pcs_step": [*LAPAROSCOPIC_APPENDICECTOMY] * 2,
             "medical_choose_codes": [CHOOSE, CHOOSE],
+            "bill_package_choice": [{"procedure_1": "AG095"}] * 2,
+            "medical_findings": [{"findings": [], "query_items": []}] * 2,
             "adjudication_decide": [QUERY_DRAFT, PARTIAL_DRAFT],
         }
     )
@@ -227,8 +237,10 @@ class Harness:
             ),
             digitisation=DefaultDigitisationService(sessions, self.files, self.gateway),
             registration=DefaultRegistrationService(sessions, policies, self.money, rules),
-            bill_review=DefaultBillReviewService(sessions, rules),
-            medical_review=DefaultMedicalReviewService(sessions, self.gateway, kb, rules, policies),
+            bill_review=DefaultBillReviewService(sessions, rules, self.gateway, kb),
+            medical_review=DefaultMedicalReviewService(
+                sessions, self.gateway, kb, rules, policies, self.files
+            ),
             risk=DefaultRiskService(sessions, self.gateway, policies),
             adjudication=DefaultAdjudicationService(sessions, self.gateway, kb),
             decision=DefaultDecisionService(sessions, config / "authority_matrix.yaml"),
@@ -281,9 +293,13 @@ class Harness:
 
 
 @pytest.fixture
-async def harness(sessions: async_sessionmaker[AsyncSession]) -> AsyncIterator[Harness]:
+async def harness(
+    sessions: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> AsyncIterator[Harness]:
     await seed_claims_db(sessions)
     await seed_icd_fixture(sessions)
+    await load_icd10pcs(sessions, sources.write_sources(tmp_path / "icd-2027"))
+    await add_reference_rows(sessions)
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
@@ -314,17 +330,27 @@ async def test_the_tracer_claim_runs_from_intake_to_closed(harness: Harness) -> 
         ],
     )
 
+    # The reply resumes at medical coding, so the bill processor confirms the sheet again.
+    await h.complete("confirm_deductions", OPS_USER_ID, {"action": "confirm"})
     await h.complete("approve", DOCTOR_USER_ID, {"action": "approve"})
     await h.complete("crc", DOCTOR_USER_ID, {"action": "uphold"})
     await h.complete("release_payment", FINANCE_USER_ID, {"action": "release"})
     result = await h.env.client.get_workflow_handle_for(ClaimWorkflow.run, str(claim_id)).result()
 
-    # The breach is deducted under R13 with its clause.
+    # Coding built the procedure; bill review mapped it to AG095 and capped the bill at it.
+    coding = await h.records.latest(claim_id, Stage.MEDICAL_CODING)
+    assert coding is not None
+    assert [p["code"]["code"] for p in coding.payload["procedure_codes"]] == ["0DTJ4ZZ"]
     sheet = await h.records.latest(claim_id, Stage.BILL_REVIEW)
     assert sheet is not None
-    room = sheet.payload["lines"][0]
-    assert (room["rule_id"], room["clause_ref"], room["deducted"]) == ("R13", "ROOM-CAP", "3000.00")
+    assert [p["package_code"] for p in sheet.payload["package"]["packages"]] == ["AG095"]
+    assert {ln["rule_id"] for ln in sheet.payload["lines"]} == {"R20"}
+    assert sheet.payload["admissible_total"] == "33000.00"
     assert sheet.payload["payable"] == str(PAYABLE)
+    # The full review read the package's guideline through our crosswalk.
+    medical = await h.records.latest(claim_id, Stage.MEDICAL_REVIEW)
+    assert medical is not None
+    assert medical.payload["guideline"]["guideline_code"] == "SG017B"
 
     # The query was raised once and answered by the reply.
     answered = await h.queries.get(query.query_id)
@@ -337,7 +363,7 @@ async def test_the_tracer_claim_runs_from_intake_to_closed(harness: Harness) -> 
     assert [ltr["kind"] for ltr in letters] == ["query", "partial"]
     partial = letters[-1]
     assert (partial["amount"], partial["plain_language"]) == (str(PAYABLE), True)
-    assert [row["line_id"] for row in partial["deductions"]] == [1, 2, None]
+    assert [row["line_id"] for row in partial["deductions"]] == [1, 2, 3, 4, None]
     assert await h.files.get(partial["pdf_key"])
     assert [n.to for n in h.notifications.sent] == ["asha.verma@member.example"] * 2
 
@@ -359,8 +385,8 @@ async def test_the_tracer_claim_runs_from_intake_to_closed(harness: Harness) -> 
         for e in await h.monitoring.events(claim_id)
         if e.action == "checkpoint_opened"
     ]
-    assert opened == ["confirm_registration", "confirm_deductions", "approve", "crc",
-                      "release_payment"]  # fmt: skip
+    assert opened == ["confirm_registration", "confirm_deductions", "confirm_deductions",
+                      "approve", "crc", "release_payment"]  # fmt: skip
 
 
 EXPECTED_EVENTS = [
@@ -370,6 +396,7 @@ EXPECTED_EVENTS = [
     ("registration", "stage_completed"),
     ("registration", "checkpoint_opened"),
     ("registration", "checkpoint_completed"),
+    ("medical_coding", "stage_completed"),
     ("bill_review", "stage_completed"),
     ("bill_review", "checkpoint_opened"),
     ("bill_review", "checkpoint_completed"),
@@ -380,6 +407,10 @@ EXPECTED_EVENTS = [
     ("query", "query_answered"),
     ("classification", "stage_completed"),  # the reply's pages
     ("digitisation", "stage_completed"),  # merged into a new record version
+    ("medical_coding", "stage_completed"),  # resumed here: the reply may change the codes
+    ("bill_review", "stage_completed"),
+    ("bill_review", "checkpoint_opened"),
+    ("bill_review", "checkpoint_completed"),
     ("medical_review", "stage_completed"),
     ("risk", "stage_completed"),
     ("adjudication", "stage_completed"),  # draft: partial

@@ -1,7 +1,13 @@
-"""Contract for medical review: verify the diagnosis codes against the knowledge base, check
-the clinical facts, and re-run the eligibility rule the verified facts can change (R5).
+"""Contract for medical review, in two steps around bill review:
 
-These guarantees hold for every MedicalFindings:
+1. code(): verify the diagnosis codes against the knowledge base and build the procedure
+   codes. Runs before bill review, which maps the verified procedures to a package.
+2. review(): the full review against the package bill review mapped: the package's
+   guideline and length-of-stay norm, a pre-existing disease re-read of the cited history
+   pages, findings and query items, and the eligibility rules the verified codes can change
+   (R5, R6, R7 and R9).
+
+These guarantees hold for every MedicalCoding and MedicalFindings:
 - Every verified code was returned by a knowledge-base lookup during the run that produced
   it, and names that lookup.
 - Every procedure code was built one character at a time, each character chosen from the
@@ -9,8 +15,9 @@ These guarantees hold for every MedicalFindings:
   pcs_validate. Each step names its lookup.
 - Every finding cites a page of the claim or a clause or ICD reference. Uncited items go back
   to the model once, then are dropped with the reason recorded.
-- Every query item names one of MEDICAL_DOCUMENTS that the claim does not hold and the
-  claimant has not answered. Free-text concerns are findings, never query items.
+- Every query item names a document the claim does not hold and the claimant has not
+  answered: a mandatory document of the package's guideline, or one of MEDICAL_DOCUMENTS.
+  Free-text concerns are findings, never query items.
 
 Callers import this module only.
 """
@@ -28,6 +35,7 @@ FindingKind = Literal[
     "coding", "hospital_codes", "length_of_stay", "pre_existing", "eligibility", "clinical"
 ]
 LookupTool = Literal["search_icd_index", "get_icd_tabular", "pcs_options", "pcs_validate"]
+PED_CLAUSE = "Excl01"
 
 # The documents medical review may ask the claimant for. A query item also excludes any of
 # these the claim already holds or the claimant already answered.
@@ -38,14 +46,16 @@ MEDICAL_DOCUMENTS = (
     DocType.PRESCRIPTION,
 )
 
-# Citation references other than pages: "clause:<clause_ref>" or "icd:<code>".
+# Citation references other than pages: "clause:<clause_ref>", "icd:<code>", or
+# "stg:<package_code>:<section>" for a section of the package's treatment guideline.
 CLAUSE_PREFIX = "clause:"
 ICD_PREFIX = "icd:"
+STG_PREFIX = "stg:"
 
 
 class Citation(BaseModel):
     page: PageRef | None = None  # a page of the claim's documents
-    ref: str | None = None  # "clause:Excl01" or "icd:K35.32"
+    ref: str | None = None  # "clause:Excl01", "icd:K35.32" or "stg:SG017B:claim_documents"
 
 
 class LookupCall(BaseModel):
@@ -105,10 +115,37 @@ class DocumentRequest(BaseModel):
     text: str  # the request as the claimant reads it
 
 
+class MedicalCoding(BaseModel):
+    """Step 1: the verified diagnosis and procedure codes, before bill review."""
+
+    claim_id: UUID
+    digitisation_version: int  # the ClaimRecord version coded
+    registration_version: int  # the RegistrationResult version used
+    verified_codes: list[VerifiedCode]
+    procedure_codes: list[VerifiedProcedure] = []
+    lookups: list[LookupCall]  # every tool call of the run, in order
+    dropped: list[DroppedItem]
+    revisions: int  # how many times the model was sent back (at most 1)
+
+
+class GuidelineUsed(BaseModel):
+    """The treatment guideline the review read, and the norms it compared against."""
+
+    package_code: str  # the package bill review mapped
+    guideline_code: str | None  # the HBP 2022 code whose guideline applies, if any
+    sections: list[str] = []  # the guideline sections read
+    mandatory_missing: list[str] = []  # mandatory claim documents the claim does not hold
+    los_norm_days: int | None = None
+    los_norm_source: str | None = None  # e.g. "PMJAY SG017B"
+
+
 class MedicalFindings(BaseModel):
     claim_id: UUID
     digitisation_version: int  # the ClaimRecord version reviewed
     registration_version: int  # the RegistrationResult version used
+    coding_version: int = 0  # the MedicalCoding version the codes came from
+    bill_review_version: int = 0  # the DeductionSheet version whose package was used
+    guideline: GuidelineUsed | None = None
     verified_codes: list[VerifiedCode]
     procedure_codes: list[VerifiedProcedure] = []
     findings: list[Finding]
@@ -121,7 +158,8 @@ class MedicalFindings(BaseModel):
 
 
 class NotReadyForMedicalReview(PermanentError):
-    """The claim has no extracted record, no registration or no policy yet."""
+    """The claim has no extracted record, no registration or no policy yet; or, for the
+    review, no coding or no deduction sheet yet."""
 
 
 class InvalidOverrule(PermanentError):
@@ -129,8 +167,13 @@ class InvalidOverrule(PermanentError):
 
 
 class MedicalReviewService(Protocol):
+    async def code(self, claim_id: UUID) -> MedicalCoding:
+        """Step 1. Idempotent per (ClaimRecord version, RegistrationResult version)."""
+        ...
+
     async def review(self, claim_id: UUID) -> MedicalFindings:
-        """Idempotent per (ClaimRecord version, RegistrationResult version)."""
+        """Step 2, after bill review. Idempotent per (MedicalCoding version, DeductionSheet
+        version)."""
         ...
 
     async def overrule(

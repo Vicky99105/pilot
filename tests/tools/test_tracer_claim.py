@@ -52,7 +52,7 @@ def test_bill_lines_sections_and_totals_add_up(bundle: tuple[Path, dict[str, Any
     assert [ln["line_id"] for ln in bill["lines"]] == list(range(1, len(bill["lines"]) + 1))
 
 
-def test_deductions_are_consistent_and_include_the_breach(
+def test_deductions_are_consistent_and_follow_the_package(
     bundle: tuple[Path, dict[str, Any]],
 ) -> None:
     _, truth = bundle
@@ -63,22 +63,33 @@ def test_deductions_are_consistent_and_include_the_breach(
     assert D(sheet["admissible_total"]) == admissible
     assert D(sheet["co_pay"]) == (admissible * D("0.05")).quantize(D("0.01"))
     assert D(sheet["payable"]) == admissible - D(sheet["co_pay"])
-    assert D(sheet["room_rate_per_day"]) > D(sheet["room_cap_per_day"]) == D("5000.00")
+    assert sheet["package"]["package_code"] == "AG095"
 
     by_rule = defaultdict(set)
     for line in sheet["deductions"]:
         by_rule[(line["rule_id"], line["clause_ref"])].add(line["head"])
+    # Every head on the bill is one a package covers: R20 caps them all at the package rate.
     assert by_rule == {
-        ("R13", "ROOM-CAP"): {"room"},
-        ("R13", "PROP-DED"): {"nursing", "ot", "professional_fees"},
+        ("R20", "AGREED-TARIFF"): {"room", "nursing", "ot", "professional_fees", "pharmacy",
+                                   "consumables", "diagnostics"},
         ("R11", "ANNEX-I"): {"consumables"},
-    }
+    }  # fmt: skip
     [r11] = [ln for ln in sheet["deductions"] if ln["rule_id"] == "R11"]
     assert r11["description"] == gen.NON_PAYABLE_ITEM and r11["deducted"] == r11["claimed"]
-    # Pharmacy and diagnostics are never reduced in proportion.
-    untouched = {ln["head"] for ln in sheet["lines"] if D(ln["deducted"]) == 0}
-    assert {"pharmacy", "diagnostics"} <= untouched
+    # What R11 left is capped at the package rate exactly.
+    assert admissible == D(sheet["package"]["rate"])
+    assert sheet["rules_failed"] == ["R11", "R20"]
     assert truth["expected"]["approver_band"] == "approver"  # payable within Rs 1 lakh
+
+
+def test_drug_findings_compare_against_the_ceiling_plus_gst(
+    bundle: tuple[Path, dict[str, Any]],
+) -> None:
+    _, truth = bundle
+    found = {f["description"] for f in truth["drug_price_findings"]}
+    # Ceftriaxone Rs 68.50 is within 63.88 plus 12% GST; metronidazole (per mL) and
+    # tramadol (per mL at 50 mg/mL) are above theirs.
+    assert found == {"Inj. Metronidazole 100 ml", "Inj. Tramadol 50 mg"}
 
 
 def test_merged_pdf_has_every_part_and_no_receipt(bundle: tuple[Path, dict[str, Any]]) -> None:

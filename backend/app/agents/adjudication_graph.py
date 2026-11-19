@@ -37,6 +37,8 @@ from app.shared.types import DocType, RuleResult, Stage
 
 MAX_REVISIONS = 1
 ZERO = Decimal("0.00")
+# Claim-level rules whose one deduction bill review spreads over the lines in proportion.
+SPREAD_RULES = {"R16", "R17", "R19", "R20"}
 PAID: tuple[Decision, ...] = ("approve", "partial")
 
 
@@ -332,8 +334,12 @@ def _self_check(inputs: AdjudicationInputs, reply: DecisionReply) -> list[str]:
             errors.append(f"reason {i} cites bill line {reason.line_id}, which is not on the sheet")
     if reply.decision == "partial":
         explained = {r.line_id for r in reply.reasons if r.line_id is not None}
+        # A claim-level rule spreads one deduction over many lines: one reason naming the
+        # rule explains every line it took the most from.
+        spread = {r.rule_id for r in reply.reasons if r.line_id is None and r.rule_id}
+        spread &= SPREAD_RULES
         for line in inputs.sheet.lines:
-            if line.deducted > 0 and line.line_id not in explained:
+            if line.deducted > 0 and line.line_id not in explained and line.rule_id not in spread:
                 errors.append(f"bill line {line.line_id} has a deduction but no reason")
     if reply.decision in ("partial", "reject") and not any(r.clause_ref for r in reply.reasons):
         errors.append(f"a {reply.decision} must cite at least one clause")

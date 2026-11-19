@@ -14,14 +14,18 @@ The claim:
 - Hospital: Sunrise Multispeciality Hospital, New Delhi, a seeded network hospital with
   differential billing, so a room breach also reduces nursing, OT and professional fees.
 - Treatment: acute appendicitis, laparoscopic appendicectomy, 4 days in a deluxe room at
-  Rs 7,500 a day. R13 deducts the room excess and the proportionate share of the linked heads.
-  One consumable line, "Gloves", is on the seeded non-payable list I, so R11 deducts it.
+  Rs 7,500 a day. Sunrise's agreement prices packages at CGHS 2025 rates (NABH, X tier,
+  semi-private ward), so the procedure maps to CGHS AG095, Laparoscopic Appendectomy, at
+  Rs 33,000. One consumable line, "Gloves", is on the non-payable list I, so R11 deducts it;
+  R20 then caps every other line (all of them heads a package covers) at the package rate,
+  spread in proportion. R13 does not apply to lines a package prices.
 - Bundle: claim form Part A (typed), claim form Part B (hospital), discharge summary,
   operation theatre notes, itemised final bill, cancelled cheque. The payment receipt is left
   out on purpose, so a query is raised; it is written separately as the query reply.
 
-The ground truth's deductions come from the real rules engine (R11, R13, R21) run on the
-ground-truth bill lines, so every expected amount is exact. All data is synthetic.
+The ground truth's deductions come from the real rules engine run on the ground-truth bill
+lines in bill review's order (R11, R12, R18, R23, R20, R24, R13, R14, R19, R16, R17, R26,
+then R21), so every expected amount is exact. All data is synthetic.
 """
 
 import argparse
@@ -49,10 +53,14 @@ from reportlab.pdfgen.canvas import Canvas  # noqa: E402
 
 from app.database.seed_knowledge import NON_PAYABLE_ITEMS  # noqa: E402
 from app.services.rules.contract import (  # noqa: E402
+    DrugFacts,
     Facts,
     Head,
     LineFacts,
+    MappedPackage,
     NonPayableItem,
+    NonPayableJudgement,
+    PackageFacts,
     RoomFacts,
     RulesEngine,
 )
@@ -100,6 +108,40 @@ HISTORY_DURATION = "since 2 days"
 STAY_DAYS = 4
 ROOM_RATE = D("7500.00")
 NON_PAYABLE_ITEM = "Gloves"  # seeded non-payable list I, item 11
+
+# The package the procedure maps to under Sunrise's agreement (CGHS, NABH, X tier,
+# semi-private ward): CGHS 2025 Annexure I, AG095. tests/pg checks the rate against the
+# loaded rate list, and the scheme, accreditation and ward against the seeded agreement.
+PACKAGE = MappedPackage(
+    scheme="CGHS", package_code="AG095", name="Laparoscopic Appendectomy", rate=D("33000.00")
+)
+NON_PACKAGE_DISCOUNT = D("10.00")  # Sunrise's agreement; no line is outside the package
+PCS_CODE = "0DTJ4ZZ"  # resection of the appendix, percutaneous endoscopic
+GUIDELINE_CODE = "SG017B"  # HBP 2022 Lap- Appendicectomy, through our crosswalk
+LOS_NORM_DAYS = 3  # SG017B, and MEDISEP MS1436
+# R12's expected reading of lines that are near a non-payable list item without matching
+# one. Nursing is paid under this product (room, boarding and nursing), so it is payable.
+# With the fixture lists no tracer line is unclear; with the loaded lists only nursing is.
+R12_READINGS: dict[str, None] = {"Nursing Care Charges": None}
+# NPPA ceiling prices (S.O. 1575(E), w.e.f. 01.04.2026) for the pharmacy lines that have one
+# formulation that fits: (medicine, dosage form, unit, ceiling before GST). tests/pg checks
+# each against the loaded table.
+DRUG_CEILINGS: dict[str, DrugFacts] = {
+    "Inj. Ceftriaxone 1 g": DrugFacts(medicine="Ceftriaxone",
+                                      dosage_form="Powder for Injection 1000mg", unit="1 Vial",
+                                      ceiling_price=D("63.88")),
+    "Inj. Metronidazole 100 ml": DrugFacts(medicine="Metronidazole",
+                                           dosage_form="Injection 500mg/100mL", unit="1 ML",
+                                           ceiling_price=D("0.21")),
+    "Inj. Pantoprazole 40 mg": DrugFacts(medicine="Pantoprazole", dosage_form="Injection 40mg",
+                                         unit="1 Vial", ceiling_price=D("51.66")),
+    "Inj. Tramadol 50 mg": DrugFacts(medicine="Tramadol",
+                                     dosage_form="Injection 50mg/mL (upto 2ml pack)",
+                                     unit="1 ML", ceiling_price=D("12.07")),
+    "Tab. Cefuroxime 500 mg (discharge)": DrugFacts(medicine="Cefuroxime",
+                                                     dosage_form="Tablet 500mg",
+                                                     unit="1 Tablet", ceiling_price=D("52.67")),
+}  # fmt: skip
 
 
 # --- Bill lines -------------------------------------------------------------------------------
@@ -317,16 +359,40 @@ def _non_payable() -> list[NonPayableItem]:
 
 
 def expected_sheet(
-    claim: TracerClaim, rules: RulesEngine, non_payable: list[NonPayableItem] | None = None
+    claim: TracerClaim,
+    rules: RulesEngine,
+    non_payable: list[NonPayableItem] | None = None,
+    unclear: set[str] | None = None,
 ) -> dict[str, Any]:
     """Bill rules on the ground-truth lines through the real rules engine, in bill review's
-    order: R11 per line, R13 per line still payable (room rate from those lines), R21 last.
-    The non-payable lists default to the seeded fixture; a test passes the loaded lists to
-    show the ground truth holds against them too."""
+    order. The non-payable lists default to the seeded fixture; a test passes the loaded
+    lists, and the descriptions bill review would find unclear in them, to show the ground
+    truth holds against them too. Unclear lines are read as R12_READINGS says."""
     product = rules.product(PRODUCT_UIN)
     non_payable = _non_payable() if non_payable is None else non_payable
     lines: list[dict[str, Any]] = []
     facts: dict[int, LineFacts] = {}
+    results: list[Any] = []
+
+    def apply(line: dict[str, Any], rule_id: str, extra: dict[str, Any]) -> Any:
+        current = facts[line["line_id"]].model_copy(update={"claimed": line["admissible"]})
+        if line["deductions"] and current.qty:
+            current = current.model_copy(update={"rate": line["admissible"] / current.qty})
+        [result] = rules.evaluate([rule_id], Facts(line=current, **extra), product)
+        results.append(result)
+        _deduct(line, result, -result.amount_effect)
+        return result
+
+    def spread(rule_id: str, targets: list[dict[str, Any]], extra: dict[str, Any]) -> None:
+        [result] = rules.evaluate([rule_id], Facts(**extra), product)
+        results.append(result)
+        if result.amount_effect:
+            weights = [ln["admissible"] for ln in targets]
+            for line, share in zip(
+                targets, rules.allocate(result.amount_effect, weights), strict=True
+            ):
+                _deduct(line, result, -share)
+
     for line_id, item in enumerate(claim.ordered_items, start=1):
         facts[line_id] = LineFacts(
             line_id=line_id,
@@ -335,48 +401,74 @@ def expected_sheet(
             qty=item.qty,
             rate=item.rate,
             claimed=item.amount,
+            service_date=claim.on(item.day),
         )
-        [r11] = rules.evaluate(
-            ["R11"], Facts(line=facts[line_id], non_payable=non_payable), product
+        lines.append(
+            {
+                "line_id": line_id,
+                "head": item.head.value,
+                "description": item.description,
+                "claimed": item.amount,
+                "admissible": item.amount,
+                "deducted": D("0.00"),
+                "rule_id": None,
+                "clause_ref": None,
+                "reason": None,
+                "deductions": [],
+            }
         )
-        line: dict[str, Any] = {
-            "line_id": line_id,
-            "head": item.head.value,
-            "description": item.description,
-            "claimed": item.amount,
-            "admissible": item.amount,
-            "deducted": D("0.00"),
-            "rule_id": None,
-            "clause_ref": None,
-            "reason": None,
-        }
-        if not r11.passed:
-            _deduct(line, r11.rule_id, r11.clause_ref, r11.amount_effect, r11.reason)
-        lines.append(line)
-    payable = [ln for ln in lines if ln["rule_id"] is None]
-    room = [ln for ln in payable if ln["head"] == Head.ROOM.value]
-    room_days = sum((facts[ln["line_id"]].qty or D("1") for ln in room), D("0"))
-    room_rate = sum((ln["claimed"] for ln in room), D("0")) / room_days
-    room_facts = RoomFacts(
-        sum_insured=SUM_INSURED,
-        room_rate_per_day=room_rate,
-        differential_billing=DIFFERENTIAL_BILLING,
-    )
-    for line in payable:
-        [r13] = rules.evaluate(
-            ["R13"], Facts(line=facts[line["line_id"]], room=room_facts), product
-        )
-        if r13.amount_effect != 0:
-            _deduct(line, r13.rule_id, r13.clause_ref, r13.amount_effect, r13.reason)
+
+    def payable() -> list[dict[str, Any]]:
+        return [ln for ln in lines if ln["admissible"] > 0]
+
+    # 1. Per line: R11, R12 on lines R11 matched nothing for, R18.
+    unmatched = [ln for ln in lines if apply(ln, "R11", {"non_payable": non_payable}).clause_ref
+                 is None]  # fmt: skip
+    for line in unmatched:
+        if line["description"] in (unclear or set()):
+            reading = R12_READINGS[line["description"]]
+            apply(line, "R12", {"judgement": NonPayableJudgement(item=reading, confidence=1.0)})
+    for line in payable():
+        apply(line, "R18", {"admission_date": claim.admission, "discharge_date": claim.discharge})
+    # 2. The package: R23 (an itemised bill: nothing), then R20 on the lines it covers.
+    package = PackageFacts(packages=[PACKAGE], billed_as_package=False)
+    for line in payable():
+        apply(line, "R23", {"package": package})
+    covered = [ln for ln in payable() if Head(ln["head"]) in product.packages.included_heads]
+    total = sum((ln["admissible"] for ln in covered), D("0"))
+    spread("R20", covered, {"package": package.model_copy(update={"package_total": total})})
+    # 3. Outside the package: R24, R13, R14 (each passes on a line the package prices).
+    for line in payable():
+        apply(line, "R24", {"package": package, "non_package_discount_percent":
+                            NON_PACKAGE_DISCOUNT})  # fmt: skip
+    room = RoomFacts(sum_insured=SUM_INSURED, room_rate_per_day=None,
+                     differential_billing=DIFFERENTIAL_BILLING)  # fmt: skip
+    for line in payable():
+        for rule_id in ("R13", "R14"):
+            apply(line, rule_id, {"room": room, "package": package})
+    # 4. Claim: R19 (no ambulance line), R16, R17, R26, then R21.
+    for rule_id in ("R16", "R17", "R26"):
+        admissible = money(sum((ln["admissible"] for ln in lines), D("0")))
+        spread(rule_id, payable(), {"sum_insured": SUM_INSURED, "admissible_total": admissible,
+                                    "procedure_codes": [PCS_CODE]})  # fmt: skip
     admissible = money(sum((ln["admissible"] for ln in lines), D("0")))
     [r21] = rules.evaluate(["R21"], Facts(admissible_total=admissible), product)
     co_pay = money(-r21.amount_effect)
+    room_lines = [i for i in claim.items if i.head is Head.ROOM]
+    room_rate = sum((i.amount for i in room_lines), D("0")) / sum(
+        (i.qty for i in room_lines), D("0")
+    )
     cap = min(
         SUM_INSURED * product.room_rent.percent_of_sum_insured / 100, product.room_rent.max_per_day
     )
+    for line in lines:
+        line["deductions"] = [
+            {"rule_id": r, "clause_ref": c, "amount": a} for a, r, c, _ in line["deductions"]
+        ]
     return {
         "room_rate_per_day": money(room_rate),
         "room_cap_per_day": money(cap),
+        "package": PACKAGE.model_dump(mode="json"),
         "lines": lines,
         "deductions": [ln for ln in lines if ln["deducted"] > 0],
         "claimed_total": claim.grand_total,
@@ -384,15 +476,38 @@ def expected_sheet(
         "co_pay": co_pay,
         "co_pay_rule": {"rule_id": r21.rule_id, "clause_ref": r21.clause_ref, "reason": r21.reason},
         "payable": money(admissible - co_pay),
+        "rules_failed": sorted({r.rule_id for r in results if not r.passed}),
     }
 
 
-def _deduct(
-    line: dict[str, Any], rule_id: str, clause: str | None, effect: Decimal, reason: str
-) -> None:
-    line["admissible"] = money(max(line["claimed"] + effect, D("0")))
+def _deduct(line: dict[str, Any], result: Any, amount: Decimal) -> None:
+    """Take amount off the line, never below zero; the line names the rule that took most."""
+    take = money(min(max(amount, D("0")), line["admissible"]))
+    if take == 0:
+        return
+    line["admissible"] = money(line["admissible"] - take)
     line["deducted"] = money(line["claimed"] - line["admissible"])
-    line["rule_id"], line["clause_ref"], line["reason"] = rule_id, clause, reason
+    line["deductions"].append((take, result.rule_id, result.clause_ref, result.reason))
+    _, line["rule_id"], line["clause_ref"], line["reason"] = max(
+        line["deductions"], key=lambda d: d[0]
+    )
+
+
+def drug_findings(claim: TracerClaim, rules: RulesEngine) -> list[dict[str, Any]]:
+    """Pharmacy lines above the NPPA ceiling plus GST, by the DRUG-PRICE check."""
+    product = rules.product(PRODUCT_UIN)
+    found = []
+    for line_id, item in enumerate(claim.ordered_items, start=1):
+        drug = DRUG_CEILINGS.get(item.description)
+        if item.head is not Head.PHARMACY or drug is None:
+            continue
+        line = LineFacts(line_id=line_id, head=item.head, description=item.description,
+                         qty=item.qty, rate=item.rate, claimed=item.amount)  # fmt: skip
+        [result] = rules.evaluate(["DRUG-PRICE"], Facts(line=line, drug=drug), product)
+        if not result.passed:
+            found.append({"line_id": line_id, "description": item.description,
+                          "reason": result.reason})  # fmt: skip
+    return found
 
 
 def ground_truth(claim: TracerClaim, rules: RulesEngine, files: dict[str, Any]) -> dict[str, Any]:
@@ -478,9 +593,17 @@ def ground_truth(claim: TracerClaim, rules: RulesEngine, files: dict[str, Any]) 
             },
             "registration_rules": {"R1": True, "R2": True, "R3": True, "R5": True, "R10": True},
             "sheet": sheet,
+            "drug_price_findings": drug_findings(claim, rules),
             "expected": {
                 "first_draft": "query",
+                # The intake's missing document. Medical review may also ask for the
+                # guideline's missing mandatory documents (histopathology and pre-anaesthesia
+                # reports, both investigation reports); that is the model's call.
                 "query_items": ["payment receipt"],
+                "medical_query_items_allowed": [DocType.INVESTIGATION_REPORT.value],
+                "package": PACKAGE.package_code,
+                "guideline_code": GUIDELINE_CODE,
+                "los_norm_days": LOS_NORM_DAYS,
                 "final_draft": "partial",
                 "icd_family": "K35",
                 # Resection of the appendix; the approach and qualifier are the builder's call.

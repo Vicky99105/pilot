@@ -169,6 +169,39 @@ export function ConfirmDeductions({ payload, submit, busy }: KindProps<Deduction
           <span className="num font-semibold">{rupees(payload.payable)}</span>
         </Detail>
       </dl>
+      {payload.package && (
+        <Section title="Package">
+          {payload.package.packages.length === 0 ? (
+            <p className="text-sm text-muted">No package applies; every line is priced on its own.</p>
+          ) : (
+            <ul className="space-y-1 text-sm">
+              {payload.package.packages.map((p) => (
+                <li key={p.package_code}>
+                  <Chip tone="neutral">{p.package_code}</Chip> {p.name} ({p.scheme}){' '}
+                  <span className="num">{rupees(p.rate)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="mt-1 text-xs text-muted">
+            Chosen from {payload.package.candidates.length} candidate
+            {payload.package.candidates.length === 1 ? '' : 's'}
+            {payload.package.billed_as_package && '; the bill charges a package'}
+          </p>
+        </Section>
+      )}
+      {payload.findings && payload.findings.length > 0 && (
+        <Section title="Checks to note (no deduction)">
+          <ul className="space-y-1 text-sm">
+            {payload.findings.map((f, i) => (
+              <li key={`${f.kind}-${i}`}>
+                <Chip tone="warn">{humanise(f.kind)}</Chip>
+                {f.line_id !== null && <span className="text-muted"> line {f.line_id}:</span>} {f.text}
+              </li>
+            ))}
+          </ul>
+        </Section>
+      )}
       <Section title="Bill lines">
         <div className="overflow-x-auto">
           <table className="w-full min-w-[36rem] text-sm">
@@ -191,7 +224,8 @@ export function ConfirmDeductions({ payload, submit, busy }: KindProps<Deduction
                       <p className="text-xs text-muted">
                         {humanise(l.head)}
                         {l.head_as_written && ` (${l.head_as_written})`}
-                        {l.flagged && ', head not recognised'}
+                        {l.in_package && ', priced by the package'}
+                        {l.flagged && `, check: ${l.flag_reason ?? 'head not recognised'}`}
                       </p>
                     </td>
                     <td className="num py-1.5 pr-2 text-right whitespace-nowrap">{rupees(l.claimed)}</td>

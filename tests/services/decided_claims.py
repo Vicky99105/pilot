@@ -15,7 +15,6 @@ from app.database.models import ClaimRow, SubmissionRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.integrations.core.contract import MemberPolicy
 from app.services.adjudication.service import DefaultAdjudicationService
-from app.services.bill_review.service import DefaultBillReviewService
 from app.services.decision.contract import ApproverOutcome, CrcOutcome
 from app.services.decision.service import DefaultDecisionService
 from app.services.digitisation.contract import Bank, BillLine
@@ -26,7 +25,13 @@ from app.shared.seed_ids import DOCTOR_USER_ID, MEMBER_USER_ID, SENIOR_USER_ID
 from app.shared.types import Field, Stage
 from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.model_gateway import FakeModelGateway
-from tests.services.claim_builders import ClaimSpec, add_digitised_claim, bill_line
+from tests.services.claim_builders import (
+    ClaimSpec,
+    add_digitised_claim,
+    bill_line,
+    reviewed_bill,
+    without_agreements,
+)
 from tests.services.test_adjudication import PARTIAL as WORKED_PARTIAL
 from tests.services.test_adjudication import add_medical
 from tests.services.test_registration import asha_policy
@@ -134,7 +139,8 @@ async def adjudicated_claim(
     policies, money = FakePolicyService([plan.policy]), FakeMoneyService()
     rules = DefaultRulesEngine(Settings().config_dir / "products")
     await DefaultRegistrationService(sessions, policies, money, rules).register(claim_id)
-    await DefaultBillReviewService(sessions, rules).review(claim_id)
+    await without_agreements(sessions)
+    await reviewed_bill(sessions, claim_id)
     await add_medical(sessions, claim_id)
     gateway = FakeModelGateway({"adjudication_decide": [plan.reply]})
     draft = await DefaultAdjudicationService(

@@ -133,6 +133,83 @@ specific_waiting:
       months: 36
       icd10cm: [M15-M19, M80-M81]
 
+# Package-first bill review. A hospital agreement names the scheme its packages are priced
+# from; these settings say how the product pays them.
+packages:
+  # What a package price covers on an itemised bill. The CGHS package definition covers
+  # accommodation, nursing, OT, surgeon and anaesthetist fees, medicines, surgical
+  # disposables and related routine investigations; implants are paid outside it.
+  included_heads: [room, icu, nursing, ot, professional_fees, pharmacy, consumables, diagnostics]
+  # Several procedures in one admission (CGHS OM 03.10.2025 Annexure I): the highest-rated
+  # at 100%, the second at 50%, the rest at 25% each. Add-on packages are paid in full.
+  multi_procedure_percent: {first: 100, second: 50, rest: 25, addon: 100}
+  # R24: the agreed non-package discount never applies to medicines or implants.
+  discount_excluded_heads: [pharmacy, implants]
+
+# R12: a model reading of an unclear line below this confidence goes to a person.
+non_payable_judging:
+  min_confidence: 0.8
+
+# NPPA ceiling prices exclude GST. Assumption: medicines carry 12% GST (the common rate for
+# scheduled formulations); a line is above the ceiling only above ceiling plus GST.
+drug_price:
+  gst_percent: 12
+
+# R16: cataract surgery, ICD-10-PCS (FY2027) prefixes: extraction of the right or left lens
+# and replacement of the right or left lens. The 4th character (J right, K left) is the eye.
+cataract_pcs: [08DJ, 08DK, 08RJ, 08RK]
+
+# R17: the wording's modern treatments (section C.I.6), with ICD-10-PCS prefixes where a
+# PCS code shows the treatment. The rest need the bill or the notes; they are not mapped.
+modern_treatments:
+  - item: Uterine Artery Embolization and HIFU
+    icd10pcs: [04LE3DT, 04LF3DU]  # occlusion of the right or left uterine artery
+    unmapped: HIFU has no PCS code of its own
+  - item: Balloon Sinuplasty
+    unmapped: PCS codes the dilation of a sinus without naming the balloon
+  - item: Deep Brain Stimulation
+    icd10pcs: [00H00MZ, 00H03MZ, 00H04MZ]  # insertion of a neurostimulator lead into the brain
+  - item: Oral chemotherapy
+    unmapped: a medicine, not a procedure
+  - item: Immunotherapy- Monoclonal Antibody to be given as injection
+    unmapped: a medicine, not a procedure
+  - item: Intra vitreal injections
+    icd10pcs: [3E0C3GC]  # other therapeutic substance into the eye, percutaneous
+  - item: Robotic surgeries
+    icd10pcs: [8E0W0CZ, 8E0W3CZ, 8E0W4CZ, 8E0W7CZ, 8E0W8CZ]  # robotic assistance, trunk
+  - item: Stereotactic radio surgeries
+    # radiation therapy with modality 2, stereotactic radiosurgery, per body system
+    icd10pcs: [D02, D72, D82, D92, DB2, DD2, DF2, DG2, DM2, DT2, DU2, DV2, DW2]
+  - item: Bronchical Thermoplasty
+    unmapped: PCS codes the destruction of a bronchus without naming the method
+  - item: Vaporisation of the prostrate (Green laser treatment or holmium laser treatment)
+    unmapped: PCS codes the destruction of the prostate without naming the laser
+  - item: IONM - (Intra Operative Neuro Monitoring)
+    unmapped: monitoring is coded only when it is the procedure
+  - item: Stem cell therapy
+    unmapped: no PCS grouping
+
+# R9: standard exclusions that a verified code shows by itself. Exclusions that need more
+# than the code (obesity surgery criteria, refractive power, investigation-only stays) are
+# left to the medical officer and adjudication.
+exclusions:
+  - code: Excl07
+    title: Change-of-gender treatments
+    icd10cm: [F64]
+  - code: Excl08
+    title: Cosmetic or plastic surgery
+    icd10cm: [Z41.1]
+  - code: Excl12
+    title: Treatment for alcoholism, drug or substance abuse
+    icd10cm: [F10-F19]
+  - code: Excl17
+    title: Sterility and infertility
+    icd10cm: [N46, N97, Z31]
+  - code: Excl18
+    title: Maternity
+    # pregnancy and childbirth, except ectopic pregnancy (O00), which the product covers
+    icd10cm: [O01-O9A]
+
 clauses:
   premium_received: 64VB
   policy_period: POLICY-PERIOD
@@ -145,6 +222,15 @@ clauses:
   proportionate_deduction: PROP-DED
   co_pay: CO-PAY
   specific_waiting: Excl02
+  pre_existing: Excl01
+  cataract: CATARACT
+  modern_treatments: MODERN-TX
+  pre_post: PRE-POST
+  ambulance: AMBULANCE
+  package_tariff: AGREED-TARIFF
+  package_inclusions: PACKAGE-INCL
+  non_package_discount: NON-PKG-DISC
+  preauth: PREAUTH
   # Non-payable annexure, by IRDAI list number.
   non_payable:
     I: ANNEX-I

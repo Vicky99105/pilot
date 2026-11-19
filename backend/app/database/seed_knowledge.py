@@ -114,6 +114,84 @@ POLICY_CLAUSES: list[tuple[str, str, str]] = [
         "Items within treatment costs, list IV",
         "Items on list IV are part of the cost of treatment and are not paid as separate items.",
     ),
+    (
+        "CATARACT",
+        "Cataract treatment",
+        "Cataract surgery is paid up to 25% of the sum insured or Rs 40,000 for each eye, "
+        "whichever is lower, in a policy year.",
+    ),
+    (
+        "MODERN-TX",
+        "Modern treatments",
+        "The listed modern treatments, such as robotic surgery, stereotactic radiosurgery "
+        "and deep brain stimulation, are paid up to 50% of the sum insured.",
+    ),
+    (
+        "PRE-POST",
+        "Pre and post hospitalisation",
+        "Medical expenses in the 30 days before admission and the 60 days after discharge "
+        "are paid when they relate to the same condition. Expenses outside those windows "
+        "are not paid.",
+    ),
+    (
+        "AMBULANCE",
+        "Ambulance",
+        "Road ambulance charges are paid up to Rs 2,000 for each hospitalisation.",
+    ),
+    (
+        "AGREED-TARIFF",
+        "Agreed package rates",
+        "At a network hospital, a treatment the hospital's agreement prices as a package is "
+        "paid at the agreed package rate. Several procedures in one admission are paid at "
+        "100% of the highest-rated package, 50% of the second and 25% of each one after.",
+    ),
+    (
+        "PACKAGE-INCL",
+        "Items included in a package",
+        "Services a package covers, such as the room, nursing, operation theatre, fees, "
+        "medicines, disposables and routine investigations, are not paid again when the "
+        "hospital bills them beside the package.",
+    ),
+    (
+        "NON-PKG-DISC",
+        "Non-package discount",
+        "Charges outside a package are paid at the hospital's tariff less the discount in its "
+        "agreement. Medicines and implants are not discounted.",
+    ),
+    (
+        "PREAUTH",
+        "Pre-authorisation limit",
+        "A cashless claim is paid up to the amount approved at pre-authorisation and any "
+        "approved enhancement. A change of diagnosis needs a fresh approval.",
+    ),
+    (
+        "Excl07",
+        "Change-of-gender treatments",
+        "Treatment to change the characteristics of the body to those of the opposite sex is "
+        "excluded.",
+    ),
+    (
+        "Excl08",
+        "Cosmetic or plastic surgery",
+        "Cosmetic or plastic surgery is excluded unless it reconstructs after an accident, "
+        "burns or cancer, or is medically necessary.",
+    ),
+    (
+        "Excl12",
+        "Alcoholism and substance abuse",
+        "Treatment for alcoholism, drug or substance abuse, or any addictive condition, is "
+        "excluded.",
+    ),
+    (
+        "Excl17",
+        "Sterility and infertility",
+        "Treatment for sterility and infertility, including assisted reproduction, is excluded.",
+    ),
+    (
+        "Excl18",
+        "Maternity",
+        "Childbirth and other maternity expenses are excluded, except ectopic pregnancy.",
+    ),
 ]
 
 _CONDITIONS = {

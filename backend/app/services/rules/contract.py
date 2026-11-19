@@ -4,9 +4,14 @@ Each rule is a pure function (facts, product) -> RuleResult, registered by its I
 never reads a database or calls a model. Parameters come from the product config in
 config/products/. Money is Decimal rupees, quantized to 2 places.
 
+Rules R1 to R26 return a RuleResult each. DRUG-PRICE is a check that never deducts: a failed
+result is a finding for the bill processor (pharmacy line above the NPPA ceiling plus GST).
+
 RuleResult conventions:
 - passed=False means an adverse finding: a failed check or a deduction for a breach.
 - amount_effect is the change to the payable amount, zero or negative.
+- R11 names the list clause whenever it matched a list item, paid or not; a line R11 matched
+  no item for has no clause, and only such a line goes to R12.
 - A rule that lacks the facts it needs returns passed=False with a reason naming them, so a
   person sees the gap at the checkpoint.
 
@@ -38,6 +43,7 @@ class Head(StrEnum):
     IMPLANTS = "implants"
     DIAGNOSTICS = "diagnostics"
     AMBULANCE = "ambulance"
+    PACKAGE = "package"  # a package charge the hospital billed as one line
     OTHER = "other"
 
 
@@ -111,6 +117,60 @@ class SpecificWaiting(BaseModel):
     conditions: list[WaitingCondition]
 
 
+class ExclusionCodes(BaseModel):
+    """A standard exclusion that verified codes can show, with its ICD ranges. An exclusion
+    that needs judgement beyond the code is left out of the product config."""
+
+    code: str  # Excl04 to Excl18; also the clause cited
+    title: str
+    icd10cm: list[str] = []
+    icd10pcs: list[str] = []  # PCS code prefixes
+
+    @model_validator(mode="after")
+    def _mapped(self) -> "ExclusionCodes":
+        if not self.icd10cm and not self.icd10pcs:
+            raise ValueError(f"{self.code}: no ICD-10-CM range and no PCS prefix")
+        return self
+
+
+class ModernTreatment(BaseModel):
+    item: str  # as the wording lists it
+    icd10pcs: list[str] = []  # PCS code prefixes
+    unmapped: str | None = None
+
+    @model_validator(mode="after")
+    def _mapped_or_explained(self) -> "ModernTreatment":
+        if not self.icd10pcs and not self.unmapped:
+            raise ValueError(f"{self.item!r}: no PCS prefix and no reason it is unmapped")
+        return self
+
+
+class MultiProcedure(BaseModel):
+    """Percent of each package rate paid when one admission has several procedures."""
+
+    first: Decimal
+    second: Decimal
+    rest: Decimal
+    addon: Decimal
+
+
+class Packages(BaseModel):
+    """How the product pays a hospital's package (R20, R23, R24, R13 and R14)."""
+
+    included_heads: list[Head]  # what a package price covers when the bill is itemised
+    multi_procedure_percent: MultiProcedure
+    # R24: the agreed discount on non-package items does not apply to these heads.
+    discount_excluded_heads: list[Head]
+
+
+class NonPayableJudging(BaseModel):
+    min_confidence: float  # R12: below this, a person decides the line
+
+
+class DrugPriceCheck(BaseModel):
+    gst_percent: Decimal  # NPPA ceiling prices exclude GST; the bill includes it
+
+
 class Clauses(BaseModel):
     premium_received: str
     policy_period: str
@@ -123,6 +183,15 @@ class Clauses(BaseModel):
     proportionate_deduction: str
     co_pay: str
     specific_waiting: str | None = None
+    pre_existing: str  # R6
+    cataract: str  # R16
+    modern_treatments: str  # R17
+    pre_post: str  # R18
+    ambulance: str  # R19
+    package_tariff: str  # R20
+    package_inclusions: str  # R23
+    non_package_discount: str  # R24
+    preauth: str  # R26
     non_payable: dict[str, str]  # IRDAI list number ("I" to "IV") -> clause
 
 
@@ -143,6 +212,12 @@ class ProductConfig(BaseModel):
     post_hospitalisation_days: int | None = None
     pre_existing_waiting_months: int | None = None
     specific_waiting: SpecificWaiting | None = None
+    packages: Packages
+    non_payable_judging: NonPayableJudging
+    drug_price: DrugPriceCheck
+    cataract_pcs: list[str]  # PCS prefixes for cataract surgery; the 4th character is the eye
+    modern_treatments: list[ModernTreatment]
+    exclusions: list[ExclusionCodes]
 
 
 # --- Facts --------------------------------------------------------------------------------
@@ -162,7 +237,8 @@ class LineFacts(BaseModel):
     description: str
     qty: Decimal | None = None  # days, for room and ICU lines
     rate: Decimal | None = None  # per day, for room and ICU lines
-    claimed: Decimal
+    claimed: Decimal  # the amount under review: what the bill claims, less earlier rules
+    service_date: date | None = None
 
 
 class RoomFacts(BaseModel):
@@ -186,6 +262,46 @@ class NonPayableItem(BaseModel):
     payable_in_product: PayableInProduct = "not_payable"
 
 
+class MappedPackage(BaseModel):
+    """A package the claim's procedure maps to, priced for the hospital's agreement."""
+
+    scheme: str
+    package_code: str
+    name: str
+    rate: Decimal  # the agreed rate (tier, accreditation, ward), before the multi-procedure rule
+    addon: bool = False
+    standalone: bool = False
+
+
+class PackageFacts(BaseModel):
+    packages: list[MappedPackage]  # one per mapped procedure
+    billed_as_package: bool  # the bill has a package charge line
+    # R20: what the bill charges for the package: the package lines, or, on an itemised
+    # bill, the lines whose head a package covers. Amounts after the earlier rules.
+    package_total: Decimal = Decimal("0")
+
+
+class DrugFacts(BaseModel):
+    """The one NPPA formulation that fits a pharmacy line."""
+
+    medicine: str
+    dosage_form: str  # e.g. "Injection 500mg/100mL"
+    unit: str  # the unit the ceiling is for, e.g. "1 Vial", "1 ML"
+    ceiling_price: Decimal  # rupees per unit, before GST
+
+
+class NonPayableJudgement(BaseModel):
+    """R12: the model's reading of a line that may be a non-payable item."""
+
+    item: NonPayableItem | None  # None: the line is payable
+    confidence: float
+
+
+class PreAuthFacts(BaseModel):
+    approved_total: Decimal  # the pre-auth plus every enhancement
+    diagnosis_codes: list[str] = []  # as approved
+
+
 class Facts(BaseModel):
     """Everything any rule may read. Each rule uses the fields it needs."""
 
@@ -197,7 +313,18 @@ class Facts(BaseModel):
     line: LineFacts | None = None  # the bill line under review (R11, R13)
     room: RoomFacts | None = None  # R13
     non_payable: list[NonPayableItem] = []  # R11
-    admissible_total: Decimal | None = None  # before co-pay (R21)
+    admissible_total: Decimal | None = None  # before co-pay (R16, R17, R21, R26)
+    sum_insured: Decimal | None = None  # R16, R17
+    discharge_date: date | None = None  # R18
+    diagnosis_codes: list[str] = []  # verified ICD-10-CM codes (R6, R7, R9, R26)
+    procedure_codes: list[str] = []  # verified ICD-10-PCS codes (R7, R9, R16, R17)
+    pre_existing_onsets: list[date] = []  # R6: latest start dates of conditions found
+    judgement: NonPayableJudgement | None = None  # R12
+    package: PackageFacts | None = None  # R13, R14, R20, R23, R24
+    non_package_discount_percent: Decimal | None = None  # R24, from the hospital agreement
+    ambulance_total: Decimal | None = None  # R19: ambulance lines after the earlier rules
+    preauth: PreAuthFacts | None = None  # R26; None for a reimbursement with no pre-auth
+    drug: DrugFacts | None = None  # DRUG-PRICE
 
 
 MatchKind = Literal["exact_id", "name_dob", "doubtful", "none"]
@@ -231,4 +358,10 @@ class RulesEngine(Protocol):
 
     def product(self, product_uin: str) -> ProductConfig:
         """The product config for a policy's UIN."""
+        ...
+
+    def allocate(self, amount: Decimal, weights: list[Decimal]) -> list[Decimal]:
+        """Spread a claim-level amount (R16, R17, R19, R20) over lines in proportion to the
+        weights (their admissible amounts). Each share is rounded half up to the paisa; the
+        last line with weight takes the remainder, so the shares sum to the amount exactly."""
         ...

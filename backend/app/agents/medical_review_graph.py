@@ -1,10 +1,16 @@
-"""Medical review graph (LangGraph).
+"""Medical review graphs (LangGraph), one per step.
 
-rewrite_terms -> lookup -> code_procedures -> choose_codes -> hospital_codes ->
-length_of_stay -> pre_existing -> validate -> (choose_codes once more, or end)
+Coding (step 1, before bill review):
+rewrite_terms -> lookup -> code_procedures -> choose_codes -> validate_codes ->
+(choose_codes once more, or end)
+
+Review (step 2, after bill review mapped the package):
+findings -> hospital_codes -> length_of_stay -> pre_existing -> validate ->
+(findings once more, or end)
 
 The model rewrites diagnosis phrases into index terms and chooses codes from the lookup
-results. Code runs every lookup and every check. The validator accepts a code only if a
+results; in the review it writes findings and picks query items from the case's document
+options. Code runs every lookup and every check. The validator accepts a code only if a
 lookup in this run returned it and it is billable, and a finding only if it has a valid
 citation. Rejected items go back to the model once; what is still wrong is dropped with
 the reason.
@@ -22,6 +28,7 @@ from langgraph.graph import END, START, StateGraph
 from app.agents.medical_case import (
     CaseFact,
     CaseFile,
+    Statement,
     compare_hospital_codes,
     length_of_stay,
     pre_existing,
@@ -29,14 +36,18 @@ from app.agents.medical_case import (
 )
 from app.agents.prompts import (
     CHOOSE_PURPOSE,
+    FINDINGS_PURPOSE,
     NO_PROCEDURE,
     PCS_PURPOSE,
     REWRITE_PURPOSE,
     ChooseCodesReply,
+    FindingsReply,
     TermRewrite,
     TermRewriteReply,
     choose_messages,
     choose_schema,
+    findings_messages,
+    findings_schema,
     pcs_choice,
     pcs_step_messages,
     pcs_step_schema,
@@ -63,7 +74,7 @@ from app.services.medical_review.contract import (
     VerifiedProcedure,
 )
 from app.services.model_gateway.contract import ModelGateway, ModelRole
-from app.shared.types import Code, DocType
+from app.shared.types import Code
 
 MAX_REVISIONS = 1
 MAX_PROCEDURES = 3
@@ -74,12 +85,17 @@ NOT_RETURNED = "not returned by any lookup in this run"
 NO_CITATION = "no valid citation"
 
 
-class MedicalGraphResult(TypedDict):
+class CodingResult(TypedDict):
     verified_codes: list[VerifiedCode]
     procedure_codes: list[VerifiedProcedure]
+    lookups: list[LookupCall]
+    dropped: list[DroppedItem]
+    revisions: int
+
+
+class ReviewResult(TypedDict):
     findings: list[Finding]
     query_items: list[DocumentRequest]
-    lookups: list[LookupCall]
     dropped: list[DroppedItem]
     revisions: int
 
@@ -94,28 +110,25 @@ def _queries(item: TermRewrite) -> tuple[str, list[str], IndexName]:
     return main, queries, item.index
 
 
-class _State(TypedDict, total=False):
+class _CodingState(TypedDict, total=False):
     case: CaseFile
     terms: list[tuple[str, list[str], IndexName]]  # (main term, queries, index)
     procedure_codes: list[VerifiedProcedure]
     procedure_dropped: list[DroppedItem]
     candidates: list[IcdTabularEntry]
     proposal: ChooseCodesReply
-    code_findings: dict[str, list[Finding]]  # per check node, so a re-run replaces its own
     feedback: list[str]
     revisions: int
     verified_codes: list[VerifiedCode]
-    findings: list[Finding]
-    query_items: list[DocumentRequest]
     dropped: list[DroppedItem]
 
 
-async def run_medical_review(
+async def run_medical_coding(
     case: CaseFile, *, gateway: ModelGateway, kb: KnowledgeBase, claim_id: UUID
-) -> MedicalGraphResult:
+) -> CodingResult:
     ledger = IcdLookupLedger(kb, as_of=case.admission_date)
 
-    async def rewrite_terms(state: _State) -> dict[str, Any]:
+    async def rewrite_terms(state: _CodingState) -> dict[str, Any]:
         reply = await gateway.structured(
             ModelRole.REASONING,
             rewrite_messages(state["case"]),
@@ -125,7 +138,7 @@ async def run_medical_review(
         )
         return {"terms": [_queries(item) for item in reply.items if item.main_term.strip()]}
 
-    async def lookup(state: _State) -> dict[str, Any]:
+    async def lookup(state: _CodingState) -> dict[str, Any]:
         codes: list[str] = []
         searched: set[tuple[str, IndexName]] = set()
         for main, queries, index in state["terms"]:
@@ -165,7 +178,7 @@ async def run_medical_review(
                 queue += child.children
         return found
 
-    async def code_procedures(state: _State) -> dict[str, Any]:
+    async def code_procedures(state: _CodingState) -> dict[str, Any]:
         coded: list[VerifiedProcedure] = []
         dropped: list[DroppedItem] = []
         phrases = list({p.text.strip().lower(): p for p in state["case"].procedures}.values())
@@ -227,7 +240,7 @@ async def run_medical_review(
             citations=[Citation(page=procedure.source)] if procedure.source else [],
         )
 
-    async def choose_codes(state: _State) -> dict[str, Any]:
+    async def choose_codes(state: _CodingState) -> dict[str, Any]:
         reply = await gateway.structured(
             ModelRole.REASONING,
             choose_messages(state["case"], state["candidates"], state.get("feedback", [])),
@@ -237,36 +250,17 @@ async def run_medical_review(
         )
         return {"proposal": reply}
 
-    def hospital_codes(state: _State) -> dict[str, Any]:
-        traced = [c.code for c in state["proposal"].codes if _code_problem(c.code) is None]
-        found = compare_hospital_codes(state["case"], traced)
-        return {"code_findings": {**state.get("code_findings", {}), "hospital": found}}
-
-    def stay(state: _State) -> dict[str, Any]:
-        reason = state["proposal"].long_stay_reason
-        cited = reason is not None and bool(
-            valid_citations([to_citation(c) for c in reason.citations], state["case"], _seen())
-        )
-        found = length_of_stay(state["case"], cited)
-        return {"code_findings": {**state.get("code_findings", {}), "stay": found}}
-
-    def pre_existing_disease(state: _State) -> dict[str, Any]:
-        found = pre_existing(state["case"])
-        return {"code_findings": {**state.get("code_findings", {}), "ped": found}}
-
-    def validate(state: _State) -> dict[str, Any]:
+    def validate_codes(state: _CodingState) -> dict[str, Any]:
         case, proposal = state["case"], state["proposal"]
         revisions = state.get("revisions", 0)
         verified: list[VerifiedCode] = []
-        findings: list[Finding] = []
-        rejected: list[tuple[DroppedItem, bool]] = []  # (item, fixable by the model)
-
+        rejected: list[DroppedItem] = []
         for choice in proposal.codes:
             code = choice.code.strip().upper()
             citations = valid_citations([to_citation(c) for c in choice.citations], case, _seen())
             problem = _code_problem(code) or (None if citations else NO_CITATION)
             if problem:
-                rejected.append((DroppedItem(item="code", detail=code, reason=problem), True))
+                rejected.append(DroppedItem(item="code", detail=code, reason=problem))
                 continue
             if any(v.code.code == code for v in verified):
                 continue
@@ -282,61 +276,17 @@ async def run_medical_review(
                     rationale=choice.rationale,
                 )
             )
-
-        for reply in proposal.findings:
-            citations = valid_citations([to_citation(c) for c in reply.citations], case, _seen())
-            if not citations:
-                rejected.append(
-                    (DroppedItem(item="finding", detail=reply.text, reason=NO_CITATION), True)
-                )
-                continue
-            findings.append(
-                Finding(
-                    kind="clinical",
-                    text=reply.text,
-                    severity=reply.severity,
-                    citations=citations,
-                    judged_by="model",
-                )
-            )
-
-        for found in state.get("code_findings", {}).values():
-            for finding in found:
-                citations = valid_citations(finding.citations, case, _seen())
-                if citations:
-                    findings.append(finding.model_copy(update={"citations": citations}))
-                else:  # the model cannot fix a code-side finding: drop it now
-                    rejected.append(
-                        (
-                            DroppedItem(item="finding", detail=finding.text, reason=NO_CITATION),
-                            False,
-                        )
-                    )
-
-        requests: list[DocumentRequest] = []
-        for item in proposal.query_items:
-            problem = _request_problem(item.doc_type, case, requests)
-            if problem:  # the reply schema already excludes these; this is the second check
-                rejected.append(
-                    (DroppedItem(item="query_item", detail=item.text, reason=problem), False)
-                )
-                continue
-            requests.append(DocumentRequest(doc_type=DocType(item.doc_type), text=item.text))
-
-        fixable = [item for item, can_fix in rejected if can_fix]
-        if fixable and revisions < MAX_REVISIONS:
-            feedback = [f"{i.item} {i.detail!r}: {i.reason}" for i in fixable]
+        if rejected and revisions < MAX_REVISIONS:
+            feedback = [f"{i.item} {i.detail!r}: {i.reason}" for i in rejected]
             return {"feedback": feedback, "revisions": revisions + 1}
         return {
             "feedback": [],
             "revisions": revisions,
             "verified_codes": verified,
-            "findings": findings,
-            "query_items": requests,
-            "dropped": [*state.get("procedure_dropped", []), *(item for item, _ in rejected)],
+            "dropped": [*state.get("procedure_dropped", []), *rejected],
         }
 
-    def after_validate(state: _State) -> str:
+    def after_validate(state: _CodingState) -> str:
         return "choose_codes" if state.get("feedback") else END
 
     def _seen() -> set[str]:
@@ -353,39 +303,161 @@ async def run_medical_review(
             return "not billable; choose a more specific code from the candidates"
         return None
 
-    def _request_problem(doc_type: str, case: CaseFile, kept: list[DocumentRequest]) -> str | None:
-        if doc_type not in {d.value for d in case.requestable}:
-            return f"{doc_type} is not a document this claim may be asked for"
-        if any(r.doc_type == doc_type for r in kept):
-            return f"{doc_type} is already asked for"
-        return None
-
-    graph = StateGraph(_State)
+    graph = StateGraph(_CodingState)
     graph.add_node("rewrite_terms", rewrite_terms)
     graph.add_node("lookup", lookup)
     graph.add_node("code_procedures", code_procedures)
     graph.add_node("choose_codes", choose_codes)
-    graph.add_node("hospital_codes", hospital_codes)
-    graph.add_node("length_of_stay", stay)
-    graph.add_node("pre_existing", pre_existing_disease)
-    graph.add_node("validate", validate)
+    graph.add_node("validate_codes", validate_codes)
     graph.add_edge(START, "rewrite_terms")
     graph.add_edge("rewrite_terms", "lookup")
     graph.add_edge("lookup", "code_procedures")
     graph.add_edge("code_procedures", "choose_codes")
-    graph.add_edge("choose_codes", "hospital_codes")
+    graph.add_edge("choose_codes", "validate_codes")
+    graph.add_conditional_edges("validate_codes", after_validate, ["choose_codes", END])
+
+    final = await graph.compile().ainvoke({"case": case})
+    return CodingResult(
+        verified_codes=final["verified_codes"],
+        procedure_codes=final.get("procedure_codes", []),
+        lookups=list(ledger.calls),
+        dropped=final["dropped"],
+        revisions=final["revisions"],
+    )
+
+
+class _ReviewState(TypedDict, total=False):
+    case: CaseFile
+    proposal: FindingsReply
+    code_findings: dict[str, list[Finding]]  # per check node, so a re-run replaces its own
+    feedback: list[str]
+    revisions: int
+    findings: list[Finding]
+    query_items: list[DocumentRequest]
+    dropped: list[DroppedItem]
+
+
+async def run_medical_review(
+    case: CaseFile,
+    *,
+    gateway: ModelGateway,
+    claim_id: UUID,
+    looked_up: set[str],
+    reread: list[Statement] | None = None,
+) -> ReviewResult:
+    """looked_up: every code the coding step's lookups returned, which a citation may name.
+    reread: what the pre-existing re-read of the cited history pages found."""
+
+    async def findings(state: _ReviewState) -> dict[str, Any]:
+        reply = await gateway.structured(
+            ModelRole.REASONING,
+            findings_messages(state["case"], state.get("feedback", [])),
+            findings_schema(state["case"]),
+            claim_id=claim_id,
+            purpose=FINDINGS_PURPOSE,
+        )
+        return {"proposal": reply}
+
+    def hospital_codes(state: _ReviewState) -> dict[str, Any]:
+        found = compare_hospital_codes(state["case"], state["case"].verified_codes)
+        return {"code_findings": {**state.get("code_findings", {}), "hospital": found}}
+
+    def stay(state: _ReviewState) -> dict[str, Any]:
+        reason = state["proposal"].long_stay_reason
+        cited = reason is not None and bool(
+            valid_citations([to_citation(c) for c in reason.citations], state["case"], looked_up)
+        )
+        found = length_of_stay(state["case"], cited)
+        return {"code_findings": {**state.get("code_findings", {}), "stay": found}}
+
+    def pre_existing_disease(state: _ReviewState) -> dict[str, Any]:
+        found = pre_existing(state["case"], reread)
+        return {"code_findings": {**state.get("code_findings", {}), "ped": found}}
+
+    def validate(state: _ReviewState) -> dict[str, Any]:
+        case, proposal = state["case"], state["proposal"]
+        revisions = state.get("revisions", 0)
+        kept: list[Finding] = []
+        rejected: list[tuple[DroppedItem, bool]] = []  # (item, fixable by the model)
+
+        for reply in proposal.findings:
+            citations = valid_citations([to_citation(c) for c in reply.citations], case, looked_up)
+            if not citations:
+                rejected.append(
+                    (DroppedItem(item="finding", detail=reply.text, reason=NO_CITATION), True)
+                )
+                continue
+            kept.append(
+                Finding(
+                    kind="clinical",
+                    text=reply.text,
+                    severity=reply.severity,
+                    citations=citations,
+                    judged_by="model",
+                )
+            )
+
+        for found in state.get("code_findings", {}).values():
+            for finding in found:
+                citations = valid_citations(finding.citations, case, looked_up)
+                if citations:
+                    kept.append(finding.model_copy(update={"citations": citations}))
+                else:  # the model cannot fix a code-side finding: drop it now
+                    rejected.append(
+                        (
+                            DroppedItem(item="finding", detail=finding.text, reason=NO_CITATION),
+                            False,
+                        )
+                    )
+
+        requests: list[DocumentRequest] = []
+        options = {d.label: d for d in case.documents}
+        for item in proposal.query_items:
+            option = options.get(item.document)
+            if option is None:  # the reply schema already excludes these; the second check
+                reason = f"{item.document} is not a document this claim may be asked for"
+                rejected.append(
+                    (DroppedItem(item="query_item", detail=item.text, reason=reason), False)
+                )
+                continue
+            same = next((r for r in requests if r.doc_type == option.doc_type), None)
+            if same is None:
+                requests.append(DocumentRequest(doc_type=option.doc_type, text=item.text))
+            elif item.text not in same.text:  # one request per document type
+                same.text = f"{same.text}; {item.text}"
+
+        fixable = [item for item, can_fix in rejected if can_fix]
+        if fixable and revisions < MAX_REVISIONS:
+            feedback = [f"{i.item} {i.detail!r}: {i.reason}" for i in fixable]
+            return {"feedback": feedback, "revisions": revisions + 1}
+        return {
+            "feedback": [],
+            "revisions": revisions,
+            "findings": kept,
+            "query_items": requests,
+            "dropped": [item for item, _ in rejected],
+        }
+
+    def after_validate(state: _ReviewState) -> str:
+        return "findings" if state.get("feedback") else END
+
+    graph = StateGraph(_ReviewState)
+    graph.add_node("findings", findings)
+    graph.add_node("hospital_codes", hospital_codes)
+    graph.add_node("length_of_stay", stay)
+    graph.add_node("pre_existing", pre_existing_disease)
+    graph.add_node("validate", validate)
+    graph.add_edge(START, "findings")
+    graph.add_edge("findings", "hospital_codes")
     graph.add_edge("hospital_codes", "length_of_stay")
     graph.add_edge("length_of_stay", "pre_existing")
     graph.add_edge("pre_existing", "validate")
-    graph.add_conditional_edges("validate", after_validate, ["choose_codes", END])
+    graph.add_conditional_edges("validate", after_validate, ["findings", END])
 
     final = await graph.compile().ainvoke({"case": case})
-    return MedicalGraphResult(
-        verified_codes=final["verified_codes"],
-        procedure_codes=final.get("procedure_codes", []),
+    return ReviewResult(
         findings=final["findings"],
         query_items=final["query_items"],
-        lookups=list(ledger.calls),
         dropped=final["dropped"],
         revisions=final["revisions"],
     )

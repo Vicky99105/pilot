@@ -24,6 +24,7 @@ from app.services.medical_review.contract import (
     Citation,
     Finding,
     InvalidOverrule,
+    MedicalCoding,
     MedicalFindings,
 )
 from app.services.query.contract import Query, QueryItem
@@ -166,6 +167,22 @@ class FakeMedicalReviewService:
     def __init__(self, *, adverse: bool = False) -> None:
         self.adverse = adverse
         self.overrules: list[tuple[list[int], str, str]] = []
+        self.calls = 0
+        self.coded: list[int] = []  # the call number of each code() and review()
+        self.reviewed: list[int] = []
+
+    async def code(self, claim_id: UUID) -> MedicalCoding:
+        self.calls += 1
+        self.coded.append(self.calls)
+        return MedicalCoding(
+            claim_id=claim_id,
+            digitisation_version=1,
+            registration_version=1,
+            verified_codes=[],
+            lookups=[],
+            dropped=[],
+            revisions=0,
+        )
 
     async def overrule(
         self, claim_id: UUID, finding_ids: list[int], reason: str, *, actor: str
@@ -178,6 +195,8 @@ class FakeMedicalReviewService:
         return findings.model_copy(update={"adverse": False})
 
     async def review(self, claim_id: UUID) -> MedicalFindings:
+        self.calls += 1
+        self.reviewed.append(self.calls)
         findings = (
             [
                 Finding(

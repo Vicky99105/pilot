@@ -72,7 +72,8 @@ async def test_seed_has_a_clause_for_every_clause_the_product_config_cites(
 ) -> None:
     await seed_claims_db(sessions)
     await seed_claims_db(sessions)
-    clauses = DefaultRulesEngine(Settings().config_dir / "products").product(PRODUCT_UIN).clauses
+    product = DefaultRulesEngine(Settings().config_dir / "products").product(PRODUCT_UIN)
+    clauses = product.clauses
 
     async with sessions() as session:
         rows = (await session.scalars(select(PolicyClauseRow))).all()
@@ -80,6 +81,7 @@ async def test_seed_has_a_clause_for_every_clause_the_product_config_cites(
     cited = {v for k, v in clauses.model_dump().items() if k != "non_payable"}
 
     assert cited | set(clauses.non_payable.values()) <= seeded
+    assert {e.code for e in product.exclusions} <= seeded  # R9 cites the exclusion itself
     assert {"Excl01", "Excl02", "Excl03"} <= seeded
     assert len(rows) == len(seeded)  # idempotent: no duplicates after two seeds
 
