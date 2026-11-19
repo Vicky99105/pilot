@@ -63,6 +63,14 @@ jobs:
           echo
       - name: Apply database migrations
         run: $COMPOSE exec -T app alembic upgrade head
+      - name: Seed users, hospitals and mock_core
+        run: |
+          $COMPOSE exec -T app python -m app.database.seed
+          $COMPOSE exec -T app python -m app.mock_core.seed
+      - name: Task queue answers for the seeded ops user
+        run: |
+          curl -skf -H 'X-User-Id: 00000000-0000-4000-8000-000000000003' https://localhost/api/tasks/queue
+          echo
       - name: Show stack state and logs
         if: failure()
         run: |

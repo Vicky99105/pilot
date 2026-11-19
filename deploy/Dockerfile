@@ -28,12 +28,15 @@ COPY backend/pyproject.toml backend/uv.lock backend/.python-version ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY backend/ ./
+COPY config/ /srv/config/
 COPY --from=ui /ui/dist /srv/ui
 
 ENV PATH=/opt/venv/bin:$PATH \
     UI_DIST_DIR=/srv/ui
 
-RUN useradd --system --uid 10001 --no-create-home app
+RUN useradd --system --uid 10001 --no-create-home app \
+    && mkdir -p /data/files && chown app /data/files
+# A new named volume mounted here copies this ownership, so the app user can write to it.
 USER app
 
 EXPOSE 8000

@@ -11,9 +11,20 @@ services:
       dockerfile: deploy/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-claims}:${POSTGRES_PASSWORD:-local-dev-only}@postgres:5432/claims
+      MOCK_CORE_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-claims}:${POSTGRES_PASSWORD:-local-dev-only}@postgres:5432/mock_core
+      # The Http core clients call this app's own /mock-core router.
+      MOCK_CORE_BASE_URL: ${MOCK_CORE_BASE_URL:-http://127.0.0.1:8000/mock-core}
+      FILE_STORE_DIR: /data/files
+      # The default is a LOCAL-ONLY dev key (base64 of a fixed 32-byte string). It protects
+      # nothing. On the server, set FILE_ENCRYPTION_KEY in .env (see .env.example).
+      FILE_ENCRYPTION_KEY: ${FILE_ENCRYPTION_KEY:-bG9jYWwtZGV2LW9ubHktbm90LWEtcmVhbC1rZXktMDA=}
+      # Empty by default: model calls fail with a clear error until a key is set.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
       TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-claims}
+    volumes:
+      - file-store:/data/files
     depends_on:
       postgres:
         condition: service_healthy
@@ -132,5 +143,6 @@ services:
 
 volumes:
   postgres-data:
+  file-store:
   caddy-data:
   caddy-config:

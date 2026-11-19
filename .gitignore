@@ -22,3 +22,6 @@ venv/
 
 # Node
 node_modules/
+
+# Local file store when running the backend outside Docker
+.local/

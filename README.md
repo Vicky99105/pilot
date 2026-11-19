@@ -43,7 +43,13 @@ Requires Docker. From the repo root:
 docker compose -f deploy/docker-compose.yml up -d --build
 curl -k https://localhost/health
 docker compose -f deploy/docker-compose.yml exec app alembic upgrade head
+docker compose -f deploy/docker-compose.yml exec app python -m app.database.seed
+docker compose -f deploy/docker-compose.yml exec app python -m app.mock_core.seed
+curl -k -H 'X-User-Id: 00000000-0000-4000-8000-000000000003' https://localhost/api/tasks/queue
 ```
+
+Both seeds are idempotent. Phase 1 has no real auth: the `X-User-Id` header picks a
+seeded user (IDs in `backend/app/shared/seed_ids.py`; `...0003` is "ops").
 
 - The UI is at https://localhost (Caddy uses a self-signed certificate).
 - The Temporal UI is at http://127.0.0.1:8080. On the server, reach it through an
