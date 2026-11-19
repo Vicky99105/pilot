@@ -22,6 +22,7 @@ from app.integrations.core.http import (
     HttpPolicyService,
 )
 from app.mock_core.router import router as mock_core_router
+from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
 from app.services.claims.contract import ClaimQueryService
 from app.services.claims.service import DefaultClaimQueryService
@@ -33,12 +34,15 @@ from app.services.health.contract import HealthService
 from app.services.health.service import DefaultHealthService
 from app.services.intake.contract import IntakeService
 from app.services.intake.service import DefaultIntakeService, DefaultWorkflowStarter
+from app.services.knowledge_base.service import DefaultKnowledgeBase
+from app.services.medical_review.service import DefaultMedicalReviewService
 from app.services.model_gateway.contract import ModelGateway
 from app.services.model_gateway.service import build_model_gateway
 from app.services.monitoring.contract import Monitoring
 from app.services.monitoring.service import DefaultMonitoring
 from app.services.page_prep.service import DefaultPagePreparer
 from app.services.registration.service import DefaultRegistrationService
+from app.services.risk.service import DefaultRiskService
 from app.services.rules.service import DefaultRulesEngine
 from app.services.tasks.contract import TaskService
 from app.services.tasks.service import DefaultTaskService, DefaultWorkflowSignaller
@@ -99,6 +103,8 @@ def create_app(
             config_path=settings.config_dir / "models.yaml", file_store=files, sessions=sessions
         )
         rules = DefaultRulesEngine(settings.config_dir / "products")
+        kb = DefaultKnowledgeBase(sessions)
+        policies = HttpPolicyService(settings.mock_core_base_url, core_http)
         activities = ClaimActivities(
             app.state.monitoring,
             app.state.task_service,
@@ -109,11 +115,14 @@ def create_app(
             digitisation=DefaultDigitisationService(sessions, files, gateway),
             registration=DefaultRegistrationService(
                 sessions,
-                HttpPolicyService(settings.mock_core_base_url, core_http),
+                policies,
                 HttpMoneyService(settings.mock_core_base_url, core_http),
                 rules,
             ),
             bill_review=DefaultBillReviewService(sessions, rules),
+            medical_review=DefaultMedicalReviewService(sessions, gateway, kb, rules, policies),
+            risk=DefaultRiskService(sessions, gateway, policies),
+            adjudication=DefaultAdjudicationService(sessions, gateway, kb),
         )
         worker_task = asyncio.create_task(
             run_worker_forever(settings, activities), name="temporal-worker"

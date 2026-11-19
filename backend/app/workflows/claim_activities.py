@@ -1,7 +1,7 @@
 """ClaimWorkflow activities. Thin wrappers that call service contracts only.
 
-Slices 2 and 3: intake through bill review call their services. The later stages still
-only record an event; slices 4 and 5 replace them.
+Slices 2 to 4: intake through adjudication call their services. Decision, communication,
+query, settlement and monitoring still only record an event; slice 5 replaces them.
 """
 
 from collections.abc import Awaitable, Callable
@@ -12,12 +12,15 @@ from pydantic import TypeAdapter, ValidationError
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from app.services.adjudication.contract import AdjudicationService
 from app.services.bill_review.contract import BillReviewService, LineEdit
 from app.services.classification.contract import ClassificationService
 from app.services.digitisation.contract import DigitisationService
 from app.services.intake.contract import IntakeService
+from app.services.medical_review.contract import MedicalReviewService
 from app.services.monitoring.contract import Monitoring
 from app.services.registration.contract import RegistrationOverrides, RegistrationService
+from app.services.risk.contract import RiskService
 from app.services.tasks.contract import TaskService
 from app.shared.errors import PermanentError
 from app.shared.types import DocType, Stage
@@ -56,6 +59,9 @@ class ClaimActivities:
         digitisation: DigitisationService,
         registration: RegistrationService,
         bill_review: BillReviewService,
+        medical_review: MedicalReviewService,
+        risk: RiskService,
+        adjudication: AdjudicationService,
     ) -> None:
         self._monitoring = monitoring
         self._tasks = tasks
@@ -64,6 +70,9 @@ class ClaimActivities:
         self._digitisation = digitisation
         self._registration = registration
         self._bill_review = bill_review
+        self._medical_review = medical_review
+        self._risk = risk
+        self._adjudication = adjudication
 
     async def _run(self, claim_id: UUID, stage: Stage, call: Awaitable[R]) -> R:
         """Run a stage's service call. A permanent failure is recorded as an event, so it
@@ -233,15 +242,51 @@ class ClaimActivities:
 
     @activity.defn(name="medical_review")
     async def medical_review(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        findings = await self._run(
+            inp.claim_id, inp.stage, self._medical_review.review(inp.claim_id)
+        )
+        return await self._stage_done(
+            inp,
+            {
+                "verified_codes": [v.code.code for v in findings.verified_codes],
+                "adverse": findings.adverse,
+                "findings": len(findings.findings),
+                "dropped": len(findings.dropped),
+                "query_items": findings.query_items,
+            },
+            needs_checkpoint=findings.adverse,  # "medical findings" only when adverse
+            checkpoint_payload=findings.model_dump(mode="json"),
+        )
 
     @activity.defn(name="risk")
     async def risk(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        report = await self._run(inp.claim_id, inp.stage, self._risk.score(inp.claim_id))
+        return await self._stage_done(
+            inp,
+            {
+                "score": report.score,
+                "refer": report.refer,
+                "hits": [h.rule_id for h in report.hits],
+            },
+            needs_checkpoint=report.refer,  # "investigate" only when referred
+            checkpoint_payload=report.model_dump(mode="json"),
+        )
 
     @activity.defn(name="adjudication")
     async def adjudication(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp, draft="approve")
+        draft = await self._run(inp.claim_id, inp.stage, self._adjudication.draft(inp.claim_id))
+        return await self._stage_done(
+            inp,
+            {
+                "decision": draft.decision,
+                "amount": str(draft.amount),
+                "guardrail_passed": draft.guardrail_passed,
+                "guardrail_errors": draft.guardrail_errors,
+                "self_check_errors": draft.self_check_errors,
+            },
+            draft=draft.decision,
+            checkpoint_payload=draft.model_dump(mode="json"),
+        )
 
     @activity.defn(name="decision")
     async def decision(self, inp: StageInput) -> StageResult:

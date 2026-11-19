@@ -6,16 +6,19 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+from app.services.adjudication.contract import Decision, DraftDecision
 from app.services.bill_review.contract import DeductionSheet, LineEdit
 from app.services.classification.contract import DocumentSet
 from app.services.digitisation.contract import ClaimRecord
 from app.services.intake.contract import ClaimForm, Submission
+from app.services.medical_review.contract import Citation, Finding, MedicalFindings
 from app.services.registration.contract import (
     MatchedHospital,
     MatchedMember,
     RegistrationOverrides,
     RegistrationResult,
 )
+from app.services.risk.contract import RiskHit, RiskReport
 from app.shared.types import DocType, RequestType
 
 _NAMESPACE = uuid.UUID("6f1c1d1e-5a43-4a8e-9a55-0c1a1f0c0001")
@@ -136,3 +139,82 @@ class FakeBillReviewService:
         self, claim_id: UUID, edits: list[LineEdit], *, actor: str
     ) -> DeductionSheet:
         raise NotImplementedError
+
+
+class FakeMedicalReviewService:
+    """Clean findings, or one adverse finding when adverse=True."""
+
+    def __init__(self, *, adverse: bool = False) -> None:
+        self.adverse = adverse
+
+    async def review(self, claim_id: UUID) -> MedicalFindings:
+        findings = (
+            [
+                Finding(
+                    kind="pre_existing",
+                    text="history predates the policy",
+                    severity="adverse",
+                    citations=[Citation(ref="clause:Excl01")],
+                    judged_by="code",
+                )
+            ]
+            if self.adverse
+            else []
+        )
+        return MedicalFindings(
+            claim_id=claim_id,
+            digitisation_version=1,
+            registration_version=1,
+            verified_codes=[],
+            findings=findings,
+            query_items=[],
+            rule_results=[],
+            lookups=[],
+            dropped=[],
+            revisions=0,
+            adverse=self.adverse,
+        )
+
+
+class FakeRiskService:
+    """No red flags, or a referral when refer=True."""
+
+    def __init__(self, *, refer: bool = False) -> None:
+        self.refer = refer
+
+    async def score(self, claim_id: UUID) -> RiskReport:
+        hits = [RiskHit(rule_id="RF3", weight=60, detail="file reused")] if self.refer else []
+        return RiskReport(
+            claim_id=claim_id,
+            registration_version=1,
+            hits=hits,
+            score=60 if self.refer else 0,
+            refer=self.refer,
+            explanation="explained" if self.refer else "No red flags.",
+        )
+
+
+class FakeAdjudicationService:
+    """Drafts the given decision with a passing guardrail."""
+
+    def __init__(self, decision: Decision = "approve") -> None:
+        self.decision = decision
+
+    async def draft(self, claim_id: UUID) -> DraftDecision:
+        zero = Decimal("0.00")
+        return DraftDecision(
+            claim_id=claim_id,
+            input_versions={},
+            decision=self.decision,
+            expected_decision=self.decision,
+            amount=zero,
+            payable_on_sheet=zero,
+            available_balance=zero,
+            reasons=[],
+            query_items=[],
+            summary="",
+            self_check_errors=[],
+            guardrail_errors=[],
+            guardrail_passed=True,
+            revisions=0,
+        )

@@ -260,7 +260,16 @@ class ModelCallRow(Base):
 
 class IcdIndexRow(Base):
     __tablename__ = "icd_index"
-    __table_args__ = (Index("ix_icd_index_term", "system", "version", "term"),)
+    __table_args__ = (
+        Index("ix_icd_index_term", "system", "version", "term"),
+        # Trigram index for ILIKE '%word%' search on Postgres (pg_trgm, migration 0005).
+        Index(
+            "ix_icd_index_path_trgm",
+            "path",
+            postgresql_using="gin",
+            postgresql_ops={"path": "gin_trgm_ops"},
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     system: Mapped[str] = mapped_column(String(30))

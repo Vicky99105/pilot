@@ -21,11 +21,14 @@ from app.workflows.claim_workflow import CHECKPOINT_SLA, ClaimWorkflow
 from app.workflows.worker import build_worker
 from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.stages import (
+    FakeAdjudicationService,
     FakeBillReviewService,
     FakeClassificationService,
     FakeDigitisationService,
     FakeIntakeService,
+    FakeMedicalReviewService,
     FakeRegistrationService,
+    FakeRiskService,
 )
 from tests.fakes.tasks import FakeTaskService
 
@@ -84,7 +87,9 @@ class Harness:
         return [e.detail["kind"] for e in self.monitoring.events if e.action == "checkpoint_opened"]  # type: ignore[index]
 
 
-async def _harness(activities_cls: type[ClaimActivities]) -> AsyncIterator[Harness]:
+async def _harness(
+    activities_cls: type[ClaimActivities], *, adverse: bool = False, refer: bool = False
+) -> AsyncIterator[Harness]:
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
@@ -97,6 +102,9 @@ async def _harness(activities_cls: type[ClaimActivities]) -> AsyncIterator[Harne
             digitisation=FakeDigitisationService(),
             registration=FakeRegistrationService(),
             bill_review=FakeBillReviewService(),
+            medical_review=FakeMedicalReviewService(adverse=adverse),
+            risk=FakeRiskService(refer=refer),
+            adjudication=FakeAdjudicationService(),
         )
         worker: Worker = build_worker(env.client, TASK_QUEUE, claim_activities=activities)
         async with worker:
@@ -106,6 +114,18 @@ async def _harness(activities_cls: type[ClaimActivities]) -> AsyncIterator[Harne
 @pytest.fixture
 async def harness() -> AsyncIterator[Harness]:
     async for h in _harness(ClaimActivities):
+        yield h
+
+
+@pytest.fixture
+async def adverse_harness() -> AsyncIterator[Harness]:
+    async for h in _harness(ClaimActivities, adverse=True):
+        yield h
+
+
+@pytest.fixture
+async def referral_harness() -> AsyncIterator[Harness]:
+    async for h in _harness(ClaimActivities, refer=True):
         yield h
 
 
@@ -217,3 +237,42 @@ async def test_hold_pauses_before_the_next_stage_until_resume(harness: Harness) 
         lambda: bool(harness.tasks.unfinished("confirm_deductions")), "bill review after resume"
     )
     await handle.terminate()
+
+
+async def test_adverse_medical_findings_open_the_medical_officer_task(
+    adverse_harness: Harness,
+) -> None:
+    h = adverse_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions"]:
+        await h.complete(handle, kind)
+    await h.wait_for(lambda: bool(h.tasks.unfinished("medical_findings")), "medical task")
+    [task] = h.tasks.unfinished("medical_findings")
+
+    assert task.role.value == "medical_officer"
+    assert task.payload["adverse"] is True
+    assert task.payload["findings"][0]["kind"] == "pre_existing"
+    assert h.monitoring.actions(Stage.RISK) == []  # waits for the medical officer
+
+    for kind in ["medical_findings", "approve", "release_payment"]:
+        await h.complete(handle, kind)
+    assert (await handle.result()).status == "closed"
+    assert "investigate" not in h.opened_kinds()
+
+
+async def test_a_referral_opens_the_investigator_task(referral_harness: Harness) -> None:
+    h = referral_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions"]:
+        await h.complete(handle, kind)
+    await h.wait_for(lambda: bool(h.tasks.unfinished("investigate")), "investigator task")
+    [task] = h.tasks.unfinished("investigate")
+
+    assert task.role.value == "investigator"
+    assert (task.payload["score"], task.payload["refer"]) == (60, True)
+    assert h.monitoring.actions(Stage.ADJUDICATION) == []  # waits for the investigator
+
+    for kind in ["investigate", "approve", "release_payment"]:
+        await h.complete(handle, kind)
+    assert (await handle.result()).status == "closed"
+    assert "medical_findings" not in h.opened_kinds()

@@ -18,14 +18,42 @@ from app.services.digitisation.contract import (
     BillLine,
     ClaimedAmounts,
     ClaimRecord,
+    Clinical,
+    ClinicalFact,
     HospitalDetails,
     Identity,
 )
 from app.shared.seed_ids import HOSPITAL_ROHINI_IDS
-from app.shared.types import Field, RequestType, Stage
+from app.shared.types import Code, DocType, Field, PageRef, RequestType, Stage
 
 POLICY = "MOCK/AS/2026/000101"
 MEMBER = "MOCK-M-000101-01"
+DISCHARGE_DOC = UUID("0d15c4a2-0000-4000-8000-000000000001")
+DIAGNOSIS = "Acute appendicitis with perforation and localised peritonitis"
+
+
+def page(n: int) -> PageRef:
+    """A page of the discharge summary."""
+    return PageRef(document_id=DISCHARGE_DOC, page=n)
+
+
+def fact(kind: Any, text: str, n: int, duration: str | None = None) -> ClinicalFact:
+    return ClinicalFact(kind=kind, text=text, duration=duration, confidence=0.95, source=page(n))
+
+
+def appendicitis(*extra: ClinicalFact) -> Clinical:
+    """The tracer claim's discharge summary: perforated appendix, hospital code K35.8."""
+    return Clinical(
+        diagnoses=[Field(value=DIAGNOSIS, confidence=0.95, source=page(1))],
+        procedures=[Field(value="Laparoscopic appendicectomy", confidence=0.95, source=page(1))],
+        hospital_codes=[Code(system="ICD-10", version="as-written", code="K35.8")],
+        facts=[
+            fact("diagnosis", DIAGNOSIS, 1),
+            fact("history", "Pain in right lower abdomen for 2 days", 1, duration="2 days"),
+            fact("finding", "CT abdomen: perforated appendix with localised collection", 2),
+            *extra,
+        ],
+    )
 
 
 def f(value: Any) -> Any:
@@ -72,6 +100,7 @@ class ClaimSpec:
     accident: bool = False
     claimed: Decimal = Decimal("170000.00")
     lines: list[BillLine] = field(default_factory=lambda: list(WORKED_BILL))
+    clinical: Clinical = field(default_factory=appendicitis)
 
 
 def claim_record(claim_id: UUID, spec: ClaimSpec) -> ClaimRecord:
@@ -92,6 +121,8 @@ def claim_record(claim_id: UUID, spec: ClaimSpec) -> ClaimRecord:
             accident=f(spec.accident),
         ),
         claimed=ClaimedAmounts(total=f(spec.claimed)),
+        clinical=spec.clinical,
+        documents={DocType.DISCHARGE_SUMMARY: DISCHARGE_DOC},
         bill=Bill(lines=spec.lines, grand_total=f(total)),
     )
 

@@ -48,6 +48,9 @@ docker compose -f deploy/docker-compose.yml exec app python -m app.mock_core.see
 curl -k -H 'X-User-Id: 00000000-0000-4000-8000-000000000003' https://localhost/api/tasks/queue
 ```
 
+The compose file sets the project name `claims-pilot`. Do not pass `-p`: another
+project name starts a second stack with its own containers and volumes.
+
 Both seeds are idempotent. Phase 1 has no real auth: the `X-User-Id` header picks a
 seeded user (IDs in `backend/app/shared/seed_ids.py`; `...0003` is "ops").
 

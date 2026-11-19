@@ -46,6 +46,7 @@ from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.file_store import FakeFileStore
 from tests.fakes.model_gateway import FakeModelGateway
 from tests.fakes.monitoring import FakeMonitoring
+from tests.fakes.stages import FakeAdjudicationService, FakeMedicalReviewService, FakeRiskService
 from tests.fakes.tasks import FakeTaskService
 from tests.services.test_digitisation import BILL, CHEQUE, DISCHARGE, PAGES, PART_A, v
 from tests.services.test_registration import asha_policy
@@ -87,6 +88,9 @@ class Harness:
                 self.sessions, FakePolicyService([asha_policy()]), self.money, rules
             ),
             bill_review=DefaultBillReviewService(self.sessions, rules),
+            medical_review=FakeMedicalReviewService(),
+            risk=FakeRiskService(),
+            adjudication=FakeAdjudicationService(),
         )
 
     async def submit(self) -> Submission:
