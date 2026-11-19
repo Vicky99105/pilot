@@ -17,8 +17,8 @@ What it does, through the HTTP API only (X-User-Id picks the seeded user):
    SELECTs through `docker compose exec postgres psql`) and scores the run against
    ground_truth.json. Writes report.json and report.md to the run folder.
 
-It stops early when the model cost in the database passes the budget, or when no new event
-arrives for --stall-seconds.
+It stops early when the model cost in the database passes the budget, when no new event
+arrives for --stall-seconds, or when a checkpoint comes back refused (outcome "refused").
 """
 
 import argparse
@@ -274,6 +274,12 @@ class Driver:
                         continue
                     full = self.api.get(f"/api/tasks/{task['id']}", user)
                     outcome = self.outcome(full)
+                    error = full["payload"].get("error")
+                    if error:
+                        # The service refused this checkpoint's outcome; the driver would
+                        # send the same outcome again, which cannot pass.
+                        self.log(event="refused", kind=full["kind"], error=error)
+                        return "refused"
                     self.api.post(
                         f"/api/tasks/{task['id']}/complete", user, json={"outcome": outcome}
                     )

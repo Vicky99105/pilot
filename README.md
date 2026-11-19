@@ -103,7 +103,7 @@ uv run --project backend python tools/mockgen/tracer_claim.py --out .local/trace
 ```
 
 `tools/acceptance/run_tracer.py` runs the claim live through the stack on port 8000 (start it
-with the override above, with `OPENROUTER_API_KEY` set, then migrate and seed). It submits
+with the override above, with the key for the provider in `config/models.yaml` set, currently `GEMINI_API_KEY`, then migrate and seed). It submits
 the merged PDF as the member, completes every checkpoint as ops, doctor and finance through
 the API, answers the query with the receipt, and scores the run against the ground truth.
 Each run picks an admission date that overlaps no earlier claim, so it can be re-run.

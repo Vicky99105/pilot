@@ -343,17 +343,23 @@ def _form_matches(record: ClaimRecord, form: ClaimForm) -> CheckResult | None:
 def _bank_matches(record: ClaimRecord) -> CheckResult | None:
     cheque, form = record.bank, record.claim_form_bank
     pairs = [
-        ("bank.account_number", cheque.account_number.value, form.account_number.value),
-        ("bank.ifsc", cheque.ifsc.value, form.ifsc.value),
+        ("account_number", cheque.account_number.value, form.account_number.value),
+        ("ifsc", cheque.ifsc.value, form.ifsc.value),
     ]
-    compared = [(p, a, b) for p, a, b in pairs if a and b]
+    compared = [(name, a, b) for name, a, b in pairs if a and b]
     if not compared:
         return None
-    odd = [p for p, a, b in compared if _ident(a) != _ident(b)]
+    # Either side can be the misread one, so a mismatch flags both for the operator.
+    odd = [
+        path
+        for name, a, b in compared
+        if _ident(a) != _ident(b)
+        for path in (f"bank.{name}", f"claim_form_bank.{name}")
+    ]
     return CheckResult(
         check_id="bank_matches_cheque",
         passed=not odd,
-        detail="; ".join(f"{p}: cheque {a} vs claim form {b}" for p, a, b in compared),
+        detail="; ".join(f"bank.{n}: cheque {a} vs claim form {b}" for n, a, b in compared),
         fields=odd,
     )
 

@@ -299,7 +299,18 @@ async def test_claim_form_bank_must_match_the_cheque(env: Env) -> None:
 
     record = await env.extract()
 
-    assert failed(record) == {"bank_matches_cheque": ["bank.account_number"]}
+    assert failed(record) == {
+        "bank_matches_cheque": ["bank.account_number", "claim_form_bank.account_number"]
+    }
+
+
+async def test_a_bank_mismatch_flags_the_claim_form_side_for_correction(env: Env) -> None:
+    # Either side can be the misread one, so the operator must be offered both.
+    env.replies[DocType.CLAIM_FORM_PART_A]["ifsc"] = v("SBNN0001234")
+
+    record = await env.extract()
+
+    assert failed(record) == {"bank_matches_cheque": ["bank.ifsc", "claim_form_bank.ifsc"]}
 
 
 async def test_low_confidence_uses_a_stricter_bar_for_handwriting(env: Env) -> None:
