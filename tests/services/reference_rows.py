@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.database.models import (
     DrugPriceRow,
     GuidelineSectionRow,
+    NonPayableItemRow,
     PackageItemRow,
     PackageMasterRow,
     RateFactorRow,
@@ -98,3 +99,39 @@ async def add_reference_rows(sessions: async_sessionmaker[AsyncSession]) -> None
                 )
             ]
         )  # fmt: skip
+
+
+# The wording's non-payable items the tracer bill comes near, as the non_payable loader
+# writes them (tests/pg checks each against the loaded table): gloves, which R11 matches,
+# and the three nursing items "Nursing Care Charges" is near, which go to R12.
+WORDING = "GODHLIP24179V022324"
+TRACER_WORDING_ITEMS: list[tuple[str, int, str, str, str]] = [
+    ("I", 21, "SERVICE CHARGES WHERE NURSING CHARGE ALSO CHARGED",
+     "Not paid when nursing is also charged", "not_payable"),
+    ("I", 52, "PRIVATE NURSES CHARGES- SPECIAL NURSING CHARGES",
+     "Special nursing during the stay is paid; nursing after discharge is not",
+     "payable_within_limits"),
+    ("I", 56, "GLOVES",
+     "Sterile gloves are paid; non-sterile (examination) gloves are not, so a bill line must "
+     "show the gloves were sterile", "not_payable_unless"),
+    ("II", 38, "Nursing, DMO/ RMO charges included in room rent under associated medical "
+     "expenses", "Part of the room charges; not paid as a separate item", "not_payable"),
+]  # fmt: skip
+
+
+async def add_tracer_wording_items(sessions: async_sessionmaker[AsyncSession]) -> None:
+    """Load the wording's items above as the active non-payable lists (they replace the
+    fixture), as in the acceptance environment."""
+    async with sessions.begin() as session:
+        session.add_all(
+            NonPayableItemRow(
+                list_name=list_name,
+                item_number=number,
+                item=item,
+                condition=condition,
+                payable_in_product=flag,
+                source="non_payable",
+                source_version=WORDING,
+            )
+            for list_name, number, item, condition, flag in TRACER_WORDING_ITEMS
+        )

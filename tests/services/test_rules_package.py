@@ -4,6 +4,7 @@ and R18, the sub-limits R16, R17 and R19, the pre-auth check R26, the eligibilit
 R7 and R9 on verified codes, and the drug price check."""
 
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -38,6 +39,90 @@ def pkg(code: str, rate: str, *, addon: bool = False, standalone: bool = False) 
     )  # fmt: skip
 
 
+# --- Which claims the hospital agreement's package pricing binds ---------------------------
+
+CASHLESS, REIMBURSEMENT = "cashless", "reimbursement"
+AG095_ITEMISED = PackageFacts(packages=[pkg("AG095", "33000")], billed_as_package=False,
+                              package_total=D("93003.00"))  # fmt: skip
+AG095_CHARGED = PackageFacts(packages=[pkg("AG095", "33000")], billed_as_package=True)
+ROOM_7500 = RoomFacts(sum_insured=D("500000"), room_rate_per_day=D("7500"),
+                      differential_billing=True)  # fmt: skip
+
+
+def wording(product: ProductConfig, routes: list[str]) -> ProductConfig:
+    """The product with package pricing bound to other claim routes, as another wording
+    would set it."""
+    packages = product.packages.model_copy(update={"pricing_applies_to": routes})
+    return product.model_copy(update={"packages": packages})
+
+
+def package_rules(engine: RulesEngine, product: ProductConfig, route: str | None
+                  ) -> dict[str, tuple[bool, Decimal]]:  # fmt: skip
+    """R20, R23, R24 and R13 on one claim route: (passed, amount effect) each."""
+    results = {
+        "R20": one(engine, "R20", Facts(claim_route=route, package=AG095_ITEMISED), product),
+        "R23": one(engine, "R23", Facts(claim_route=route, package=AG095_CHARGED,
+                                        line=line(Head.CONSUMABLES, "4850")), product),
+        "R24": one(engine, "R24", Facts(claim_route=route, package=AG095_ITEMISED,
+                                        line=line(Head.AMBULANCE, "7500"),
+                                        non_package_discount_percent=D("10")), product),
+        "R13": one(engine, "R13", Facts(claim_route=route, package=AG095_ITEMISED, room=ROOM_7500,
+                                        line=line(Head.ROOM, "7500", qty=D(1), rate=D(7500))),
+                   product),
+    }  # fmt: skip
+    return {rule_id: (r.passed, r.amount_effect) for rule_id, r in results.items()}
+
+
+def test_the_product_binds_package_pricing_to_cashless_claims_only(product: ProductConfig) -> None:
+    assert product.packages.pricing_applies_to == [CASHLESS]
+
+
+def test_a_cashless_claim_is_priced_by_the_package(
+    engine: RulesEngine, product: ProductConfig
+) -> None:
+    assert package_rules(engine, product, CASHLESS) == {
+        "R20": (False, D("-60003.00")),  # capped at AG095's Rs 33,000
+        "R23": (False, D("-4850.00")),  # already inside the package charge
+        "R24": (False, D("-750.00")),  # agreed 10% off a line outside the package
+        "R13": (True, D("0")),  # the package prices the room
+    }
+
+
+def test_a_reimbursement_is_not_capped_by_package_rates(
+    engine: RulesEngine, product: ProductConfig
+) -> None:
+    """The agreement binds the hospital on cashless claims; a reimbursement is paid on the
+    policy's own limits, so the room cap applies even though a package was mapped."""
+    assert package_rules(engine, product, REIMBURSEMENT) == {
+        "R20": (True, D("0")),
+        "R23": (True, D("0")),
+        "R24": (True, D("0")),
+        "R13": (False, D("-2500.00")),  # Rs 7,500 a day against the Rs 5,000 cap
+    }
+    r20 = one(engine, "R20", Facts(claim_route=REIMBURSEMENT, package=AG095_ITEMISED), product)
+    assert "reimbursement" in r20.reason and "AG095" in r20.reason
+
+
+def test_a_wording_that_caps_reimbursement_at_package_rates_turns_it_on(
+    engine: RulesEngine, product: ProductConfig
+) -> None:
+    """New India's wording (clause 3.31) caps a reimbursement at the network package rate."""
+    both = wording(product, [CASHLESS, REIMBURSEMENT])
+
+    assert package_rules(engine, both, REIMBURSEMENT) == package_rules(engine, both, CASHLESS)
+    assert package_rules(engine, both, REIMBURSEMENT)["R20"] == (False, D("-60003.00"))
+
+
+def test_package_rules_without_the_claim_route_name_the_missing_fact(
+    engine: RulesEngine, product: ProductConfig
+) -> None:
+    for rule_id, result in package_rules(engine, product, None).items():
+        if rule_id != "R13":
+            assert result == (False, D("0")), rule_id
+    r20 = one(engine, "R20", Facts(package=AG095_ITEMISED), product)
+    assert r20.reason == "missing facts: claim_route"
+
+
 # --- R20: package cap and the multi-procedure rule ----------------------------------------
 
 
@@ -65,7 +150,8 @@ def test_r20_caps_the_package_charges_at_the_package_total(
     passed: bool,
 ) -> None:
     facts = Facts(
-        package=PackageFacts(packages=packages, billed_as_package=False, package_total=D(billed))
+        claim_route=CASHLESS,
+        package=PackageFacts(packages=packages, billed_as_package=False, package_total=D(billed)),
     )
 
     result = one(engine, "R20", facts, product)
@@ -76,8 +162,8 @@ def test_r20_caps_the_package_charges_at_the_package_total(
 
 def test_r20_names_each_package_and_its_share(engine: RulesEngine, product: ProductConfig) -> None:
     packages = [pkg("A", "40000"), pkg("B", "20000"), pkg("SA", "25000", standalone=True)]
-    facts = Facts(package=PackageFacts(packages=packages, billed_as_package=False,
-                                       package_total=D("90000")))  # fmt: skip
+    facts = Facts(claim_route=CASHLESS, package=PackageFacts(
+        packages=packages, billed_as_package=False, package_total=D("90000")))  # fmt: skip
 
     result = one(engine, "R20", facts, product)
 
@@ -114,6 +200,7 @@ def test_r23_deducts_lines_a_package_charge_already_covers(
     effect: str,
 ) -> None:
     facts = Facts(
+        claim_route=CASHLESS,
         line=line(head, "4850"),
         package=PackageFacts(packages=[pkg("AG095", "33000")], billed_as_package=billed_as_package),
     )
@@ -156,6 +243,7 @@ def test_r24_discounts_non_package_lines_except_medicines_and_implants(
     effect: str,
 ) -> None:
     facts = Facts(
+        claim_route=CASHLESS,
         line=line(head, "7500"),
         package=package,
         non_package_discount_percent=None if percent is None else D(percent),
@@ -180,8 +268,9 @@ def test_r13_and_r14_leave_package_lines_to_the_package(
     room_line = line(Head.ROOM, "7500", qty=D(1), rate=D(7500))
     icu_line = line(Head.ICU, "15000", qty=D(1), rate=D(15000))
 
-    r13 = one(engine, "R13", Facts(line=room_line, room=room, package=package), product)
-    r14 = one(engine, "R14", Facts(line=icu_line, room=room, package=package), product)
+    on = {"room": room, "package": package, "claim_route": CASHLESS}
+    r13 = one(engine, "R13", Facts(line=room_line, **on), product)
+    r14 = one(engine, "R14", Facts(line=icu_line, **on), product)
 
     assert (r13.passed, r13.amount_effect) == (True, D("0"))
     assert (r14.passed, r14.amount_effect) == (True, D("0"))

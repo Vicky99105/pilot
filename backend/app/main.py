@@ -170,6 +170,7 @@ def create_app(
     app.state.file_store = file_store
     app.state.permission_service = permission_service
     app.state.query_service = query_service
+    app.state.mock_core_admin_enabled = settings.mock_core_admin_enabled
     app.include_router(health.router)
     app.include_router(task_routes.router)
     app.include_router(monitoring_routes.router)

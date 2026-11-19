@@ -28,7 +28,7 @@ from app.shared.types import DocType, RequestType, Stage
 from app.workflows.claim_workflow import ClaimWorkflow
 from app.workflows.worker import build_worker
 from tests.knowledge import sources
-from tests.services.reference_rows import add_reference_rows
+from tests.services.reference_rows import add_reference_rows, add_tracer_wording_items
 from tests.services.test_medical_review_coding import LAPAROSCOPIC_APPENDICECTOMY
 from tests.services.test_registration import asha_policy
 from tests.workflows.test_claim_end_to_end import TASK_QUEUE, Gateway, Harness
@@ -152,9 +152,14 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
             }
             for ln in truth["sheet"]["deductions"]
         ],
-        "summary": "Paid at the agreed package rate; one non-payable item.",
+        "summary": "Room cap with proportionate deduction; non-payable items.",
     }
     package = truth["expected"]["package"]
+    # R12: the one line the wording's lists leave unclear, read as the ground truth expects.
+    [item] = gen.R12_READINGS.values()
+    assert item is not None
+    nursing = {"line_1": {"choice": f"List {item.list_name} item {item.item_number}: "
+                                    f"{item.item}", "confidence": 0.95}}  # fmt: skip
     return {
         "classify_page": [*labels, {"doc_type": "payment_receipt", "confidence": 0.97}],
         "extract_claim_form_part_a": [part_a],
@@ -165,6 +170,7 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
         "medical_rewrite_terms": [rewrite, rewrite],
         "medical_pcs_step": [*LAPAROSCOPIC_APPENDICECTOMY] * 2,
         "medical_choose_codes": [choose, choose],
+        "bill_non_payable": [nursing] * 2,
         "bill_package_choice": [{"procedure_1": package}] * 2,
         "medical_ped_reread": [{"statements": []}] * 2,
         "medical_findings": [{"findings": [], "query_items": []}] * 2,
@@ -181,6 +187,7 @@ async def run(
     await seed_icd_fixture(sessions)
     await load_icd10pcs(sessions, sources.write_sources(tmp_path / "icd-2027"))
     await add_reference_rows(sessions)
+    await add_tracer_wording_items(sessions)
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:

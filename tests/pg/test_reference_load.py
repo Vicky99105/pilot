@@ -45,6 +45,7 @@ from app.services.rules.contract import NonPayableItem
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import HOSPITAL_ROHINI_IDS, PRODUCT_UIN
 from tests.pg.conftest import ALEMBIC_INI, PG_ENV, _server
+from tests.services.reference_rows import TRACER_WORDING_ITEMS
 from tools.mockgen import tracer_claim as gen
 
 pytestmark = pytest.mark.pg
@@ -257,23 +258,31 @@ def test_the_tracer_ground_truth_holds_against_the_full_non_payable_lists(loaded
     async def unclear(kb: KnowledgeBase) -> set[str]:
         return {d for d in descriptions if await kb.match_non_payable(d)}
 
-    # The lines bill review would send to R12 against the loaded lists, which the generator
-    # reads as R12_READINGS says. Gloves matches R11 itself and is never unclear.
+    # The lines bill review sends to R12 against the loaded lists are exactly the ones the
+    # generator reads, and each reading is a loaded item as written. Gloves matches R11
+    # itself and is never unclear.
     near = _run(loaded, unclear) - {gen.NON_PAYABLE_ITEM}
     print(f"\nTracer lines near a list item (R12): {sorted(near)}")
-    assert near <= set(gen.R12_READINGS)
+    assert near == set(gen.R12_READINGS)
+    for reading in gen.R12_READINGS.values():
+        assert reading is None or reading in full
+    # The wording rows the workflow test loads are the loaded rows.
+    for list_name, number, item, condition, flag in TRACER_WORDING_ITEMS:
+        assert NonPayableItem(list_name=list_name, item_number=number, item=item,
+                              condition=condition, payable_in_product=flag) in full  # fmt: skip
 
     fixture_sheet = gen.expected_sheet(claim, rules)
-    full_sheet = gen.expected_sheet(claim, rules, full, near)
+    full_sheet = gen.expected_sheet(claim, rules, full)
 
     deducted = [
         (ln["description"], ln["deducted"], ln["rule_id"]) for ln in full_sheet["deductions"]
     ]
     assert ("Gloves", D("264.00"), "R11") in deducted
+    assert ("Nursing Care Charges", D("900.00"), "R12") in deducted
     assert [ln["deducted"] for ln in full_sheet["lines"]] == [
         ln["deducted"] for ln in fixture_sheet["lines"]
     ]
-    assert full_sheet["payable"] == fixture_sheet["payable"] == D("31350.00")
+    assert full_sheet["payable"] == fixture_sheet["payable"] == D("60644.52")
 
 
 # --- Slice P2-4: the tracer's package, guideline, norm and drug prices ---------------------

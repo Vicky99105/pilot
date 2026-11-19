@@ -9,7 +9,8 @@ and mock_core databases are migrated and seeded.
 What it does, through the HTTP API only (X-User-Id picks the seeded user):
 1. Picks an admission date that overlaps none of the member's earlier claims, so it can be
    re-run, and generates the bundle with tools/mockgen/tracer_claim.py.
-2. Submits the merged PDF as the member (POST /api/submissions).
+2. Resets the member's mock policy balances (POST /mock-core/admin/reset-policy, local
+   override only), then submits the merged PDF as the member (POST /api/submissions).
 3. Polls the queues of ops, doctor, finance and the senior approver, and completes each of
    this claim's tasks with the outcome the UI sends. At "fix labels" and "fix fields" it
    acts as an operator: a flagged value that differs from the ground truth is corrected.
@@ -61,6 +62,7 @@ STAFF = {
     "senior": SENIOR_USER_ID,
 }
 STAY = timedelta(days=gen.STAY_DAYS)
+ACTOR = "acceptance-run"  # who the mock core's reset event names
 _TITLES = {"mr", "mrs", "ms", "miss", "smt", "shri", "sri", "dr"}
 
 
@@ -490,6 +492,9 @@ def score(claim_id: str, truth: dict[str, Any], driver: Driver, api: Api) -> dic
         ],
         "expected": truth["expected"]["package"],
         "billed_as_package": package.get("billed_as_package"),
+        # Whether the package priced any line (capped money), against the ground truth.
+        "lines_in_package": sum(1 for ln in sheet["lines"] if ln.get("in_package")),
+        "caps_money_expected": want_sheet.get("package_caps_money"),
     }
     report["bill_findings"] = [
         (f["kind"], f.get("line_id"), f["text"]) for f in sheet.get("findings", [])
@@ -731,6 +736,10 @@ def markdown(report: dict[str, Any], outcome: str, wall: float) -> str:
     )
     out.append(f"- Bill findings: {r['bill_findings']}")
     out.append(f"- Bill findings expected: {r['bill_findings_expected']}")
+    out.append(
+        f"- Package priced {pk['lines_in_package']} lines (expected to cap money: "
+        f"{pk['caps_money_expected']})"
+    )
     out.append(f"- R12 readings: {r['r12']}; rules failed {r['rules_failed']}")
     out.append(f"- Rules fired: {d['rules_fired']}")
     out.append(f"- Rules expected: {d['rules_expected']}")
@@ -791,6 +800,23 @@ def markdown(report: dict[str, Any], outcome: str, wall: float) -> str:
     return "\n".join(out) + "\n"
 
 
+def submit(api: Api, merged: Path, truth: dict[str, Any]) -> Any:
+    """Reset the tracer member's mock policy balances, then submit the merged bundle as the
+    member. Each run starts from the seeded balance, so earlier runs' utilised and blocked
+    amounts never fail R10. The reset needs the local override (MOCK_CORE_ADMIN_ENABLED)."""
+    api.post(
+        "/mock-core/admin/reset-policy",
+        ACTOR,
+        json={"policy_number": MEMBER_POLICY_NUMBER},
+    )
+    return api.post(
+        "/api/submissions",
+        MEMBER_USER_ID,
+        data={"form": json.dumps(truth["form"])},
+        files={"merged": (merged.name, merged.read_bytes(), "application/pdf")},
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -816,13 +842,7 @@ def main() -> None:
     print(f"Run folder {run_dir}; admission {admission}; spent so far USD {spent:.4f}")
 
     started = time.monotonic()
-    merged = run_dir / gen.MERGED
-    submission = api.post(
-        "/api/submissions",
-        MEMBER_USER_ID,
-        data={"form": json.dumps(truth["form"])},
-        files={"merged": (merged.name, merged.read_bytes(), "application/pdf")},
-    )
+    submission = submit(api, run_dir / gen.MERGED, truth)
     claim_id = submission["claim_id"]
     driver = Driver(api, truth, run_dir, args.budget_usd)
     driver.log(

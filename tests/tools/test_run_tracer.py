@@ -4,8 +4,8 @@ of sending the same outcome again until the run times out."""
 from pathlib import Path
 from typing import Any
 
-from app.shared.seed_ids import FINANCE_USER_ID
-from tools.acceptance.run_tracer import Driver
+from app.shared.seed_ids import FINANCE_USER_ID, MEMBER_POLICY_NUMBER
+from tools.acceptance.run_tracer import Driver, submit
 
 CLAIM = "claim-1"
 REFUSAL = "PermanentError: PayeeCheckFailed: payee checks failed: cheque_matches_claim_form"
@@ -48,3 +48,33 @@ def test_driver_stops_at_a_checkpoint_reopened_after_a_refusal(tmp_path: Path) -
     assert api.completed == []  # the refused outcome is not sent again
     assert driver.actions[-1]["event"] == "refused"
     assert driver.actions[-1]["error"] == REFUSAL
+
+
+class RecordingApi:
+    """Records each POST; answers the submission like the API does."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, Any, dict[str, Any]]] = []
+
+    def post(self, path: str, user: Any, **kwargs: Any) -> Any:
+        self.posts.append((path, user, kwargs))
+        if path == "/api/submissions":
+            return {"claim_id": CLAIM, "missing_documents": [], "warnings": []}
+        return {"policy_number": MEMBER_POLICY_NUMBER, "blocks_voided": 0}
+
+
+def test_each_run_resets_the_tracer_policy_before_it_submits(tmp_path: Path) -> None:
+    """Live runs left utilised and blocked amounts on the tracer member's mock policy, so a
+    later run failed R10. Every run now starts from a clean balance."""
+    api = RecordingApi()
+    merged = tmp_path / "bundle_merged.pdf"
+    merged.write_bytes(b"%PDF-1.4")
+
+    submission = submit(api, merged, {"form": {"policy_number": MEMBER_POLICY_NUMBER}})  # type: ignore[arg-type]
+
+    assert [path for path, _, _ in api.posts] == ["/mock-core/admin/reset-policy",
+                                                  "/api/submissions"]  # fmt: skip
+    _, actor, reset = api.posts[0]
+    assert reset == {"json": {"policy_number": MEMBER_POLICY_NUMBER}}
+    assert actor == "acceptance-run"
+    assert submission["claim_id"] == CLAIM

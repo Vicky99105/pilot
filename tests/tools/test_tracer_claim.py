@@ -52,9 +52,13 @@ def test_bill_lines_sections_and_totals_add_up(bundle: tuple[Path, dict[str, Any
     assert [ln["line_id"] for ln in bill["lines"]] == list(range(1, len(bill["lines"]) + 1))
 
 
-def test_deductions_are_consistent_and_follow_the_package(
+def test_deductions_are_consistent_and_follow_the_policy_limits(
     bundle: tuple[Path, dict[str, Any]],
 ) -> None:
+    """A member reimbursement: AG095 is mapped (guideline and stay norm) but its rate does not
+    cap the claim under this wording. The policy's own rules apply: R11 takes the gloves, R12
+    reads the nursing lines as List II item 38 (part of the room charges), and the room cap
+    with the proportionate deduction (R13) takes the rest."""
     _, truth = bundle
     sheet = truth["sheet"]
     for line in sheet["lines"]:
@@ -64,22 +68,38 @@ def test_deductions_are_consistent_and_follow_the_package(
     assert D(sheet["co_pay"]) == (admissible * D("0.05")).quantize(D("0.01"))
     assert D(sheet["payable"]) == admissible - D(sheet["co_pay"])
     assert sheet["package"]["package_code"] == "AG095"
+    assert sheet["claim_route"] == "reimbursement"
 
     by_rule = defaultdict(set)
     for line in sheet["deductions"]:
         by_rule[(line["rule_id"], line["clause_ref"])].add(line["head"])
-    # Every head on the bill is one a package covers: R20 caps them all at the package rate.
     assert by_rule == {
-        ("R20", "AGREED-TARIFF"): {"room", "nursing", "ot", "professional_fees", "pharmacy",
-                                   "consumables", "diagnostics"},
         ("R11", "ANNEX-I"): {"consumables"},
-    }  # fmt: skip
+        ("R12", "ANNEX-II"): {"nursing"},
+        ("R13", "ROOM-CAP"): {"room"},
+        ("R13", "PROP-DED"): {"ot", "professional_fees"},
+    }
+    assert not any(d["rule_id"] in ("R20", "R23", "R24") for ln in sheet["lines"]
+                   for d in ln["deductions"])  # fmt: skip
     [r11] = [ln for ln in sheet["deductions"] if ln["rule_id"] == "R11"]
     assert r11["description"] == gen.NON_PAYABLE_ITEM and r11["deducted"] == r11["claimed"]
-    # What R11 left is capped at the package rate exactly.
-    assert admissible == D(sheet["package"]["rate"])
-    assert sheet["rules_failed"] == ["R11", "R20"]
+    nursing = [ln for ln in sheet["lines"] if ln["head"] == "nursing"]
+    assert len(nursing) == 4 and all(D(ln["admissible"]) == 0 for ln in nursing)
+    assert all("List II item 38" in ln["reason"] for ln in nursing)
+    assert sheet["rules_failed"] == ["R11", "R12", "R13"]
     assert truth["expected"]["approver_band"] == "approver"  # payable within Rs 1 lakh
+
+
+def test_the_room_cap_matches_simple_arithmetic(bundle: tuple[Path, dict[str, Any]]) -> None:
+    """A cross-check of the engine's numbers: Rs 7,500 a day against the Rs 5,000 cap is a
+    2/3 ratio, applied to the room and to each OT and professional fee line."""
+    _, truth = bundle
+    sheet = truth["sheet"]
+    assert (D(sheet["room_rate_per_day"]), D(sheet["room_cap_per_day"])) == (D("7500"), D("5000"))
+    for line in sheet["lines"]:
+        if line["head"] in ("room", "ot", "professional_fees"):
+            expected = (D(line["claimed"]) * 2 / 3).quantize(D("0.01"))
+            assert D(line["admissible"]) == expected, line["description"]
 
 
 def test_drug_findings_compare_against_the_ceiling_plus_gst(

@@ -8,6 +8,10 @@ from pydantic import BaseModel
 
 from app.shared.types import Stage
 
+# The claim ID for events about no single claim, such as a test-data reset of a mock core
+# policy. No claim has it, so these events never move a claim's status.
+SYSTEM_EVENTS = UUID(int=0)
+
 
 class ClaimStatusRow(BaseModel):
     claim_id: UUID

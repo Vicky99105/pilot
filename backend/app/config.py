@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     mock_core_database_url: str = "postgresql+psycopg://claims:claims@localhost:5432/mock_core"
     # Where the Http core clients reach the core systems. Phase 1: this app's own router.
     mock_core_base_url: str = "http://127.0.0.1:8000/mock-core"
+    # Test-data admin operations on the mock core (reset a policy's balances), for local
+    # acceptance runs only. Off by default; only deploy/docker-compose.local.yml turns it on.
+    mock_core_admin_enabled: bool = False
     temporal_address: str = "localhost:7233"
     temporal_namespace: str = "default"
     temporal_task_queue: str = "claims"

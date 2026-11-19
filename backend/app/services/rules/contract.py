@@ -14,6 +14,9 @@ RuleResult conventions:
   no item for has no clause, and only such a line goes to R12.
 - A rule that lacks the facts it needs returns passed=False with a reason naming them, so a
   person sees the gap at the checkpoint.
+- Package pricing (R20, R23, R24) applies only on the claim routes the product config lists
+  in packages.pricing_applies_to. On another route those rules pass and the room and ICU caps
+  (R13, R14) apply to every line, whether or not a package was mapped.
 
 Callers import this module only.
 """
@@ -154,9 +157,19 @@ class MultiProcedure(BaseModel):
     addon: Decimal
 
 
+# How a claim reaches the insurer: through the network hospital (cashless: pre-auth,
+# enhancement, discharge) or from the insured person after paying the bill (reimbursement).
+ClaimRoute = Literal["cashless", "reimbursement"]
+
+
 class Packages(BaseModel):
     """How the product pays a hospital's package (R20, R23, R24, R13 and R14)."""
 
+    # The claim routes the hospital agreement's pricing binds: the package or tariff cap
+    # (R20, with the multi-procedure rule), unbundling (R23) and the non-package discount
+    # (R24). On any other route the policy's own limits apply (R13, R14), even when a package
+    # is mapped. A wording that caps reimbursement at the network rate lists both routes.
+    pricing_applies_to: list[ClaimRoute]
     included_heads: list[Head]  # what a package price covers when the bill is itemised
     multi_procedure_percent: MultiProcedure
     # R24: the agreed discount on non-package items does not apply to these heads.
@@ -321,6 +334,7 @@ class Facts(BaseModel):
     pre_existing_onsets: list[date] = []  # R6: latest start dates of conditions found
     judgement: NonPayableJudgement | None = None  # R12
     package: PackageFacts | None = None  # R13, R14, R20, R23, R24
+    claim_route: ClaimRoute | None = None  # R13, R14, R20, R23, R24: does the agreement bind?
     non_package_discount_percent: Decimal | None = None  # R24, from the hospital agreement
     ambulance_total: Decimal | None = None  # R19: ambulance lines after the earlier rules
     preauth: PreAuthFacts | None = None  # R26; None for a reimbursement with no pre-auth

@@ -2,6 +2,9 @@
 
 It uses its own database (MOCK_CORE_DATABASE_URL). Money endpoints are idempotent: a repeated
 idempotency_key returns the first successful response and changes nothing.
+
+The admin endpoints change mock test data only. They answer 403 unless the app was started
+with MOCK_CORE_ADMIN_ENABLED (local acceptance runs), and each use is a monitoring event.
 """
 
 from collections.abc import Awaitable, Callable
@@ -9,9 +12,9 @@ from decimal import Decimal
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -32,7 +35,8 @@ from app.mock_core.models import (
     McPremiumPayment,
     McSubmitGrant,
 )
-from app.shared.types import Code
+from app.services.monitoring.contract import SYSTEM_EVENTS, Monitoring
+from app.shared.types import Code, Stage
 
 router = APIRouter(tags=["mock-core"])
 CENT = Decimal("0.01")
@@ -210,6 +214,48 @@ async def can_submit_for(body: PermissionRequest, sessions: Sessions) -> Permiss
             .limit(1)
         )
     return PermissionAnswer(allowed=grant is not None)
+
+
+class ResetRequest(BaseModel):
+    policy_number: str
+
+
+@router.post("/admin/reset-policy")
+async def reset_policy(
+    body: ResetRequest,
+    request: Request,
+    sessions: Sessions,
+    x_user_id: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Set one policy's utilised and blocked amounts to zero and void its active blocks, so
+    a voided block can never be released against the reset balance. Test data only."""
+    if not getattr(request.app.state, "mock_core_admin_enabled", False):
+        raise HTTPException(403, "mock core admin operations are off (MOCK_CORE_ADMIN_ENABLED)")
+    async with sessions.begin() as session:
+        policy = await session.get(McPolicy, body.policy_number, with_for_update=True)
+        if policy is None:
+            raise HTTPException(404, "policy not found")
+        detail = {
+            "policy_number": policy.policy_number,
+            "utilised_before": str(policy.utilised.quantize(CENT)),
+            "blocked_before": str(policy.blocked.quantize(CENT)),
+        }
+        voided = await session.execute(
+            update(McBlock)
+            .where(McBlock.policy_number == policy.policy_number, McBlock.status == "active")
+            .values(status="voided")
+        )
+        policy.utilised, policy.blocked = Decimal("0"), Decimal("0")
+    result = {**detail, "blocks_voided": voided.rowcount}  # type: ignore[attr-defined]
+    monitoring: Monitoring = request.app.state.monitoring
+    await monitoring.record_event(
+        claim_id=SYSTEM_EVENTS,
+        stage=Stage.MONITORING,
+        action="mock_core_policy_reset",
+        actor=x_user_id or "unknown",
+        detail=result,
+    )
+    return result
 
 
 async def _idempotent(

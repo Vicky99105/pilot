@@ -16,16 +16,22 @@ The claim:
 - Treatment: acute appendicitis, laparoscopic appendicectomy, 4 days in a deluxe room at
   Rs 7,500 a day. Sunrise's agreement prices packages at CGHS 2025 rates (NABH, X tier,
   semi-private ward), so the procedure maps to CGHS AG095, Laparoscopic Appendectomy, at
-  Rs 33,000. One consumable line, "Gloves", is on the non-payable list I, so R11 deducts it;
-  R20 then caps every other line (all of them heads a package covers) at the package rate,
-  spread in proportion. R13 does not apply to lines a package prices.
+  Rs 33,000. The claim is a reimbursement, and the product binds package pricing to
+  cashless claims only (packages.pricing_applies_to), so AG095 does not cap the money: the
+  policy's own rules do. "Gloves" is on the non-payable list I, so R11 deducts it. The four
+  nursing lines are read by R12 as List II item 38 (nursing is part of the room charges),
+  so they are deducted in full. The room cap (Rs 5,000 a day) and the proportionate
+  deduction (R13) then reduce the room, OT and professional fee lines by 2/3.
 - Bundle: claim form Part A (typed), claim form Part B (hospital), discharge summary,
   operation theatre notes, itemised final bill, cancelled cheque. The payment receipt is left
   out on purpose, so a query is raised; it is written separately as the query reply.
 
 The ground truth's deductions come from the real rules engine run on the ground-truth bill
 lines in bill review's order (R11, R12, R18, R23, R20, R24, R13, R14, R19, R16, R17, R26,
-then R21), so every expected amount is exact. All data is synthetic.
+then R21), so every expected amount is exact. The R12 reading is the expected outcome with
+the wording's non-payable lists loaded, as in the acceptance environment; tests/pg checks
+that those lists send exactly R12_READINGS' lines to R12 and hold the item as written here.
+All data is synthetic.
 """
 
 import argparse
@@ -53,6 +59,7 @@ from reportlab.pdfgen.canvas import Canvas  # noqa: E402
 
 from app.database.seed_knowledge import NON_PAYABLE_ITEMS  # noqa: E402
 from app.services.rules.contract import (  # noqa: E402
+    ClaimRoute,
     DrugFacts,
     Facts,
     Head,
@@ -115,14 +122,24 @@ NON_PAYABLE_ITEM = "Gloves"  # seeded non-payable list I, item 11
 PACKAGE = MappedPackage(
     scheme="CGHS", package_code="AG095", name="Laparoscopic Appendectomy", rate=D("33000.00")
 )
-NON_PACKAGE_DISCOUNT = D("10.00")  # Sunrise's agreement; no line is outside the package
+NON_PACKAGE_DISCOUNT = D("10.00")  # Sunrise's agreement; it binds cashless claims only
+CLAIM_ROUTE: ClaimRoute = "reimbursement"  # the member claims after paying the hospital
 PCS_CODE = "0DTJ4ZZ"  # resection of the appendix, percutaneous endoscopic
 GUIDELINE_CODE = "SG017B"  # HBP 2022 Lap- Appendicectomy, through our crosswalk
 LOS_NORM_DAYS = 3  # SG017B, and MEDISEP MS1436
 # R12's expected reading of lines that are near a non-payable list item without matching
-# one. Nursing is paid under this product (room, boarding and nursing), so it is payable.
-# With the fixture lists no tracer line is unclear; with the loaded lists only nursing is.
-R12_READINGS: dict[str, None] = {"Nursing Care Charges": None}
+# one. With the wording's lists loaded only nursing is. Nursing billed separately is IRDAI
+# List II item 38: part of the room charges, which the room cap already pays (room,
+# boarding and nursing), so it is not payable as a separate item. tests/pg checks the item
+# against the loaded row.
+NURSING_IN_ROOM_RENT = NonPayableItem(
+    list_name="II",
+    item_number=38,
+    item="Nursing, DMO/ RMO charges included in room rent under associated medical expenses",
+    condition="Part of the room charges; not paid as a separate item",
+    payable_in_product="not_payable",
+)
+R12_READINGS: dict[str, NonPayableItem | None] = {"Nursing Care Charges": NURSING_IN_ROOM_RENT}
 # NPPA ceiling prices (S.O. 1575(E), w.e.f. 01.04.2026) for the pharmacy lines that have one
 # formulation that fits: (medicine, dosage form, unit, ceiling before GST). tests/pg checks
 # each against the loaded table.
@@ -359,20 +376,18 @@ def _non_payable() -> list[NonPayableItem]:
 
 
 def expected_sheet(
-    claim: TracerClaim,
-    rules: RulesEngine,
-    non_payable: list[NonPayableItem] | None = None,
-    unclear: set[str] | None = None,
+    claim: TracerClaim, rules: RulesEngine, non_payable: list[NonPayableItem] | None = None
 ) -> dict[str, Any]:
     """Bill rules on the ground-truth lines through the real rules engine, in bill review's
-    order. The non-payable lists default to the seeded fixture; a test passes the loaded
-    lists, and the descriptions bill review would find unclear in them, to show the ground
-    truth holds against them too. Unclear lines are read as R12_READINGS says."""
+    order. R11 reads the non-payable lists given (the seeded fixture by default; a test passes
+    the loaded lists). A line R11 matched nothing for is read by R12 as R12_READINGS says,
+    the expected outcome with the wording's lists loaded."""
     product = rules.product(PRODUCT_UIN)
     non_payable = _non_payable() if non_payable is None else non_payable
     lines: list[dict[str, Any]] = []
     facts: dict[int, LineFacts] = {}
     results: list[Any] = []
+    route = {"claim_route": CLAIM_ROUTE}
 
     def apply(line: dict[str, Any], rule_id: str, extra: dict[str, Any]) -> Any:
         current = facts[line["line_id"]].model_copy(update={"claimed": line["admissible"]})
@@ -425,27 +440,37 @@ def expected_sheet(
     unmatched = [ln for ln in lines if apply(ln, "R11", {"non_payable": non_payable}).clause_ref
                  is None]  # fmt: skip
     for line in unmatched:
-        if line["description"] in (unclear or set()):
+        if line["description"] in R12_READINGS:
             reading = R12_READINGS[line["description"]]
             apply(line, "R12", {"judgement": NonPayableJudgement(item=reading, confidence=1.0)})
     for line in payable():
         apply(line, "R18", {"admission_date": claim.admission, "discharge_date": claim.discharge})
-    # 2. The package: R23 (an itemised bill: nothing), then R20 on the lines it covers.
+    # 2. The package is mapped on every route; R23 and R20 price by it only where the
+    # agreement binds the claim's route. A line is priced by the package only there.
     package = PackageFacts(packages=[PACKAGE], billed_as_package=False)
+    bound = CLAIM_ROUTE in product.packages.pricing_applies_to
+    covered_heads = product.packages.included_heads if bound else []
     for line in payable():
-        apply(line, "R23", {"package": package})
-    covered = [ln for ln in payable() if Head(ln["head"]) in product.packages.included_heads]
+        apply(line, "R23", {"package": package, **route})
+    covered = [ln for ln in payable() if Head(ln["head"]) in covered_heads]
     total = sum((ln["admissible"] for ln in covered), D("0"))
-    spread("R20", covered, {"package": package.model_copy(update={"package_total": total})})
-    # 3. Outside the package: R24, R13, R14 (each passes on a line the package prices).
+    spread("R20", covered, {"package": package.model_copy(update={"package_total": total}),
+                            **route})  # fmt: skip
+    # 3. R24, then R13 and R14 with the room rate of the room lines outside the package.
     for line in payable():
         apply(line, "R24", {"package": package, "non_package_discount_percent":
-                            NON_PACKAGE_DISCOUNT})  # fmt: skip
-    room = RoomFacts(sum_insured=SUM_INSURED, room_rate_per_day=None,
+                            NON_PACKAGE_DISCOUNT, **route})  # fmt: skip
+    room_lines = [ln for ln in payable() if ln["head"] == Head.ROOM.value
+                  and Head.ROOM not in covered_heads]  # fmt: skip
+    room_days = sum((facts[ln["line_id"]].qty or D("1") for ln in room_lines), D("0"))
+    room_rate = (
+        sum((ln["admissible"] for ln in room_lines), D("0")) / room_days if room_lines else None
+    )
+    room = RoomFacts(sum_insured=SUM_INSURED, room_rate_per_day=room_rate,
                      differential_billing=DIFFERENTIAL_BILLING)  # fmt: skip
     for line in payable():
         for rule_id in ("R13", "R14"):
-            apply(line, rule_id, {"room": room, "package": package})
+            apply(line, rule_id, {"room": room, "package": package, **route})
     # 4. Claim: R19 (no ambulance line), R16, R17, R26, then R21.
     for rule_id in ("R16", "R17", "R26"):
         admissible = money(sum((ln["admissible"] for ln in lines), D("0")))
@@ -454,10 +479,6 @@ def expected_sheet(
     admissible = money(sum((ln["admissible"] for ln in lines), D("0")))
     [r21] = rules.evaluate(["R21"], Facts(admissible_total=admissible), product)
     co_pay = money(-r21.amount_effect)
-    room_lines = [i for i in claim.items if i.head is Head.ROOM]
-    room_rate = sum((i.amount for i in room_lines), D("0")) / sum(
-        (i.qty for i in room_lines), D("0")
-    )
     cap = min(
         SUM_INSURED * product.room_rent.percent_of_sum_insured / 100, product.room_rent.max_per_day
     )
@@ -466,9 +487,11 @@ def expected_sheet(
             {"rule_id": r, "clause_ref": c, "amount": a} for a, r, c, _ in line["deductions"]
         ]
     return {
-        "room_rate_per_day": money(room_rate),
+        "claim_route": CLAIM_ROUTE,
+        "room_rate_per_day": None if room_rate is None else money(room_rate),
         "room_cap_per_day": money(cap),
         "package": PACKAGE.model_dump(mode="json"),
+        "package_caps_money": bound,
         "lines": lines,
         "deductions": [ln for ln in lines if ln["deducted"] > 0],
         "claimed_total": claim.grand_total,

@@ -35,7 +35,7 @@ from app.services.registration.service import DefaultRegistrationService
 from app.services.risk.contract import RiskReport
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import PRODUCT_UIN
-from app.shared.types import DocType, RuleResult, Stage
+from app.shared.types import DocType, RequestType, RuleResult, Stage
 from tests.database.factories import add_claim
 from tests.fakes.adjudication import FakeAdjudicationTools
 from tests.fakes.core import FakeMoneyService, FakePolicyService
@@ -429,7 +429,9 @@ async def test_one_reason_naming_a_spread_rule_explains_every_line_it_spread_ove
 ) -> None:
     """R20 spreads one package cap over many lines; one reason naming R20 explains them all.
     A line-specific deduction still needs its own reason."""
-    claim_id = await add_digitised_claim(env.sessions, ClaimSpec())  # the worked bill
+    # The worked bill as a cashless claim, so the agreement's package cap binds it.
+    spec = ClaimSpec(request_type=RequestType.DISCHARGE)
+    claim_id = await add_digitised_claim(env.sessions, spec)
     rules = DefaultRulesEngine(Settings().config_dir / "products")
     await DefaultRegistrationService(
         env.sessions, env.policies, FakeMoneyService(), rules

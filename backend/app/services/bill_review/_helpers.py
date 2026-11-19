@@ -4,9 +4,12 @@ import re
 from decimal import Decimal
 
 from app.services.bill_review.contract import DeductionLine
-from app.services.rules.contract import Head
+from app.services.rules.contract import ClaimRoute, Head
+from app.shared.types import RequestType
 
 ZERO = Decimal("0.00")
+# The request types a network hospital sends on a cashless claim.
+CASHLESS_REQUESTS = (RequestType.PREAUTH, RequestType.ENHANCEMENT, RequestType.DISCHARGE)
 
 # Patterns per head, matched on whole words of the lower-cased text. Order matters: the
 # first head whose pattern matches wins, so ICU comes before room.
@@ -60,3 +63,13 @@ def room_rate_per_day(lines: list[DeductionLine], days: dict[int, Decimal]) -> D
     if not room or total_days <= 0:
         return None
     return sum((ln.claimed for ln in room), ZERO) / total_days
+
+
+def claim_route(request_type: RequestType) -> ClaimRoute | None:
+    """Cashless or reimbursement, from the request type the claim was opened with. None for
+    a request type that opens no claim of its own (a query reply, for example)."""
+    if request_type in CASHLESS_REQUESTS:
+        return "cashless"
+    if request_type is RequestType.REIMBURSEMENT:
+        return "reimbursement"
+    return None

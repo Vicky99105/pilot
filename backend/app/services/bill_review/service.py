@@ -10,9 +10,9 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import NonPayableItemRow
+from app.database.models import ClaimRow, NonPayableItemRow
 from app.database.repositories.stage_records import StageRecordRepository
-from app.services.bill_review._helpers import ZERO, map_head, money
+from app.services.bill_review._helpers import ZERO, claim_route, map_head, money
 from app.services.bill_review._prompts import (
     NON_PAYABLE_PURPOSE,
     PACKAGE_PURPOSE,
@@ -49,6 +49,7 @@ from app.services.medical_review.contract import MedicalCoding
 from app.services.model_gateway.contract import ModelGateway, ModelRole
 from app.services.registration.contract import RegistrationResult
 from app.services.rules.contract import (
+    ClaimRoute,
     DrugFacts,
     Facts,
     Head,
@@ -62,7 +63,7 @@ from app.services.rules.contract import (
     RulesEngine,
 )
 from app.shared.codes import code_in_ranges
-from app.shared.types import RuleResult, Stage
+from app.shared.types import RequestType, RuleResult, Stage
 
 ONE_DAY = Decimal("1")
 FIXTURE = "fixture"  # the hand-made non-payable subset seeded for the tracer
@@ -135,6 +136,7 @@ class DefaultBillReviewService:
         if registration.policy is None:
             raise NotReadyForBillReview(f"claim {claim_id} has no policy to review against")
         product = self._rules.product(registration.policy.product_uin)
+        route = await self._claim_route(claim_id)
         admitted = record.admission.admission_date.value
         hospital_id = registration.hospital.rohini_id
         agreement = (
@@ -162,7 +164,9 @@ class DefaultBillReviewService:
                 ),
             )
 
-        # 2. Package: map, then R23 and R20.
+        # 2. Package: map, then R23 and R20. The package is mapped on every route (the full
+        # medical review needs its guideline); the rules price by it only where the hospital
+        # agreement binds the claim's route.
         mapping = await self._map_package(review, record, coding, agreement, hospital_id)
         package = None
         if mapping is not None and mapping.packages:
@@ -170,9 +174,11 @@ class DefaultBillReviewService:
                 packages=mapping.packages, billed_as_package=mapping.billed_as_package
             )
             for line in review.lines:
-                line.sheet.in_package = _in_package(line.sheet.head, package, product)
+                line.sheet.in_package = _in_package(line.sheet.head, package, product, route)
             for line in review.payable():
-                review.apply("R23", line, Facts(line=line.facts(), package=package))
+                review.apply(
+                    "R23", line, Facts(line=line.facts(), package=package, claim_route=route)
+                )
             priced = [
                 ln
                 for ln in review.payable()
@@ -180,7 +186,9 @@ class DefaultBillReviewService:
                 and (ln.sheet.head is Head.PACKAGE or not package.billed_as_package)
             ]
             total = sum((ln.sheet.admissible for ln in priced), ZERO)
-            facts = Facts(package=package.model_copy(update={"package_total": total}))
+            facts = Facts(
+                package=package.model_copy(update={"package_total": total}), claim_route=route
+            )
             review.spread("R20", priced, facts)
 
         # 3. Per line outside the package: R24, R13, R14.
@@ -189,7 +197,12 @@ class DefaultBillReviewService:
             review.apply(
                 "R24",
                 line,
-                Facts(line=line.facts(), package=package, non_package_discount_percent=discount),
+                Facts(
+                    line=line.facts(),
+                    package=package,
+                    non_package_discount_percent=discount,
+                    claim_route=route,
+                ),
             )
         room = RoomFacts(
             sum_insured=registration.policy.sum_insured,
@@ -198,7 +211,11 @@ class DefaultBillReviewService:
         )
         for line in review.payable():
             for rule_id in ("R13", "R14"):
-                review.apply(rule_id, line, Facts(line=line.facts(), room=room, package=package))
+                review.apply(
+                    rule_id,
+                    line,
+                    Facts(line=line.facts(), room=room, package=package, claim_route=route),
+                )
 
         # 4. Claim: R19, R16, R17, R26.
         ambulance = [ln for ln in review.payable() if ln.sheet.head is Head.AMBULANCE]
@@ -287,6 +304,13 @@ class DefaultBillReviewService:
             claim_id, Stage.BILL_REVIEW, sheet.model_dump(mode="json"), created_by=actor
         )
         return sheet
+
+    async def _claim_route(self, claim_id: UUID) -> ClaimRoute | None:
+        async with self._sessions() as session:
+            request_type = await session.scalar(
+                select(ClaimRow.request_type).where(ClaimRow.id == claim_id)
+            )
+        return claim_route(RequestType(request_type)) if request_type else None
 
     # --- R12 -----------------------------------------------------------------------------
 
@@ -618,9 +642,15 @@ def _option(candidate: TariffCandidate, agreement: HospitalAgreement) -> Package
     )
 
 
-def _in_package(head: Head, package: PackageFacts, product: ProductConfig) -> bool:
-    return bool(package.packages) and (
-        head is Head.PACKAGE or head in product.packages.included_heads
+def _in_package(
+    head: Head, package: PackageFacts, product: ProductConfig, route: ClaimRoute | None
+) -> bool:
+    """True when the package prices the line: the agreement binds the claim's route, and the
+    line is a package charge or a head the package covers."""
+    return (
+        bool(package.packages)
+        and route in product.packages.pricing_applies_to
+        and (head is Head.PACKAGE or head in product.packages.included_heads)
     )
 
 

@@ -8,3 +8,7 @@ services:
   app:
     ports:
       - "127.0.0.1:8000:8000"
+    environment:
+      # Lets the acceptance run reset the tracer member's mock policy balances before each
+      # run (POST /mock-core/admin/reset-policy). Never set in docker-compose.yml.
+      MOCK_CORE_ADMIN_ENABLED: "true"

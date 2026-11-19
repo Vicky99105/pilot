@@ -374,11 +374,35 @@ def r14_icu_cap(facts: Facts, product: ProductConfig) -> RuleResult:
 # --- Packages: R20, R23, R24 --------------------------------------------------------------
 
 
+def agreement_binds(facts: Facts, product: ProductConfig) -> bool:
+    """True when the hospital agreement's pricing binds this claim's route."""
+    return facts.claim_route in product.packages.pricing_applies_to
+
+
+def _not_bound(rule_id: str, facts: Facts, product: ProductConfig) -> RuleResult | None:
+    """The result of a package pricing rule that cannot apply: a missing-facts result when
+    the claim route is unknown, a pass when the agreement does not bind the route. None when
+    the rule applies."""
+    if facts.claim_route is None:
+        return _missing(rule_id, "claim_route")
+    if agreement_binds(facts, product):
+        return None
+    reason = (
+        f"the hospital agreement's package pricing does not bind a {facts.claim_route} claim "
+        "under this wording; the policy's own limits apply"
+    )
+    if facts.package is not None and facts.package.packages:
+        reason += f" (package {_codes(facts)} mapped)"
+    return RuleResult(rule_id=rule_id, passed=True, reason=reason)
+
+
 def in_package(head: Head, facts: Facts, product: ProductConfig) -> bool:
     """True when a package applies and prices this head: a package charge line, or a head the
-    package covers."""
-    return facts.package is not None and (
-        head is Head.PACKAGE or head in product.packages.included_heads
+    package covers, on a claim route the agreement binds."""
+    return (
+        facts.package is not None
+        and agreement_binds(facts, product)
+        and (head is Head.PACKAGE or head in product.packages.included_heads)
     )
 
 
@@ -415,6 +439,8 @@ def r20_package_cap(facts: Facts, product: ProductConfig) -> RuleResult:
     clause = product.clauses.package_tariff
     if facts.package is None or not facts.package.packages:
         return RuleResult(rule_id="R20", passed=True, reason="no package applies to the claim")
+    if (unbound := _not_bound("R20", facts, product)) is not None:
+        return unbound
     shares = package_shares(facts.package.packages, product)
     total = money(sum((p.rate * pct / HUNDRED for p, pct in shares), ZERO))
     parts = [f"{p.package_code} at {pct.normalize():f}% of {_rupees(p.rate)}" for p, pct in shares]
@@ -442,6 +468,8 @@ def r23_package_inclusions(facts: Facts, product: ProductConfig) -> RuleResult:
     package = facts.package
     if package is None or not package.billed_as_package:
         return RuleResult(rule_id="R23", passed=True, reason="no package charge on the bill")
+    if (unbound := _not_bound("R23", facts, product)) is not None:
+        return unbound
     if line.head not in product.packages.included_heads:
         reason = f"{line.head.value} is not inside the package"
         return RuleResult(rule_id="R23", passed=True, reason=reason)
@@ -464,6 +492,8 @@ def r24_non_package_discount(facts: Facts, product: ProductConfig) -> RuleResult
     percent = facts.non_package_discount_percent
     if not percent:
         return RuleResult(rule_id="R24", passed=True, reason="no agreed non-package discount")
+    if (unbound := _not_bound("R24", facts, product)) is not None:
+        return unbound
     if in_package(line.head, facts, product):
         return _priced_by_package("R24", facts)
     if line.head in product.packages.discount_excluded_heads:

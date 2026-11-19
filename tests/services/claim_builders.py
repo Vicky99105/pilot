@@ -117,6 +117,8 @@ class ClaimSpec:
     lines: list[BillLine] = field(default_factory=lambda: list(WORKED_BILL))
     clinical: Clinical = field(default_factory=appendicitis)
     submitted_by: UUID | None = None
+    # How the claim arrived: reimbursement, or a cashless discharge from a network hospital.
+    request_type: RequestType = RequestType.REIMBURSEMENT
 
 
 def claim_record(claim_id: UUID, spec: ClaimSpec) -> ClaimRecord:
@@ -164,7 +166,7 @@ async def add_digitised_claim(
         session.add(
             SubmissionRow(
                 id=submission_id,
-                request_type=RequestType.REIMBURSEMENT.value,
+                request_type=spec.request_type.value,
                 submitted_by=spec.submitted_by,
                 form=form,
                 member_id=spec.member_id,
@@ -180,7 +182,7 @@ async def add_digitised_claim(
                 member_id=spec.member_id,
                 policy_number=spec.policy_number,
                 hospital_id=spec.hospital_id,
-                request_type=RequestType.REIMBURSEMENT.value,
+                request_type=spec.request_type.value,
                 status="digitisation",
                 status_changed_at=now,
                 created_at=now,

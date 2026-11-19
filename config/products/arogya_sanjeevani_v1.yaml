@@ -136,6 +136,11 @@ specific_waiting:
 # Package-first bill review. A hospital agreement names the scheme its packages are priced
 # from; these settings say how the product pays them.
 packages:
+  # The hospital agreement binds the hospital on cashless claims only. This wording (Go Digit)
+  # has no clause capping a reimbursement at the network package rate, so a reimbursement is
+  # paid on the policy's own limits. A wording with such a clause (New India 3.31) lists
+  # [cashless, reimbursement].
+  pricing_applies_to: [cashless]
   # What a package price covers on an itemised bill. The CGHS package definition covers
   # accommodation, nursing, OT, surgeon and anaesthetist fees, medicines, surgical
   # disposables and related routine investigations; implants are paid outside it.

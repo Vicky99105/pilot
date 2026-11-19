@@ -27,7 +27,7 @@ from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.contract import Head, RulesEngine
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import HOSPITAL_ROHINI_IDS
-from app.shared.types import Stage
+from app.shared.types import RequestType, Stage
 from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.model_gateway import FakeModelGateway
 from tests.services.claim_builders import (
@@ -41,6 +41,7 @@ from tests.services.reference_rows import add_reference_rows
 from tests.services.test_registration import asha_policy
 
 D = Decimal
+CASHLESS = RequestType.DISCHARGE  # a cashless claim's final bill from a network hospital
 
 
 @dataclass
@@ -91,8 +92,9 @@ async def test_worked_example_admits_138500_and_pays_131575(env: Env) -> None:
     charges, except medicines and implants (R24), then the room cap and the proportionate
     deduction apply to what is left (R13). The discount on the room lowers the room rate
     the proportion uses (Rs 6,750 against the Rs 5,000 cap), so the linked heads end where
-    they did before the discount; only diagnostics keep the 10% off."""
-    claim_id = await env.registered()
+    they did before the discount; only diagnostics keep the 10% off. A cashless claim: the
+    agreement's discount binds the hospital."""
+    claim_id = await env.registered(ClaimSpec(request_type=CASHLESS))
 
     sheet = await env.service.review(claim_id)
 
@@ -164,7 +166,12 @@ async def test_non_payable_items_are_deducted_in_full_with_their_list_clause(env
         "ANNEX-II",
     )
     assert "Part of the room charges" in (found[9].reason or "")
-    assert (found[10].head, found[10].rule_id) == (Head.CONSUMABLES, "R24")  # not a list item
+    # Not a list item, and a reimbursement gets no agreed discount: paid as billed.
+    assert (found[10].head, found[10].rule_id, found[10].admissible) == (
+        Head.CONSUMABLES,
+        None,
+        D("800.00"),
+    )
 
 
 async def test_a_loaded_wording_list_replaces_the_fixture_for_r11(env: Env) -> None:
@@ -314,14 +321,16 @@ ITEMISED = [
     bill_line(10, "Investigations", "Complete Blood Count (CBC)", "5029"),
 ]
 ITEMISED_TOTAL = D("79946.00")
+ITEMISED_CASHLESS = ClaimSpec(lines=ITEMISED, claimed=ITEMISED_TOTAL, request_type=CASHLESS)
 CHOOSE_AG095 = {"bill_package_choice": [{"procedure_1": "AG095"}]}
 
 
 async def test_an_itemised_bill_is_capped_at_the_agreed_package_rate(env: Env) -> None:
     """Sunrise: CGHS, NABH, X tier, semi-private. AG095 is Rs 33,000. R11 takes the gloves;
     R20 caps the other lines a package covers (Rs 77,182) at Rs 33,000, in proportion; the
-    implant is outside the package, and implants are never discounted (R24)."""
-    claim_id = await env.registered(ClaimSpec(lines=ITEMISED, claimed=ITEMISED_TOTAL), LAP)
+    implant is outside the package, and implants are never discounted (R24). A cashless
+    claim: the agreement binds the hospital."""
+    claim_id = await env.registered(ITEMISED_CASHLESS, LAP)
     env.script(**CHOOSE_AG095)
 
     sheet = await env.service.review(claim_id)
@@ -347,6 +356,38 @@ async def test_an_itemised_bill_is_capped_at_the_agreed_package_rate(env: Env) -
     assert (r20.clause_ref, r20.amount_effect) == ("AGREED-TARIFF", D("-44182.00"))
     # No room cap or proportionate deduction on lines the package prices.
     assert not any(d.rule_id in ("R13", "R14") for ln in sheet.lines for d in ln.deductions)
+
+
+async def test_a_reimbursement_maps_the_package_but_pays_on_the_policys_own_limits(
+    env: Env,
+) -> None:
+    """The same bill as a reimbursement. AG095 is still mapped (the guideline and the stay
+    norm need it), but the agreement does not bind a reimbursement under this wording: no
+    package cap, no unbundling, no agreed discount. The room cap applies: Rs 7,500 a day
+    against Rs 5,000, so room 30,000 to 20,000 and nursing, OT and the surgeon's fee by the
+    same 2/3 (2,400, 12,333.33, 12,000). Gloves go (R11); the rest is paid as billed."""
+    claim_id = await env.registered(ClaimSpec(lines=ITEMISED, claimed=ITEMISED_TOTAL), LAP)
+    env.script(**CHOOSE_AG095)
+
+    sheet = await env.service.review(claim_id)
+    found = {ln.line_id: ln for ln in sheet.lines}
+
+    assert sheet.package is not None
+    assert [p.package_code for p in sheet.package.packages] == ["AG095"]
+    assert not any(ln.in_package for ln in sheet.lines)
+    assert {(n, found[n].admissible, found[n].rule_id) for n in (1, 2, 3, 4, 7)} == {
+        (1, D("20000.00"), "R13"),
+        (2, D("2400.00"), "R13"),
+        (3, D("12333.33"), "R13"),
+        (4, D("12000.00"), "R13"),
+        (7, D("0.00"), "R11"),
+    }
+    assert not any(d.rule_id in ("R20", "R23", "R24") for ln in sheet.lines for d in ln.deductions)
+    [r20] = [r for r in sheet.rule_results if r.rule_id == "R20"]
+    assert r20.passed and "reimbursement" in r20.reason and "AG095" in r20.reason
+    assert sheet.admissible_total == D("56315.33")
+    assert sheet.co_pay == D("2815.77")
+    assert sheet.payable == D("53499.56")
 
 
 async def test_the_package_choice_is_an_enum_of_the_agreement_schemes_candidates(
@@ -387,7 +428,8 @@ async def test_a_package_charge_with_items_billed_beside_it_is_unbundled(env: En
         bill_line(3, "Pharmacy", "Inj. Ceftriaxone 1 g", "411", qty="6"),
         bill_line(4, "Ambulance", "Ambulance pick up", "3500"),
     ]
-    claim_id = await env.registered(ClaimSpec(lines=lines, claimed=D("48761.00")), LAP)
+    spec = ClaimSpec(lines=lines, claimed=D("48761.00"), request_type=CASHLESS)
+    claim_id = await env.registered(spec, LAP)
     env.script(**CHOOSE_AG095)
 
     sheet = await env.service.review(claim_id)

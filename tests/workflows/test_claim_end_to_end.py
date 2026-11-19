@@ -3,10 +3,11 @@
 Time-skipping Temporal, SQLite, an in-memory file store, a scripted model gateway, fake
 core policy and money services, and a fake notification sender. The claim is a member's
 reimbursement for a laparoscopic appendicectomy at Sunrise (CGHS NABH, X tier) with a missing
-payment receipt. Medical coding builds 0DTJ4ZZ; bill review maps it to package AG095 and
-caps the bill at the Rs 33,000 package (R20); the full medical review reads the SG017B
-guideline; a query is raised and answered by a reply upload, which re-runs coding and bill
-review; the partial is approved and upheld by the CRC, a letter is issued, finance releases
+payment receipt. Medical coding builds 0DTJ4ZZ; bill review maps it to package AG095,
+which does not cap a reimbursement under this wording, so the room cap and the
+proportionate deduction apply (R13); the full medical review reads the SG017B guideline; a
+query is raised and answered by a reply upload, which re-runs coding and bill review; the
+partial is approved and upheld by the CRC, a letter is issued, finance releases
 the payment, and the claim closes.
 """
 
@@ -147,13 +148,17 @@ QUERY_DRAFT = {
 PARTIAL_DRAFT = {
     "decision": "partial",
     "reasons": [
-        {"text": "Paid at the package rate", "clause_ref": "AGREED-TARIFF", "rule_id": "R20",
-         "line_id": n}
-        for n in (1, 2, 3, 4)
+        {"text": "Room above the Rs 5,000 a day cap", "clause_ref": "ROOM-CAP", "rule_id": "R13",
+         "line_id": 1},
+        {"text": "Reduced in proportion to the room cap", "clause_ref": "PROP-DED",
+         "rule_id": "R13", "line_id": 2},
     ],
-    "summary": "Paid at the agreed AG095 package rate.",
+    "summary": "Room cap with proportionate deduction.",
 }  # fmt: skip
-PAYABLE = D("31350.00")  # the Rs 33,000 package less the 5% co-pay
+# Room 18,000 to 15,000 (Rs 6,000 a day against Rs 5,000) and the surgeon's visits by the
+# same 5/6, 6,000 to 5,000; medicines and investigations are never reduced. Rs 38,250 less
+# the 5% co-pay.
+PAYABLE = D("36337.50")
 
 
 class Gateway(FakeModelGateway):
@@ -337,15 +342,17 @@ async def test_the_tracer_claim_runs_from_intake_to_closed(harness: Harness) -> 
     await h.complete("release_payment", FINANCE_USER_ID, {"action": "release"})
     result = await h.env.client.get_workflow_handle_for(ClaimWorkflow.run, str(claim_id)).result()
 
-    # Coding built the procedure; bill review mapped it to AG095 and capped the bill at it.
+    # Coding built the procedure; bill review mapped it to AG095, which does not cap a
+    # reimbursement: the room cap applies instead.
     coding = await h.records.latest(claim_id, Stage.MEDICAL_CODING)
     assert coding is not None
     assert [p["code"]["code"] for p in coding.payload["procedure_codes"]] == ["0DTJ4ZZ"]
     sheet = await h.records.latest(claim_id, Stage.BILL_REVIEW)
     assert sheet is not None
     assert [p["package_code"] for p in sheet.payload["package"]["packages"]] == ["AG095"]
-    assert {ln["rule_id"] for ln in sheet.payload["lines"]} == {"R20"}
-    assert sheet.payload["admissible_total"] == "33000.00"
+    assert [ln["rule_id"] for ln in sheet.payload["lines"]] == ["R13", "R13", None, None]
+    assert not any(ln["in_package"] for ln in sheet.payload["lines"])
+    assert sheet.payload["admissible_total"] == "38250.00"
     assert sheet.payload["payable"] == str(PAYABLE)
     # The full review read the package's guideline through our crosswalk.
     medical = await h.records.latest(claim_id, Stage.MEDICAL_REVIEW)
@@ -363,7 +370,7 @@ async def test_the_tracer_claim_runs_from_intake_to_closed(harness: Harness) -> 
     assert [ltr["kind"] for ltr in letters] == ["query", "partial"]
     partial = letters[-1]
     assert (partial["amount"], partial["plain_language"]) == (str(PAYABLE), True)
-    assert [row["line_id"] for row in partial["deductions"]] == [1, 2, 3, 4, None]
+    assert [row["line_id"] for row in partial["deductions"]] == [1, 2, None]
     assert await h.files.get(partial["pdf_key"])
     assert [n.to for n in h.notifications.sent] == ["asha.verma@member.example"] * 2
 
