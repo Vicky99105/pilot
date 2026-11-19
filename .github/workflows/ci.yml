@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COMPOSE: docker compose -f deploy/docker-compose.yml
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # Backend gates (unfiltered: read the exit code, not a grep).
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.7"
+      - name: Install backend dependencies
+        run: uv sync --project backend --locked
+      - name: Ruff lint
+        run: uv run --project backend ruff check backend tests
+      - name: Ruff format check
+        run: uv run --project backend ruff format --check backend tests
+      - name: Mypy
+        run: uv run --project backend mypy backend/app
+      - name: Pytest
+        run: uv run --project backend pytest tests
+
+      # UI gates.
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "24.22.2"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Install UI dependencies
+        run: npm ci --prefix ui --no-audit --no-fund
+      - name: UI typecheck
+        run: npm --prefix ui run typecheck
+      - name: UI build
+        run: npm --prefix ui run build
+
+      # Full stack on the runner: build, start, health check through Caddy.
+      - name: Start stack
+        run: $COMPOSE up -d --build
+      - name: Wait for /health to return 200
+        run: |
+          deadline=$((SECONDS + 180))
+          until curl -skf https://localhost/health; do
+            if [ $SECONDS -ge $deadline ]; then
+              echo "::error::/health did not return 200 within 3 minutes"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo
+      - name: Apply database migrations
+        run: $COMPOSE exec -T app alembic upgrade head
+      - name: Show stack state and logs
+        if: failure()
+        run: |
+          $COMPOSE ps -a
+          $COMPOSE logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: $COMPOSE down -v

@@ -1,0 +1,7 @@
+# SITE_ADDRESS is the server IP now, the domain later. Defaults to localhost.
+# tls internal: Caddy issues its own certificate until a domain exists.
+{$SITE_ADDRESS:localhost} {
+	tls internal
+	encode zstd gzip
+	reverse_proxy app:8000
+}
