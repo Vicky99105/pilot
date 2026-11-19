@@ -8,14 +8,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.database.seed import seed_claims_db
 from app.services.claims.contract import ClaimQueryService
 from app.services.claims.service import DefaultClaimQueryService
+from app.services.communication.service import DefaultCommunicationService
 from app.services.intake.contract import ClaimForm, Submission, SubmissionInput, UploadedFile
 from app.services.intake.service import DefaultIntakeService
 from app.services.page_prep.service import DefaultPagePreparer
+from app.services.query.contract import QueryItem
+from app.services.query.service import DefaultQueryService
 from app.shared.seed_ids import HOSPITAL_USER_ID, MEMBER_USER_ID
 from app.shared.types import DocType, RequestType
 from tests.docs import make_pdf
 from tests.fakes.file_store import FakeFileStore
 from tests.fakes.intake import FakeWorkflowStarter
+from tests.fakes.model_gateway import FakeModelGateway
+from tests.fakes.notifications import FakeNotificationService
 
 
 class Env:
@@ -96,3 +101,31 @@ async def test_stored_file_resolves_uploads_and_page_images(env: Env) -> None:
     assert image is not None and image.mime == "image/png"
     assert image.claim_id == submission.claim_id
     assert await env.claims.stored_file("0" * 32) is None
+
+
+async def test_get_shows_letters_and_the_open_query_and_letters_resolve_as_files(
+    env: Env,
+) -> None:
+    submission = await env.submit(MEMBER_USER_ID, "one")
+    communication = DefaultCommunicationService(
+        env.sessions, env.files, FakeModelGateway({}), FakeNotificationService()
+    )
+    queries = DefaultQueryService(env.sessions, communication, reply_days=15, reminder_days=[3])
+    item = QueryItem(text="Payment receipt", source="missing_document")
+    query = await queries.raise_query(submission.claim_id, [item])
+
+    detail = await env.claims.get(submission.claim_id)
+
+    assert detail is not None
+    [letter] = detail.letters
+    assert (letter.kind, letter.letter_id) == ("query", query.letter_id)
+    assert letter.download_url == f"/api/files/{letter.pdf_key}"
+    assert detail.open_query is not None
+    assert (detail.open_query.query_id, detail.open_query.items) == (
+        query.query_id,
+        ["Payment receipt"],
+    )
+    assert detail.open_query.deadline == query.deadline
+    stored = await env.claims.stored_file(letter.pdf_key)
+    assert stored is not None
+    assert (stored.mime, stored.claim_id) == ("application/pdf", submission.claim_id)

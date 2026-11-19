@@ -2,7 +2,15 @@
 
 Agentic health-claims processing pilot. Temporal runs the claim lifecycle; one
 FastAPI process serves the API and the React UI and runs the Temporal worker.
-This is Phase 0: the skeleton, a `/health` endpoint and the CI pipeline.
+
+Current state: Phase 1 (tracer bullet), backend slices 1 to 5. One reimbursement claim
+runs through all 13 stages with real services: intake, classification, digitisation,
+registration, bill review, medical review, risk, adjudication, decision (approver bands
+and CRC), communication (letter PDFs), the query loop, settlement and monitoring. People
+decide at checkpoints in the Review area task queues. Core systems (policy, money,
+permissions) are mocked behind contracts, and letters are recorded, not emailed (shadow
+mode). The Phase 1 UI (slice 6) and the seeded acceptance claim (slice 7) come next.
+Contracts and slices: `docs/plans/2026-11-19-phase-1-tracer.md`.
 
 ## Layout
 
@@ -13,7 +21,8 @@ backend/            Python (uv). FastAPI app, Temporal worker, Alembic.
   app/api/routes/   Thin HTTP routes that call service contracts
   app/services/     One folder per service: contract.py + service.py
   app/workflows/    Temporal workflows, activities and the worker
-  app/database/     SQLAlchemy base and Alembic migrations
+  app/database/     SQLAlchemy models, Alembic migrations and the seeds
+config/             Model roles, product rules config, authority matrix
 ui/                 React + Vite + TypeScript + Tailwind
 tests/              All backend tests (run against contracts, with fakes)
 deploy/             Dockerfile, docker-compose.yml, Caddyfile, Postgres init
@@ -52,7 +61,12 @@ The compose file sets the project name `claims-pilot`. Do not pass `-p`: another
 project name starts a second stack with its own containers and volumes.
 
 Both seeds are idempotent. Phase 1 has no real auth: the `X-User-Id` header picks a
-seeded user (IDs in `backend/app/shared/seed_ids.py`; `...0003` is "ops").
+seeded user (IDs in `backend/app/shared/seed_ids.py`): `...0001` member, `...0002`
+hospital, `...0003` ops, `...0004` doctor (approver up to Rs 1 lakh, CRC), `...0005`
+finance, `...0006` senior approver (no limit).
+
+Letters are never emailed by default. Microsoft Graph sending is off unless
+`NOTIFICATIONS_GRAPH_ENABLED=true`, and then only to addresses in `NOTIFICATION_ALLOWLIST`.
 
 - The UI is at https://localhost (Caddy uses a self-signed certificate).
 - The Temporal UI is at http://127.0.0.1:8080. On the server, reach it through an

@@ -1,12 +1,12 @@
-"""Submit area: submissions, the submitter's claims, and stored files."""
+"""Submit area: submissions, query replies, the submitter's claims, and stored files."""
 
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import ValidationError
-from starlette.datastructures import UploadFile
+from starlette.datastructures import FormData, UploadFile
 
-from app.api.deps import Claims, CurrentUser, Files, Intake, Permissions
+from app.api.deps import Claims, CurrentUser, Files, Intake, Permissions, Queries
 from app.integrations.core.contract import PermissionService
 from app.services.claims.contract import ClaimDetail, ClaimSummary
 from app.services.intake.contract import (
@@ -74,20 +74,7 @@ async def submit(
         user, permissions, policy_number=form.policy_number, hospital_id=form.hospital_id
     ):
         raise HTTPException(403, "you cannot submit for this policy or hospital")
-    files = []
-    for name, value in parts.multi_items():
-        if not isinstance(value, UploadFile):
-            continue
-        if name != MERGED_FIELD and name not in SLOTS:
-            raise HTTPException(422, f"unknown slot {name!r}; use a document type or 'merged'")
-        files.append(
-            UploadedFile(
-                filename=value.filename or name,
-                content_type=value.content_type,
-                data=await value.read(),
-                slot=None if name == MERGED_FIELD else DocType(name),
-            )
-        )
+    files = await _uploads(parts)
     try:
         return await intake.accept(
             SubmissionInput(
@@ -98,6 +85,44 @@ async def submit(
                 files=files,
                 parent_claim_id=form.parent_claim_id,
             )
+        )
+    except SubmissionRejected as exc:
+        raise HTTPException(422, exc.reasons) from None
+
+
+@router.post("/queries/{query_id}/reply", status_code=201, response_model=Submission)
+async def reply_to_query(
+    query_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    intake: Intake,
+    queries: Queries,
+    claims: Claims,
+    permissions: Permissions,
+) -> Submission:
+    """Multipart: one file part per document, named by slot, or "merged". The reply joins
+    the claim and its workflow gets the followup_received signal."""
+    if user.kind not in ("member", "hospital"):
+        raise HTTPException(403, "only members and hospitals reply to queries")
+    query = await queries.get(query_id)
+    detail = await claims.get(query.claim_id) if query else None
+    if (
+        query is None
+        or detail is None
+        or not await can_see(
+            user, permissions, policy_number=detail.policy_number, hospital_id=detail.hospital_id
+        )
+    ):
+        raise HTTPException(404, "query not found")
+    if query.status not in ("open", "overdue"):
+        raise HTTPException(409, f"query is {query.status}")
+    files = await _uploads(await request.form())
+    try:
+        return await intake.accept_followup(
+            query.claim_id,
+            submitted_by=user.id,
+            channel="member" if user.kind == "member" else "hospital",
+            files=files,
         )
     except SubmissionRejected as exc:
         raise HTTPException(422, exc.reasons) from None
@@ -130,3 +155,22 @@ async def get_file(
     ):
         raise HTTPException(404, "file not found")
     return Response(content=await files.get(storage_key), media_type=stored.mime)
+
+
+async def _uploads(parts: FormData) -> list[UploadedFile]:
+    """File parts, each named by its slot (a document type) or "merged"."""
+    files = []
+    for name, value in parts.multi_items():
+        if not isinstance(value, UploadFile):
+            continue
+        if name != MERGED_FIELD and name not in SLOTS:
+            raise HTTPException(422, f"unknown slot {name!r}; use a document type or 'merged'")
+        files.append(
+            UploadedFile(
+                filename=value.filename or name,
+                content_type=value.content_type,
+                data=await value.read(),
+                slot=None if name == MERGED_FIELD else DocType(name),
+            )
+        )
+    return files

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 import pytest
@@ -26,7 +27,14 @@ class Ctx:
         self.service: TaskService = DefaultTaskService(sessions, self.signaller)
         self.claim_id: UUID = uuid4()
 
-    async def open(self, kind: str, role: Role, hours: int, workflow_id: str = "wf-1") -> Task:
+    async def open(
+        self,
+        kind: str,
+        role: Role,
+        hours: int,
+        workflow_id: str = "wf-1",
+        authority_amount: Decimal | None = None,
+    ) -> Task:
         return await self.service.open_task(
             claim_id=self.claim_id,
             workflow_id=workflow_id,
@@ -35,6 +43,7 @@ class Ctx:
             title=f"{kind} title",
             payload={"kind": kind},
             deadline=NOW + timedelta(hours=hours),
+            authority_amount=authority_amount,
         )
 
 
@@ -100,7 +109,10 @@ async def test_complete_persists_then_signals_the_workflow(ctx: Ctx) -> None:
     assert (done.status, done.outcome) == ("done", {"action": "confirm"})
     stored = await ctx.service.get_task(task_id=task.id, user_id=ops)
     assert stored is not None and stored.status == "done"
-    assert ctx.signaller.signals == [("wf-1", task.id, {"action": "confirm"})]
+    # The signal names who completed the task, so the workflow can record the person.
+    assert ctx.signaller.signals == [
+        ("wf-1", task.id, {"action": "confirm", "completed_by": str(ops)})
+    ]
 
 
 async def test_complete_open_task_by_role_holder_is_allowed(ctx: Ctx) -> None:
@@ -154,3 +166,21 @@ async def test_get_task_is_hidden_from_users_without_the_role(ctx: Ctx) -> None:
     task = await ctx.open("confirm_registration", Role.CLAIMS_OPERATOR, hours=1)
 
     assert await ctx.service.get_task(task_id=task.id, user_id=finance) is None
+
+
+async def test_an_approver_task_above_the_users_limit_is_hidden_and_refused(ctx: Ctx) -> None:
+    doctor = await add_user(ctx.sessions, "doctor", [Role.APPROVER], max_amount=Decimal("100000"))
+    senior = await add_user(ctx.sessions, "senior", [Role.APPROVER])  # no limit
+    large = await ctx.open("approve", Role.APPROVER, hours=1, authority_amount=Decimal("133000.00"))
+    small = await ctx.open(
+        "approve", Role.APPROVER, hours=2, workflow_id="wf-2", authority_amount=Decimal("36337.50")
+    )
+
+    assert [t.id for t in await ctx.service.list_queue(user_id=doctor)] == [small.id]
+    assert [t.id for t in await ctx.service.list_queue(user_id=senior)] == [large.id, small.id]
+    assert await ctx.service.get_task(task_id=large.id, user_id=doctor) is None
+    with pytest.raises(TaskNotAllowed, match="limit"):
+        await ctx.service.complete(task_id=large.id, user_id=doctor, outcome={"action": "approve"})
+    taken = await ctx.service.take_next(user_id=doctor)
+    assert taken is not None and taken.id == small.id
+    assert large.authority_amount == Decimal("133000.00")

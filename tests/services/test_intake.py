@@ -35,7 +35,7 @@ class Env:
         self.files = FakeFileStore()
         self.starter = FakeWorkflowStarter()
         self.intake: IntakeService = DefaultIntakeService(
-            sessions, self.files, self.starter, now=lambda: NOW
+            sessions, self.files, self.starter, signaller=self.starter, now=lambda: NOW
         )
 
 
@@ -261,6 +261,38 @@ async def test_a_follow_up_joins_its_parent_claim_without_a_new_workflow(env: En
     assert reply.claim_id == parent.claim_id
     assert reply.parent_claim_id == parent.claim_id
     assert list(env.starter.started) == [str(parent.claim_id)]
+    # The parent's workflow hears about the follow-up.
+    assert env.starter.followups == [(str(parent.claim_id), reply.submission_id)]
+
+
+async def test_a_follow_up_copies_the_parents_form(env: Env) -> None:
+    parent = await env.intake.accept(_submission(_typed_files()))
+
+    reply = await env.intake.accept_followup(
+        parent.claim_id,
+        submitted_by=MEMBER_USER_ID,
+        channel="member",
+        files=[_file(DocType.PAYMENT_RECEIPT, make_pdf(["receipt"]))],
+    )
+
+    assert (reply.request_type, reply.form) == (RequestType.QUERY_REPLY, parent.form)
+    assert (reply.claim_id, reply.missing_documents) == (parent.claim_id, [])
+    assert env.starter.followups == [(str(parent.claim_id), reply.submission_id)]
+
+
+async def test_a_follow_up_is_kept_with_a_warning_when_the_signal_fails(env: Env) -> None:
+    parent = await env.intake.accept(_submission(_typed_files()))
+    env.starter.unavailable = True
+
+    reply = await env.intake.accept_followup(
+        parent.claim_id,
+        submitted_by=MEMBER_USER_ID,
+        channel="member",
+        files=[_file(DocType.PAYMENT_RECEIPT, make_pdf(["receipt"]))],
+    )
+
+    assert reply.claim_id == parent.claim_id
+    assert any("not delivered" in w for w in reply.warnings)
 
 
 async def test_get_returns_none_for_an_unknown_submission(env: Env) -> None:

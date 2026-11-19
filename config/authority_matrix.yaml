@@ -1,0 +1,15 @@
+# Who may approve a claim decision, by the amount at stake: the payable on the latest
+# deduction sheet. Each band is the APPROVER role; a user may act on a claim when the
+# max_amount on their approver role (user_roles) covers the amount, or is empty (no limit).
+# Changing a limit or a band is a change to this file and to the seeded user_roles.
+
+version: 1
+role: approver
+bands:
+  - name: approver
+    up_to: 100000
+  - name: senior_approver
+    up_to: null  # no upper limit
+
+# Final decisions that need the CRC reviewer's approval before any letter goes out.
+crc_required_for: [partial, reject]

@@ -53,6 +53,7 @@ class CaseFile(BaseModel):
     declared_peds: list[Code]
     known_pages: list[PageRef]  # the pages a citation may name
     clause_refs: list[str]  # the policy clauses a citation may name
+    answered_queries: list[str] = []  # items the claimant already answered in a query reply
 
 
 # --- Citations ----------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from app.services.claims.contract import ClaimQueryService
 from app.services.file_store.contract import FileStore
 from app.services.intake.contract import IntakeService
 from app.services.monitoring.contract import Monitoring
+from app.services.query.contract import QueryService
 from app.services.tasks.contract import TaskService
 from app.services.users.contract import STAFF_ROLES, User, UserService
 
@@ -41,6 +42,11 @@ def get_claim_queries(request: Request) -> ClaimQueryService:
 
 def get_file_store(request: Request) -> FileStore:
     service: FileStore = request.app.state.file_store
+    return service
+
+
+def get_query_service(request: Request) -> QueryService:
+    service: QueryService = request.app.state.query_service
     return service
 
 
@@ -78,3 +84,4 @@ Intake = Annotated[IntakeService, Depends(get_intake_service)]
 Claims = Annotated[ClaimQueryService, Depends(get_claim_queries)]
 Files = Annotated[FileStore, Depends(get_file_store)]
 Permissions = Annotated[PermissionService, Depends(get_permission_service)]
+Queries = Annotated[QueryService, Depends(get_query_service)]

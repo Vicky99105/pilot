@@ -23,6 +23,12 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
       TEMPORAL_TASK_QUEUE: ${TEMPORAL_TASK_QUEUE:-claims}
+      # Letters by email: off by default (shadow mode, letters are only recorded). When on,
+      # Microsoft Graph sends only to the comma-separated addresses in the allowlist.
+      NOTIFICATIONS_GRAPH_ENABLED: ${NOTIFICATIONS_GRAPH_ENABLED:-false}
+      NOTIFICATION_ALLOWLIST: ${NOTIFICATION_ALLOWLIST:-}
+      GRAPH_SENDER: ${GRAPH_SENDER:-}
+      GRAPH_ACCESS_TOKEN: ${GRAPH_ACCESS_TOKEN:-}
     volumes:
       - file-store:/data/files
     depends_on:

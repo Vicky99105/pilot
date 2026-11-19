@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -38,6 +39,7 @@ class FakeTaskService:
         title: str,
         payload: dict[str, Any],
         deadline: datetime,
+        authority_amount: Decimal | None = None,
     ) -> Task:
         for t in self.tasks.values():
             if (t.workflow_id, t.kind) == (workflow_id, kind) and t.status != "done":
@@ -54,6 +56,7 @@ class FakeTaskService:
             status="open",
             assignee=None,
             outcome=None,
+            authority_amount=authority_amount,
         )
         self.tasks[task.id] = task
         return task
@@ -97,7 +100,9 @@ class FakeTaskService:
         done = task.model_copy(update={"status": "done", "assignee": user_id, "outcome": outcome})
         self.tasks[task_id] = done
         await self.signaller.task_completed(
-            workflow_id=task.workflow_id, task_id=task_id, outcome=outcome
+            workflow_id=task.workflow_id,
+            task_id=task_id,
+            outcome={**outcome, "completed_by": str(user_id)},
         )
         return done
 

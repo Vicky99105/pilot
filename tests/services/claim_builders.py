@@ -101,6 +101,7 @@ class ClaimSpec:
     claimed: Decimal = Decimal("170000.00")
     lines: list[BillLine] = field(default_factory=lambda: list(WORKED_BILL))
     clinical: Clinical = field(default_factory=appendicitis)
+    submitted_by: UUID | None = None
 
 
 def claim_record(claim_id: UUID, spec: ClaimSpec) -> ClaimRecord:
@@ -149,6 +150,7 @@ async def add_digitised_claim(
             SubmissionRow(
                 id=submission_id,
                 request_type=RequestType.REIMBURSEMENT.value,
+                submitted_by=spec.submitted_by,
                 form=form,
                 member_id=spec.member_id,
                 admission_date=spec.admission_date,

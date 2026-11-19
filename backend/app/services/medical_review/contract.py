@@ -58,8 +58,8 @@ class Finding(BaseModel):
 
 
 class DroppedItem(BaseModel):
-    item: Literal["code", "finding"]
-    detail: str  # the code, or the finding text
+    item: Literal["code", "finding", "query_item"]
+    detail: str  # the code, the finding text, or the query item
     reason: str
 
 

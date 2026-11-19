@@ -5,10 +5,12 @@ from uuid import UUID
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import ClaimRow, FileRow, PageRow, SubmissionRow
+from app.database.models import ClaimRow, FileRow, LetterRow, PageRow, QueryRow, SubmissionRow
 from app.services.claims.contract import (
     ClaimDetail,
     ClaimSummary,
+    LetterView,
+    OpenQueryView,
     StoredFile,
     SubmissionView,
     SubmittedFileView,
@@ -61,6 +63,19 @@ class DefaultClaimQueryService:
                     .order_by(FileRow.position)
                 )
             )
+            letters = list(
+                await session.scalars(
+                    select(LetterRow)
+                    .where(LetterRow.claim_id == claim_id)
+                    .order_by(LetterRow.created_at)
+                )
+            )
+            query = await session.scalar(
+                select(QueryRow)
+                .where(QueryRow.claim_id == claim_id, QueryRow.status.in_(("open", "overdue")))
+                .order_by(QueryRow.raised_at.desc())
+                .limit(1)
+            )
         first = next((s for s in submissions if s.id == claim.submission_id), None)
         return ClaimDetail(
             **_summary(claim, first).model_dump(),
@@ -68,6 +83,28 @@ class DefaultClaimQueryService:
             member_id=claim.member_id,
             hospital_id=claim.hospital_id,
             submitted_by=first.submitted_by if first else None,
+            closed_at=claim.closed_at,
+            letters=[
+                LetterView(
+                    letter_id=letter.id,
+                    kind=letter.kind,
+                    created_at=letter.created_at,
+                    pdf_key=letter.pdf_key,
+                    download_url=f"/api/files/{letter.pdf_key}",
+                    sent=letter.sent,
+                )
+                for letter in letters
+            ],
+            open_query=OpenQueryView(
+                query_id=query.id,
+                items=[item["text"] for item in query.items],
+                status=query.status,
+                raised_at=query.raised_at,
+                deadline=query.deadline,
+                reply_url=f"/api/queries/{query.id}/reply",
+            )
+            if query
+            else None,
             submissions=[
                 SubmissionView(
                     submission_id=s.id,
@@ -109,11 +146,31 @@ class DefaultClaimQueryService:
                 )
             ).first()
         if row is None:
-            return None
+            return await self._letter_file(storage_key)
         file, _, claim = row
         return StoredFile(
             storage_key=storage_key,
             mime=file.mime if file.storage_key == storage_key else "image/png",
+            claim_id=claim.id,
+            policy_number=claim.policy_number,
+            hospital_id=claim.hospital_id,
+        )
+
+    async def _letter_file(self, storage_key: str) -> StoredFile | None:
+        async with self._sessions() as session:
+            row = (
+                await session.execute(
+                    select(LetterRow, ClaimRow)
+                    .join(ClaimRow, ClaimRow.id == LetterRow.claim_id)
+                    .where(LetterRow.pdf_key == storage_key)
+                )
+            ).first()
+        if row is None:
+            return None
+        _, claim = row
+        return StoredFile(
+            storage_key=storage_key,
+            mime="application/pdf",
             claim_id=claim.id,
             policy_number=claim.policy_number,
             hospital_id=claim.hospital_id,

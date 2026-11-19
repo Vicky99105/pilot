@@ -16,7 +16,9 @@ class User(BaseModel):
     name: str
     kind: Literal["staff", "member", "hospital"]
     roles: list[Role]
-    approval_limit: Decimal | None = None
+    # The approver limit. None when the user is not an approver or has no limit; check
+    # roles to tell them apart.
+    max_amount: Decimal | None = None
     hospital_id: str | None = None
     policy_number: str | None = None
     member_id: str | None = None

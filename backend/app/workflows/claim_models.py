@@ -1,6 +1,7 @@
 """Inputs and outputs of ClaimWorkflow and its activities."""
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 from app.shared.types import RequestType, Role, Stage
 
 DraftDecision = Literal["approve", "partial", "query", "reject"]
+FinalDecision = Literal["approve", "partial", "reject"]
 
 
 class ClaimInput(BaseModel):
@@ -28,6 +30,7 @@ class StageResult(BaseModel):
     needs_checkpoint: bool = False  # conditional checkpoints: unsure labels, adverse findings
     checkpoint_payload: dict[str, Any] = {}  # what the person needs to see at the checkpoint
     draft: DraftDecision | None = None  # adjudication only
+    authority_amount: Decimal | None = None  # decision only: the approver limit needed
 
 
 class OpenTaskInput(BaseModel):
@@ -39,6 +42,7 @@ class OpenTaskInput(BaseModel):
     title: str
     payload: dict[str, Any]
     deadline: datetime
+    authority_amount: Decimal | None = None
 
 
 class EventInput(BaseModel):
@@ -58,7 +62,36 @@ class CorrectionInput(BaseModel):
     actor: str
 
 
+class OutcomeInput(BaseModel):
+    """A checkpoint outcome for an activity that records it: the approver's decision, the
+    CRC review or the finance release. outcome["completed_by"] names the person."""
+
+    claim_id: UUID
+    stage: Stage
+    task_id: UUID
+    outcome: dict[str, Any]
+
+
+class DecisionStep(BaseModel):
+    final_decision: FinalDecision | None  # None after a send-back
+    crc_required: bool
+    send_back_stage: Stage | None
+
+
+class QueryRaised(BaseModel):
+    query_id: UUID | None  # None when there was nothing new to ask
+    reply_window_days: int = 0
+    reminder_days: list[int] = []
+
+
+class QueryStepInput(BaseModel):
+    claim_id: UUID
+    query_id: UUID
+    day: int | None = None  # reminders
+    submission_id: UUID | None = None  # replies
+
+
 class ClaimResult(BaseModel):
     claim_id: UUID
     status: Literal["closed"]
-    draft: DraftDecision | None
+    draft: DraftDecision | None  # the final decision

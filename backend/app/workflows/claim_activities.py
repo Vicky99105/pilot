@@ -1,7 +1,7 @@
 """ClaimWorkflow activities. Thin wrappers that call service contracts only.
 
-Slices 2 to 4: intake through adjudication call their services. Decision, communication,
-query, settlement and monitoring still only record an event; slice 5 replaces them.
+Every stage calls its service. Each activity records the claim's events through the
+Monitoring contract, which also keeps claims.status at the current stage.
 """
 
 from collections.abc import Awaitable, Callable
@@ -15,20 +15,28 @@ from temporalio.exceptions import ApplicationError
 from app.services.adjudication.contract import AdjudicationService
 from app.services.bill_review.contract import BillReviewService, LineEdit
 from app.services.classification.contract import ClassificationService
+from app.services.communication.contract import CommunicationService
+from app.services.decision.contract import ApproverOutcome, CrcOutcome, DecisionService
 from app.services.digitisation.contract import DigitisationService
 from app.services.intake.contract import IntakeService
 from app.services.medical_review.contract import MedicalReviewService
 from app.services.monitoring.contract import Monitoring
+from app.services.query.contract import NothingToAsk, Query, QueryService
 from app.services.registration.contract import RegistrationOverrides, RegistrationService
 from app.services.risk.contract import RiskService
+from app.services.settlement.contract import SettlementService
 from app.services.tasks.contract import TaskService
 from app.shared.errors import PermanentError
 from app.shared.types import DocType, Stage
 from app.workflows.claim_models import (
     ClaimInput,
     CorrectionInput,
+    DecisionStep,
     EventInput,
     OpenTaskInput,
+    OutcomeInput,
+    QueryRaised,
+    QueryStepInput,
     StageInput,
     StageResult,
 )
@@ -62,6 +70,10 @@ class ClaimActivities:
         medical_review: MedicalReviewService,
         risk: RiskService,
         adjudication: AdjudicationService,
+        decision: DecisionService,
+        communication: CommunicationService,
+        query: QueryService,
+        settlement: SettlementService,
     ) -> None:
         self._monitoring = monitoring
         self._tasks = tasks
@@ -73,6 +85,10 @@ class ClaimActivities:
         self._medical_review = medical_review
         self._risk = risk
         self._adjudication = adjudication
+        self._decision = decision
+        self._communication = communication
+        self._query = query
+        self._settlement = settlement
 
     async def _run(self, claim_id: UUID, stage: Stage, call: Awaitable[R]) -> R:
         """Run a stage's service call. A permanent failure is recorded as an event, so it
@@ -290,23 +306,231 @@ class ClaimActivities:
 
     @activity.defn(name="decision")
     async def decision(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        """Route the draft to an approver band. The stage completes when the decision is
+        final: recorded by the approver and, for a partial or reject, upheld by the CRC."""
+        routing = await self._run(inp.claim_id, inp.stage, self._decision.route(inp.claim_id))
+        draft = await self._run(inp.claim_id, inp.stage, self._adjudication.draft(inp.claim_id))
+        await self._event(
+            inp,
+            "decision_routed",
+            {"band": routing.band, "amount": str(routing.amount), "draft": routing.draft_decision},
+        )
+        return StageResult(
+            claim_id=inp.claim_id,
+            stage=inp.stage,
+            needs_checkpoint=True,  # "approve" is always on
+            checkpoint_payload={
+                "routing": routing.model_dump(mode="json"),
+                "draft": draft.model_dump(mode="json"),
+            },
+            draft=routing.draft_decision,
+            authority_amount=routing.authority_amount,
+        )
+
+    @activity.defn(name="record_decision")
+    async def record_decision(self, inp: OutcomeInput) -> DecisionStep:
+        outcome = _parse(
+            ApproverOutcome.model_validate,
+            {**inp.outcome, "approver_id": inp.outcome.get("completed_by"), "task_id": inp.task_id},
+        )
+        # A refused outcome is not a stage failure: the workflow reopens the checkpoint.
+        record = await _non_retryable_on_permanent(self._decision.record(inp.claim_id, outcome))
+        detail = {
+            "action": record.action,
+            "final_decision": record.final_decision,
+            "amount": str(record.final_amount),
+            "approver": str(record.approver_id),
+            "overrides": [o.model_dump() for o in record.overrides],
+        }
+        await self._event(_at(inp), "decision_recorded", detail, actor=f"user:{record.approver_id}")
+        if record.final_decision is not None and not record.crc_required:
+            await self._event(
+                _at(inp), "stage_completed", {"final_decision": record.final_decision}
+            )
+        return DecisionStep(
+            final_decision=record.final_decision,
+            crc_required=record.crc_required,
+            send_back_stage=record.send_back_stage,
+        )
+
+    @activity.defn(name="review_crc")
+    async def review_crc(self, inp: OutcomeInput) -> DecisionStep:
+        outcome = _parse(
+            CrcOutcome.model_validate,
+            {**inp.outcome, "reviewer_id": inp.outcome.get("completed_by"), "task_id": inp.task_id},
+        )
+        record = await _non_retryable_on_permanent(self._decision.review_crc(inp.claim_id, outcome))
+        assert record.crc is not None
+        await self._event(
+            _at(inp),
+            "crc_reviewed",
+            {"action": record.crc.action, "reviewer": str(record.crc.reviewer_id)},
+            actor=f"user:{record.crc.reviewer_id}",
+        )
+        upheld = record.crc.action == "uphold"
+        if upheld:
+            await self._event(
+                _at(inp), "stage_completed", {"final_decision": record.final_decision}
+            )
+        return DecisionStep(
+            final_decision=record.final_decision if upheld else None,
+            crc_required=True,
+            send_back_stage=record.crc.send_back_stage,
+        )
 
     @activity.defn(name="communication")
     async def communication(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        letter = await self._run(
+            inp.claim_id, inp.stage, self._communication.issue_letter(inp.claim_id)
+        )
+        return await self._stage_done(
+            inp,
+            {
+                "letter_id": str(letter.letter_id),
+                "kind": letter.kind,
+                "amount": str(letter.amount),
+                "plain_language": letter.plain_language,
+                "sent": letter.sent,
+                "send_error": letter.send_error,
+            },
+        )
 
     @activity.defn(name="query")
-    async def query(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+    async def query(self, inp: StageInput) -> QueryRaised:
+        items = await self._run(
+            inp.claim_id, inp.stage, self._query.outstanding_items(inp.claim_id)
+        )
+
+        async def raise_query() -> Query | None:
+            try:
+                return await self._query.raise_query(inp.claim_id, items)
+            except NothingToAsk:
+                return None  # everything was asked and answered: the approver decides
+
+        query = await self._run(inp.claim_id, inp.stage, raise_query())
+        if query is None:
+            await self._event(inp, "query_not_raised", {"items": [i.text for i in items]})
+            return QueryRaised(query_id=None)
+        await self._stage_done(
+            inp,
+            {
+                "query_id": str(query.query_id),
+                "items": [i.text for i in query.items],
+                "letter_id": str(query.letter_id) if query.letter_id else None,
+                "deadline": query.deadline.isoformat(),
+            },
+        )
+        return QueryRaised(
+            query_id=query.query_id,
+            reply_window_days=query.reply_window_days,
+            reminder_days=query.reminder_days,
+        )
+
+    @activity.defn(name="query_reminder")
+    async def query_reminder(self, inp: QueryStepInput) -> None:
+        assert inp.day is not None
+        await self._run(
+            inp.claim_id, Stage.QUERY, self._query.record_reminder(inp.query_id, inp.day)
+        )
+        await self._event(
+            _query(inp), "query_reminder", {"query_id": str(inp.query_id), "day": inp.day}
+        )
+
+    @activity.defn(name="query_overdue")
+    async def query_overdue(self, inp: QueryStepInput) -> None:
+        await self._run(inp.claim_id, Stage.QUERY, self._query.mark_overdue(inp.query_id))
+        await self._event(_query(inp), "query_deadline_passed", {"query_id": str(inp.query_id)})
+
+    @activity.defn(name="query_reply")
+    async def query_reply(self, inp: QueryStepInput) -> None:
+        assert inp.submission_id is not None
+        query = await self._run(
+            inp.claim_id,
+            Stage.QUERY,
+            self._query.attach_reply(inp.query_id, inp.submission_id),
+        )
+        await self._event(
+            _query(inp),
+            "query_answered",
+            {"query_id": str(query.query_id), "submission_id": str(inp.submission_id)},
+        )
 
     @activity.defn(name="settlement")
     async def settlement(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        """Payee checks only. Payment waits for the finance release; see settle."""
+        record = await self._run(
+            inp.claim_id, inp.stage, self._settlement.check_payee(inp.claim_id)
+        )
+        await self._event(
+            inp,
+            "payee_checked",
+            {
+                "checks": [c.model_dump() for c in record.payee_checks],
+                "paid": str(record.paid_amount),
+            },
+        )
+        return StageResult(
+            claim_id=inp.claim_id,
+            stage=inp.stage,
+            needs_checkpoint=record.final_decision in ("approve", "partial"),
+            checkpoint_payload=record.model_dump(mode="json"),
+        )
+
+    @activity.defn(name="settle")
+    async def settle(self, inp: OutcomeInput) -> None:
+        """After the finance release (or, for a rejection, directly): pay, release the
+        block and close the claim."""
+        released_by = None
+        if inp.outcome:
+            if inp.outcome.get("action") != "release":
+                raise ApplicationError(
+                    'the finance outcome must be {"action": "release"} or a send-back',
+                    type="PermanentError",
+                    non_retryable=True,
+                )
+            released_by = _parse(UUID, inp.outcome.get("completed_by"))
+        record = await _non_retryable_on_permanent(
+            self._settlement.settle(inp.claim_id, released_by=released_by)
+        )
+        await self._event(
+            _at(inp),
+            "stage_completed",
+            {
+                "payment_id": record.payment_ref.payment_id if record.payment_ref else None,
+                "paid": str(record.paid_amount),
+                "utilised": str(record.utilised),
+                "released": str(record.released),
+            },
+            actor=f"user:{released_by}" if released_by else "system",
+        )
+        await self._event(_at(inp), "claim_closed", {"closed_at": str(record.closed_at)})
 
     @activity.defn(name="monitoring")
     async def monitoring(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        summary = await _non_retryable_on_permanent(self._monitoring.summarise(inp.claim_id))
+        return await self._stage_done(
+            inp,
+            {
+                "status": summary.status,
+                "turnaround_seconds": summary.turnaround_seconds,
+                "within_deadline": summary.within_deadline,
+                "checkpoints": summary.checkpoints,
+            },
+        )
+
+    async def _event(
+        self,
+        inp: StageInput,
+        action: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        actor: str = "system",
+    ) -> None:
+        await _non_retryable_on_permanent(
+            self._monitoring.record_event(
+                claim_id=inp.claim_id, stage=inp.stage, action=action, actor=actor, detail=detail
+            )
+        )
 
     @activity.defn(name="open_task")
     async def open_task(self, inp: OpenTaskInput) -> UUID:
@@ -319,6 +543,7 @@ class ClaimActivities:
                 title=inp.title,
                 payload=inp.payload,
                 deadline=inp.deadline,
+                authority_amount=inp.authority_amount,
             )
         )
         await self._monitoring.record_event(
@@ -343,16 +568,28 @@ class ClaimActivities:
         )
 
     def all(self) -> list[Callable[..., Awaitable[Any]]]:
-        names = [s.value for s in Stage] + ["open_task", "record_event", "apply_corrections"]
+        names = [s.value for s in Stage] + [
+            "open_task",
+            "record_event",
+            "apply_corrections",
+            "record_decision",
+            "review_crc",
+            "query_reminder",
+            "query_overdue",
+            "query_reply",
+            "settle",
+        ]
         return [getattr(self, n) for n in names]
 
 
 def _parse(parse: Callable[[Any], R], raw: Any) -> R:
+    """A person's outcome that does not parse is a permanent error: the workflow reopens
+    the checkpoint with the reason."""
     try:
         return parse(raw)
-    except ValidationError as exc:
+    except (ValidationError, ValueError, TypeError) as exc:
         raise ApplicationError(
-            f"invalid corrections: {exc}", type="PermanentError", non_retryable=True
+            f"invalid outcome: {exc}", type="PermanentError", non_retryable=True
         ) from exc
 
 
@@ -365,3 +602,11 @@ def _labels(raw: dict[str, Any]) -> dict[UUID, DocType]:
             type="PermanentError",
             non_retryable=True,
         ) from exc
+
+
+def _at(inp: OutcomeInput) -> StageInput:
+    return StageInput(claim_id=inp.claim_id, stage=inp.stage)
+
+
+def _query(inp: QueryStepInput) -> StageInput:
+    return StageInput(claim_id=inp.claim_id, stage=Stage.QUERY)

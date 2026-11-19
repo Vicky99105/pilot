@@ -41,6 +41,7 @@ from app.shared.seed_ids import (
     MEMBER_USER_ID,
     OPS_USER_ID,
     PRODUCT_UIN,
+    SENIOR_USER_ID,
 )
 from app.shared.types import DocType, RequestType, Role
 
@@ -57,16 +58,20 @@ USERS = [
         kind="member",
         policy_number=MEMBER_POLICY_NUMBER,
         member_id=MEMBER_MEMBER_ID,
+        # Letters are addressed here. Reserved example domain: nothing can be delivered to it.
+        email="asha.verma@member.example",
     ),
     UserRow(
         id=HOSPITAL_USER_ID,
         name="Sunrise Hospital desk",
         kind="hospital",
         hospital_id=HOSPITAL_ROHINI_IDS[0],
+        email="desk@sunrise-hospital.example",
     ),
     UserRow(id=OPS_USER_ID, name="Ops", kind="staff"),
     UserRow(id=DOCTOR_USER_ID, name="Doctor", kind="staff"),
     UserRow(id=FINANCE_USER_ID, name="Finance", kind="staff"),
+    UserRow(id=SENIOR_USER_ID, name="Senior approver", kind="staff"),
 ]
 
 ROLES = [
@@ -76,11 +81,11 @@ ROLES = [
     UserRoleRow(user_id=OPS_USER_ID, role=Role.BILL_PROCESSOR.value),
     UserRoleRow(user_id=OPS_USER_ID, role=Role.INVESTIGATOR.value),
     UserRoleRow(user_id=DOCTOR_USER_ID, role=Role.MEDICAL_OFFICER.value),
-    UserRoleRow(
-        user_id=DOCTOR_USER_ID, role=Role.APPROVER.value, approval_limit=Decimal("100000.00")
-    ),
+    UserRoleRow(user_id=DOCTOR_USER_ID, role=Role.APPROVER.value, max_amount=Decimal("100000.00")),
     UserRoleRow(user_id=DOCTOR_USER_ID, role=Role.CRC_REVIEWER.value),
     UserRoleRow(user_id=FINANCE_USER_ID, role=Role.FINANCE.value),
+    # Same role as the doctor's approver row, with no limit: approves above Rs 1 lakh.
+    UserRoleRow(user_id=SENIOR_USER_ID, role=Role.APPROVER.value),
 ]
 
 # (name, city, state, pincode, beds, differential billing). The nursing home charges one

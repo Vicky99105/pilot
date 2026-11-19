@@ -1,6 +1,7 @@
 """Default medical review: build the case file, run the medical review graph, then re-run R5
 on the verified facts."""
 
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -16,11 +17,13 @@ from app.services.knowledge_base.contract import KnowledgeBase
 from app.services.medical_review.contract import (
     CLAUSE_PREFIX,
     Citation,
+    DroppedItem,
     Finding,
     MedicalFindings,
     NotReadyForMedicalReview,
 )
 from app.services.model_gateway.contract import ModelGateway
+from app.services.query.contract import same_item
 from app.services.registration.contract import RegistrationResult
 from app.services.rules.contract import Facts, RulesEngine
 from app.shared.types import PageRef, RuleResult, Stage
@@ -69,10 +72,24 @@ class DefaultMedicalReviewService:
                 f"policy {registration.policy.policy_number} not found in the core system"
             )
 
+        answered = await self._answered_queries(claim_id)
         case = _case_file(record, policy, await self._clause_refs(policy.product_uin))
+        case.answered_queries = answered
         result = await run_medical_review(
             case, gateway=self._gateway, kb=self._kb, claim_id=claim_id
         )
+        query_items, repeated = [], []
+        for item in result["query_items"]:
+            if any(same_item(item, a) for a in answered):
+                repeated.append(
+                    DroppedItem(
+                        item="query_item",
+                        detail=item,
+                        reason="already answered by the claimant in a query reply",
+                    )
+                )
+            else:
+                query_items.append(item)
 
         product = self._rules.product(policy.product_uin)
         facts = Facts(
@@ -88,10 +105,10 @@ class DefaultMedicalReviewService:
             registration_version=registered.version,
             verified_codes=result["verified_codes"],
             findings=findings,
-            query_items=result["query_items"],
+            query_items=query_items,
             rule_results=rule_results,
             lookups=result["lookups"],
-            dropped=result["dropped"],
+            dropped=[*result["dropped"], *repeated],
             revisions=result["revisions"],
             adverse=any(f.severity == "adverse" for f in findings),
         )
@@ -99,6 +116,18 @@ class DefaultMedicalReviewService:
             claim_id, Stage.MEDICAL_REVIEW, medical.model_dump(mode="json"), created_by="model"
         )
         return medical
+
+    async def _answered_queries(self, claim_id: UUID) -> list[str]:
+        """Items of the claim's answered queries, from each query's latest stage record."""
+        latest: dict[str, dict[str, Any]] = {}
+        for record in await self._records.history(claim_id, Stage.QUERY):
+            latest[str(record.payload.get("query_id"))] = record.payload
+        return [
+            item["text"]
+            for query in latest.values()
+            if query.get("status") == "answered"
+            for item in query.get("items", [])
+        ]
 
     async def _clause_refs(self, product_uin: str) -> list[str]:
         async with self._sessions() as session:

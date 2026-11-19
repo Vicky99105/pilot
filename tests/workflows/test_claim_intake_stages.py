@@ -46,7 +46,15 @@ from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.file_store import FakeFileStore
 from tests.fakes.model_gateway import FakeModelGateway
 from tests.fakes.monitoring import FakeMonitoring
-from tests.fakes.stages import FakeAdjudicationService, FakeMedicalReviewService, FakeRiskService
+from tests.fakes.stages import (
+    FakeAdjudicationService,
+    FakeCommunicationService,
+    FakeDecisionService,
+    FakeMedicalReviewService,
+    FakeQueryService,
+    FakeRiskService,
+    FakeSettlementService,
+)
 from tests.fakes.tasks import FakeTaskService
 from tests.services.test_digitisation import BILL, CHEQUE, DISCHARGE, PAGES, PART_A, v
 from tests.services.test_registration import asha_policy
@@ -91,6 +99,10 @@ class Harness:
             medical_review=FakeMedicalReviewService(),
             risk=FakeRiskService(),
             adjudication=FakeAdjudicationService(),
+            decision=FakeDecisionService(),
+            communication=FakeCommunicationService(),
+            query=FakeQueryService(),
+            settlement=FakeSettlementService(),
         )
 
     async def submit(self) -> Submission:
@@ -124,7 +136,8 @@ class Harness:
         self.tasks.roles.setdefault(MEMBER_USER_ID, set()).add(task.role)
         await self.tasks.complete(task_id=task.id, user_id=MEMBER_USER_ID, outcome=outcome)
         handle = self.env.client.get_workflow_handle(task.workflow_id)
-        await handle.signal(ClaimWorkflow.task_completed, args=[str(task.id), outcome])
+        signalled = {**outcome, "completed_by": str(MEMBER_USER_ID)}  # as TaskService sends it
+        await handle.signal(ClaimWorkflow.task_completed, args=[str(task.id), signalled])
         return str(task.id)
 
 
@@ -192,7 +205,7 @@ async def test_a_low_confidence_field_opens_fix_fields_and_resumes_after_it(
         assert history[-1].payload["identity"]["patient_name"]["value"] == "Asha Verma"
         assert "fix_labels" not in [
             e.detail["kind"]  # type: ignore[index]
-            for e in h.monitoring.events
+            for e in h.monitoring.recorded
             if e.action == "checkpoint_opened"
         ]
         assert "corrections_applied" in h.monitoring.actions(Stage.DIGITISATION)
@@ -257,7 +270,7 @@ async def test_a_permanent_model_failure_fails_the_stage_with_an_event(
             await handle.result()
 
         assert (await handle.describe()).status == WorkflowExecutionStatus.FAILED
-        failed = [e for e in h.monitoring.events if e.action == "stage_failed"]
+        failed = [e for e in h.monitoring.recorded if e.action == "stage_failed"]
         assert [e.stage for e in failed] == [Stage.CLASSIFICATION]
         assert "no API key" in failed[0].detail["error"]  # type: ignore[index]
 
@@ -345,7 +358,9 @@ async def test_a_person_edit_at_confirm_deductions_is_a_new_version_by_a_person(
         assert "corrections_applied" in h.monitoring.actions(Stage.BILL_REVIEW)
 
         # A send-back from a later stage re-runs bill review and keeps the person's version.
-        await h.complete("approve", {"action": "send_back", "stage": "bill_review"})
+        await h.complete(
+            "approve", {"action": "send_back", "stage": "bill_review", "note": "Recheck line 4"}
+        )
         await h.wait_for(lambda: bool(h.tasks.unfinished("confirm_deductions")), "deductions again")
         [again] = h.tasks.unfinished("confirm_deductions")
         assert again.payload["payable"] == "43937.50"

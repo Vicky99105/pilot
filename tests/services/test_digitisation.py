@@ -366,3 +366,58 @@ async def test_invalid_corrections_are_refused(env: Env, fields: dict[str, Any])
 async def test_extract_needs_a_classified_claim(env: Env) -> None:
     with pytest.raises(NotClassified):
         await env.service.extract(UUID(int=5))
+
+
+async def test_a_reply_is_merged_into_a_new_record_version(env: Env) -> None:
+    """A query reply is classified on its own. Extraction reads only the reply's documents
+    and merges them over the claim's record: unchanged sections stay as they were."""
+    submission = await env.claim(pages=[p for p in PAGES if p[0] != DocType.CANCELLED_CHEQUE])
+    first = await env.service.extract(submission.claim_id)
+    assert first.bank.ifsc.value is None  # no cheque yet
+
+    reply = await env.intake.accept(
+        SubmissionInput(
+            request_type=RequestType.QUERY_REPLY,
+            submitted_by=MEMBER_USER_ID,
+            channel="member",
+            parent_claim_id=submission.claim_id,
+            form=submission.form,
+            files=[UploadedFile(filename="reply.pdf", data=make_pdf(["RECEIPT", "CHEQUE"]))],
+        )
+    )
+    gateway = FakeModelGateway(
+        {
+            "classify_page": [
+                {"doc_type": "payment_receipt", "confidence": 0.95},
+                {"doc_type": "cancelled_cheque", "confidence": 0.95},
+            ],
+            "extract_cancelled_cheque": [CHEQUE],
+        }
+    )
+    classification = DefaultClassificationService(
+        env.sessions, env.files, gateway, DefaultPagePreparer(env.sessions, env.files)
+    )
+    reply_set = await classification.classify(reply.submission_id)
+
+    merged = await DefaultDigitisationService(env.sessions, env.files, gateway).extract(
+        submission.claim_id
+    )
+
+    assert [c.purpose for c in gateway.calls if c.role is ModelRole.VISION_EXTRACT] == [
+        "extract_cancelled_cheque"
+    ]
+    cheque_doc = next(d for d in reply_set.documents if d.doc_type is DocType.CANCELLED_CHEQUE)
+    assert merged.classification_version == 2
+    assert merged.bank.ifsc.value == "SBIN0001234"
+    assert merged.bank.ifsc.source == PageRef(document_id=cheque_doc.document_id, page=1)
+    assert merged.documents[DocType.CANCELLED_CHEQUE] == cheque_doc.document_id
+    assert merged.documents[DocType.FINAL_BILL] == first.documents[DocType.FINAL_BILL]
+    assert (merged.identity, merged.bill, merged.clinical) == (
+        first.identity,
+        first.bill,
+        first.clinical,
+    )
+    history = await StageRecordRepository(env.sessions).history(
+        submission.claim_id, Stage.DIGITISATION
+    )
+    assert [r.version for r in history] == [1, 2]

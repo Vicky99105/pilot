@@ -86,6 +86,7 @@ def _case_view(case: CaseFile) -> dict[str, Any]:
         "discharge_date": case.discharge_date,
         "pages_you_may_cite": [p.model_dump(mode="json") for p in case.known_pages],
         "clauses_you_may_cite": case.clause_refs,
+        "already_answered_query_items": case.answered_queries,
     }
 
 
@@ -129,7 +130,8 @@ def choose_messages(
                 "using ICD-10-CM. You may only choose a billable code from the candidate list, "
                 "which came from index and tabular lookups; never write a code from memory. "
                 "Then list findings a medical officer should see (severity: info, query or "
-                "adverse), and query items for anything the documents do not show. If the stay "
+                "adverse), and query items for anything the documents do not show. Never repeat an "
+                "item listed as already answered: the claimant has replied to it. If the stay "
                 "is longer than 7 days, give long_stay_reason only when a page states one. "
                 + CITATION_RULES
             ),

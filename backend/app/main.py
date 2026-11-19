@@ -27,6 +27,8 @@ from app.services.bill_review.service import DefaultBillReviewService
 from app.services.claims.contract import ClaimQueryService
 from app.services.claims.service import DefaultClaimQueryService
 from app.services.classification.service import DefaultClassificationService
+from app.services.communication.service import DefaultCommunicationService
+from app.services.decision.service import DefaultDecisionService
 from app.services.digitisation.service import DefaultDigitisationService
 from app.services.file_store.contract import FileStore
 from app.services.file_store.service import build_file_store
@@ -40,10 +42,15 @@ from app.services.model_gateway.contract import ModelGateway
 from app.services.model_gateway.service import build_model_gateway
 from app.services.monitoring.contract import Monitoring
 from app.services.monitoring.service import DefaultMonitoring
+from app.services.notification.contract import NotificationService
+from app.services.notification.service import build_notification_service
 from app.services.page_prep.service import DefaultPagePreparer
+from app.services.query.contract import QueryService
+from app.services.query.service import DefaultQueryService
 from app.services.registration.service import DefaultRegistrationService
 from app.services.risk.service import DefaultRiskService
 from app.services.rules.service import DefaultRulesEngine
+from app.services.settlement.service import DefaultSettlementService
 from app.services.tasks.contract import TaskService
 from app.services.tasks.service import DefaultTaskService, DefaultWorkflowSignaller
 from app.services.users.contract import UserService
@@ -65,6 +72,8 @@ def create_app(
     file_store: FileStore | None = None,
     permission_service: PermissionService | None = None,
     model_gateway: ModelGateway | None = None,
+    query_service: QueryService | None = None,
+    notification_service: NotificationService | None = None,
 ) -> FastAPI:
     """Services passed in (tests) are used as given; the rest are built in the lifespan."""
     settings = settings or Settings()
@@ -94,8 +103,9 @@ def create_app(
                 settings.mock_core_base_url, core_http
             )
         if app.state.intake_service is None:
+            starter = DefaultWorkflowStarter(settings)
             app.state.intake_service = DefaultIntakeService(
-                sessions, files, DefaultWorkflowStarter(settings)
+                sessions, files, starter, signaller=starter
             )
         if app.state.claim_queries is None:
             app.state.claim_queries = DefaultClaimQueryService(sessions)
@@ -105,6 +115,16 @@ def create_app(
         rules = DefaultRulesEngine(settings.config_dir / "products")
         kb = DefaultKnowledgeBase(sessions)
         policies = HttpPolicyService(settings.mock_core_base_url, core_http)
+        money = HttpMoneyService(settings.mock_core_base_url, core_http)
+        notifications = notification_service or build_notification_service(settings)
+        communication = DefaultCommunicationService(sessions, files, gateway, notifications)
+        if app.state.query_service is None:
+            app.state.query_service = DefaultQueryService(
+                sessions,
+                communication,
+                reply_days=settings.query_reply_days,
+                reminder_days=settings.query_reminder_days,
+            )
         activities = ClaimActivities(
             app.state.monitoring,
             app.state.task_service,
@@ -113,16 +133,17 @@ def create_app(
                 sessions, files, gateway, DefaultPagePreparer(sessions, files)
             ),
             digitisation=DefaultDigitisationService(sessions, files, gateway),
-            registration=DefaultRegistrationService(
-                sessions,
-                policies,
-                HttpMoneyService(settings.mock_core_base_url, core_http),
-                rules,
-            ),
+            registration=DefaultRegistrationService(sessions, policies, money, rules),
             bill_review=DefaultBillReviewService(sessions, rules),
             medical_review=DefaultMedicalReviewService(sessions, gateway, kb, rules, policies),
             risk=DefaultRiskService(sessions, gateway, policies),
             adjudication=DefaultAdjudicationService(sessions, gateway, kb),
+            decision=DefaultDecisionService(
+                sessions, settings.config_dir / "authority_matrix.yaml"
+            ),
+            communication=communication,
+            query=app.state.query_service,
+            settlement=DefaultSettlementService(sessions, money),
         )
         worker_task = asyncio.create_task(
             run_worker_forever(settings, activities), name="temporal-worker"
@@ -145,6 +166,7 @@ def create_app(
     app.state.claim_queries = claim_queries
     app.state.file_store = file_store
     app.state.permission_service = permission_service
+    app.state.query_service = query_service
     app.include_router(health.router)
     app.include_router(task_routes.router)
     app.include_router(monitoring_routes.router)

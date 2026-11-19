@@ -21,11 +21,14 @@ from app.database.repositories.stage_records import append_in_session
 from app.services.file_store.contract import FileStore
 from app.services.intake._helpers import CheckedFile, check_file, files_digest
 from app.services.intake.contract import (
+    Channel,
     ClaimForm,
+    FollowupSignaller,
     Submission,
     SubmissionInput,
     SubmissionRejected,
     SubmittedFile,
+    UploadedFile,
     WorkflowAlreadyStarted,
     WorkflowStarter,
 )
@@ -43,6 +46,8 @@ TURNAROUND = {
 DEFAULT_TURNAROUND = timedelta(days=15)  # reimbursement and every other request type
 MERGED_WARNING = "Merged upload: missing documents are checked after classification"
 NOT_STARTED_WARNING = "Processing not started yet (workflow service unavailable); resubmit to retry"
+NOT_SIGNALLED_WARNING = "Follow-up stored but not delivered to the claim's workflow yet"
+FOLLOWUP_SIGNAL = "followup_received"
 
 
 class DefaultIntakeService:
@@ -52,11 +57,14 @@ class DefaultIntakeService:
         file_store: FileStore,
         starter: WorkflowStarter,
         *,
+        signaller: FollowupSignaller | None = None,
         now: Callable[[], datetime] = utcnow,
     ) -> None:
+        """Without a signaller, follow-ups are stored with a warning and never signalled."""
         self._sessions = sessions
         self._files = file_store
         self._starter = starter
+        self._signaller = signaller
         self._now = now
 
     async def accept(self, submission: SubmissionInput) -> Submission:
@@ -74,8 +82,50 @@ class DefaultIntakeService:
         stored = await self._get_existing(submission_id)
         if submission.parent_claim_id is None:
             await self._start(stored)
-            stored = await self._get_existing(submission_id)
-        return stored
+        else:
+            await self._signal_followup(stored)
+        return await self._get_existing(submission_id)
+
+    async def accept_followup(
+        self,
+        parent_claim_id: UUID,
+        *,
+        submitted_by: UUID,
+        channel: Channel,
+        files: list[UploadedFile],
+        request_type: RequestType = RequestType.QUERY_REPLY,
+    ) -> Submission:
+        async with self._sessions() as session:
+            claim = await session.get(ClaimRow, parent_claim_id)
+            first = await session.get(SubmissionRow, claim.submission_id) if claim else None
+        if first is None:
+            raise SubmissionRejected([f"unknown parent claim {parent_claim_id}"])
+        return await self.accept(
+            SubmissionInput(
+                request_type=request_type,
+                submitted_by=submitted_by,
+                channel=channel,
+                form=ClaimForm.model_validate(first.form),
+                files=files,
+                parent_claim_id=parent_claim_id,
+            )
+        )
+
+    async def _signal_followup(self, submission: Submission) -> None:
+        if submission.workflow_id is not None and self._signaller is not None:
+            try:
+                await self._signaller.followup_received(
+                    workflow_id=submission.workflow_id, submission_id=submission.submission_id
+                )
+                return
+            except Exception:
+                logger.warning(
+                    "Could not signal follow-up %s", submission.submission_id, exc_info=True
+                )
+        async with self._sessions.begin() as session:
+            row = await session.get(SubmissionRow, submission.submission_id)
+            assert row is not None
+            row.warnings = [*row.warnings, NOT_SIGNALLED_WARNING]
 
     async def get(self, submission_id: UUID) -> Submission | None:
         async with self._sessions() as session:
@@ -221,6 +271,8 @@ class DefaultIntakeService:
     ) -> list[DocType]:
         """Required documents with no file in their slot. A merged upload has no slots, so
         classification checks it instead. Missing documents never block a submission."""
+        if submission.parent_claim_id is not None:
+            return []  # a follow-up answers a query; the claim's own checklist applies
         if any(f.slot is None for f in checked):
             warnings.append(MERGED_WARNING)
             return []
@@ -292,8 +344,9 @@ async def _load(session: AsyncSession, submission_id: UUID) -> Submission | None
 
 
 class DefaultWorkflowStarter:
-    """Starts ClaimWorkflow on Temporal. The workflow ID is the claim ID; a second start
-    with the same ID is refused, even after the first workflow has closed."""
+    """Starts ClaimWorkflow on Temporal and signals follow-ups to it. The workflow ID is the
+    claim ID; a second start with the same ID is refused, even after the first workflow has
+    closed."""
 
     def __init__(self, settings: Settings, client: Client | None = None) -> None:
         self._settings = settings
@@ -313,6 +366,11 @@ class DefaultWorkflowStarter:
             )
         except WorkflowAlreadyStartedError as exc:
             raise WorkflowAlreadyStarted(workflow_id) from exc
+
+    async def followup_received(self, *, workflow_id: str, submission_id: UUID) -> None:
+        client = await self._get_client()
+        handle = client.get_workflow_handle(workflow_id)
+        await handle.signal(FOLLOWUP_SIGNAL, str(submission_id))
 
     async def _get_client(self) -> Client:
         if self._client is None:

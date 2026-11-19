@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
+from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.knowledge_base.service import DefaultKnowledgeBase
 from app.services.medical_review.contract import (
@@ -243,3 +244,32 @@ async def test_a_claim_without_registration_is_not_ready(env: Env) -> None:
 
     with pytest.raises(NotReadyForMedicalReview):
         await env.service(FakeModelGateway({})).review(claim_id)
+
+
+async def test_an_item_the_claimant_already_answered_is_not_asked_again(env: Env) -> None:
+    """After a query reply the review runs again. The model sees what was answered, and an
+    answered item it repeats is dropped, so the same query is never raised twice."""
+    claim_id = await env.claim()
+    answered = {
+        "query_id": "6f1c1d1e-5a43-4a8e-9a55-0c1a1f0c0002",
+        "status": "answered",
+        "items": [{"text": "Histopathology report", "source": "medical", "doc_type": None}],
+    }
+    records = StageRecordRepository(env.sessions)
+    await records.append(claim_id, Stage.QUERY, answered, created_by="test")
+    reply = {
+        **choose(k35_32()),
+        "query_items": ["histopathology  REPORT", "Ultrasound abdomen report"],
+    }
+    gateway = FakeModelGateway(
+        {"medical_rewrite_terms": [REWRITE], "medical_choose_codes": [reply]}
+    )
+
+    findings = await env.service(gateway).review(claim_id)
+
+    assert findings.query_items == ["Ultrasound abdomen report"]
+    [dropped] = [d for d in findings.dropped if d.item == "query_item"]
+    assert dropped.detail == "histopathology  REPORT"
+    assert "already answered" in dropped.reason
+    choose_prompt = gateway.calls[-1].messages[-1].content  # type: ignore[index]
+    assert "Histopathology report" in choose_prompt

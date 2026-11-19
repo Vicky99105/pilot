@@ -14,6 +14,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+from app.services.adjudication.contract import Decision
 from app.shared.types import RequestType, Stage
 from app.workflows.claim_activities import ClaimActivities
 from app.workflows.claim_models import ClaimInput, ClaimResult, StageInput, StageResult
@@ -24,16 +25,26 @@ from tests.fakes.stages import (
     FakeAdjudicationService,
     FakeBillReviewService,
     FakeClassificationService,
+    FakeCommunicationService,
+    FakeDecisionService,
     FakeDigitisationService,
     FakeIntakeService,
     FakeMedicalReviewService,
+    FakeQueryService,
     FakeRegistrationService,
     FakeRiskService,
+    FakeSettlementService,
 )
 from tests.fakes.tasks import FakeTaskService
 
 TASK_QUEUE = "test-claims"
 ALWAYS_ON = ["confirm_registration", "confirm_deductions", "approve", "release_payment"]
+PERSON = str(uuid.uuid4())  # completes every task in these tests
+DEFAULT_OUTCOMES = {
+    "approve": {"action": "approve"},
+    "crc": {"action": "uphold"},
+    "release_payment": {"action": "release"},
+}
 
 
 class QueryOnceActivities(ClaimActivities):
@@ -54,6 +65,9 @@ class Harness:
     env: WorkflowEnvironment
     tasks: FakeTaskService
     monitoring: FakeMonitoring
+    query: FakeQueryService
+    settlement: FakeSettlementService
+    classification: FakeClassificationService
 
     async def start(self) -> WorkflowHandle[ClaimWorkflow, ClaimResult]:
         return await self.env.client.start_workflow(
@@ -79,36 +93,49 @@ class Harness:
         await self.wait_for(lambda: bool(self.tasks.unfinished(kind)), f"task {kind}")
         [task] = self.tasks.unfinished(kind)
         self.tasks.tasks[task.id] = task.model_copy(update={"status": "done"})
+        outcome = outcome or DEFAULT_OUTCOMES.get(kind, {"action": "confirm"})
         await handle.signal(
-            ClaimWorkflow.task_completed, args=[str(task.id), outcome or {"action": "confirm"}]
+            ClaimWorkflow.task_completed, args=[str(task.id), {**outcome, "completed_by": PERSON}]
         )
 
     def opened_kinds(self) -> list[str]:
-        return [e.detail["kind"] for e in self.monitoring.events if e.action == "checkpoint_opened"]  # type: ignore[index]
+        return [
+            e.detail["kind"] for e in self.monitoring.recorded if e.action == "checkpoint_opened"
+        ]  # type: ignore[index]
 
 
 async def _harness(
-    activities_cls: type[ClaimActivities], *, adverse: bool = False, refer: bool = False
+    activities_cls: type[ClaimActivities],
+    *,
+    adverse: bool = False,
+    refer: bool = False,
+    decision: Decision = "approve",
 ) -> AsyncIterator[Harness]:
     async with await WorkflowEnvironment.start_time_skipping(
         data_converter=pydantic_data_converter
     ) as env:
         monitoring, tasks = FakeMonitoring(), FakeTaskService()
+        query, settlement = FakeQueryService(), FakeSettlementService(final=decision)
+        classification = FakeClassificationService()
         activities = activities_cls(
             monitoring,
             tasks,
             intake=FakeIntakeService(),
-            classification=FakeClassificationService(),
+            classification=classification,
             digitisation=FakeDigitisationService(),
             registration=FakeRegistrationService(),
             bill_review=FakeBillReviewService(),
             medical_review=FakeMedicalReviewService(adverse=adverse),
             risk=FakeRiskService(refer=refer),
-            adjudication=FakeAdjudicationService(),
+            adjudication=FakeAdjudicationService(decision),
+            decision=FakeDecisionService(decision),
+            communication=FakeCommunicationService(),
+            query=query,
+            settlement=settlement,
         )
         worker: Worker = build_worker(env.client, TASK_QUEUE, claim_activities=activities)
         async with worker:
-            yield Harness(env, tasks, monitoring)
+            yield Harness(env, tasks, monitoring, query, settlement, classification)
 
 
 @pytest.fixture
@@ -145,7 +172,7 @@ async def test_happy_path_opens_always_on_checkpoints_and_closes(harness: Harnes
 
     assert result.status == "closed"
     assert harness.opened_kinds() == ALWAYS_ON
-    completed = [e.stage for e in harness.monitoring.events if e.action == "stage_completed"]
+    completed = [e.stage for e in harness.monitoring.recorded if e.action == "stage_completed"]
     assert completed == [s for s in Stage if s is not Stage.QUERY]
 
 
@@ -199,10 +226,12 @@ async def test_query_path_passes_all_13_stages(query_harness: Harness) -> None:
     result = await handle.result()
 
     assert result.status == "closed"
-    assert {e.stage for e in h.monitoring.events if e.action == "stage_completed"} == set(Stage)
-    # The reply re-ran classification and digitisation, then resumed at adjudication.
+    assert {e.stage for e in h.monitoring.recorded if e.action == "stage_completed"} == set(Stage)
+    # The reply re-ran classification and digitisation, then resumed at medical review.
     assert h.monitoring.actions(Stage.CLASSIFICATION).count("stage_completed") == 2
     assert h.monitoring.actions(Stage.DIGITISATION).count("stage_completed") == 2
+    assert h.monitoring.actions(Stage.MEDICAL_REVIEW).count("stage_completed") == 2
+    assert h.monitoring.actions(Stage.RISK).count("stage_completed") == 2
     assert h.monitoring.actions(Stage.ADJUDICATION).count("stage_completed") == 2
     assert h.monitoring.actions(Stage.REGISTRATION).count("stage_completed") == 1
 
@@ -211,7 +240,9 @@ async def test_send_back_reruns_the_named_stage(harness: Harness) -> None:
     handle = await harness.start()
     await harness.complete(handle, "confirm_registration")
     await harness.complete(handle, "confirm_deductions")
-    await harness.complete(handle, "approve", {"action": "send_back", "stage": "bill_review"})
+    await harness.complete(
+        handle, "approve", {"action": "send_back", "stage": "bill_review", "note": "recheck"}
+    )
     for kind in ["confirm_deductions", "approve", "release_payment"]:
         await harness.complete(handle, kind)
 
@@ -276,3 +307,159 @@ async def test_a_referral_opens_the_investigator_task(referral_harness: Harness)
         await h.complete(handle, kind)
     assert (await handle.result()).status == "closed"
     assert "medical_findings" not in h.opened_kinds()
+
+
+# --- Slice 5: decision, query loop and settlement order ------------------------------------
+
+
+@pytest.fixture
+async def partial_harness() -> AsyncIterator[Harness]:
+    async for h in _harness(ClaimActivities, decision="partial"):
+        yield h
+
+
+@pytest.fixture
+async def reject_harness() -> AsyncIterator[Harness]:
+    async for h in _harness(ClaimActivities, decision="reject"):
+        yield h
+
+
+async def _to_query(h: Harness) -> WorkflowHandle[ClaimWorkflow, ClaimResult]:
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions"]:
+        await h.complete(handle, kind)
+    await h.wait_for(lambda: "stage_completed" in h.monitoring.actions(Stage.QUERY), "query")
+    return handle
+
+
+def _reminders(h: Harness) -> list[int]:
+    return [
+        e.detail["day"]  # type: ignore[index]
+        for e in h.monitoring.recorded
+        if e.action == "query_reminder"
+    ]
+
+
+async def test_query_reminders_at_day_3_and_7_then_a_reply_resumes_at_medical_review(
+    query_harness: Harness,
+) -> None:
+    h = query_harness
+    handle = await _to_query(h)
+
+    await h.env.sleep(timedelta(days=3, minutes=1))
+    await h.wait_for(lambda: _reminders(h) == [3], "day 3 reminder")
+    await h.env.sleep(timedelta(days=4))
+    await h.wait_for(lambda: _reminders(h) == [3, 7], "day 7 reminder")
+    assert h.monitoring.actions(Stage.MEDICAL_REVIEW).count("stage_completed") == 1
+
+    reply = uuid.uuid4()
+    await handle.signal(ClaimWorkflow.followup_received, str(reply))
+    await h.wait_for(lambda: bool(h.tasks.unfinished("approve")), "approve after the reply")
+
+    assert ("reply", reply) in h.query.calls
+    assert "query_answered" in h.monitoring.actions(Stage.QUERY)
+    assert h.classification.classified[-1] == reply  # the reply's own documents
+    assert h.monitoring.actions(Stage.MEDICAL_REVIEW).count("stage_completed") == 2
+    assert "query_deadline_passed" not in h.monitoring.actions(Stage.QUERY)
+    for kind in ["approve", "release_payment"]:
+        await h.complete(handle, kind)
+    assert (await handle.result()).status == "closed"
+
+
+async def test_no_reply_by_the_deadline_opens_the_operator_task_and_waits_again(
+    query_harness: Harness,
+) -> None:
+    h = query_harness
+    handle = await _to_query(h)
+
+    await h.env.sleep(timedelta(days=15, minutes=1))
+    await h.wait_for(lambda: bool(h.tasks.unfinished("query_no_reply")), "operator task")
+    [task] = h.tasks.unfinished("query_no_reply")
+
+    assert task.role.value == "claims_operator"
+    assert "query_deadline_passed" in h.monitoring.actions(Stage.QUERY)
+    assert ("overdue", task.payload and h.query.calls[0][1]) in h.query.calls
+    assert h.monitoring.actions(Stage.SETTLEMENT) == []  # never closed for a missing document
+
+    await h.complete(handle, "query_no_reply", {"action": "extend"})
+    await h.wait_for(lambda: "query_extended" in h.monitoring.actions(Stage.QUERY), "extended")
+    await handle.signal(ClaimWorkflow.followup_received, str(uuid.uuid4()))
+    for kind in ["approve", "release_payment"]:
+        await h.complete(handle, kind)
+    assert (await handle.result()).status == "closed"
+    assert _reminders(h) == [3, 7]  # no second round of reminders after the extension
+
+
+async def test_a_partial_needs_the_crc_and_the_crc_can_send_it_back(
+    partial_harness: Harness,
+) -> None:
+    h = partial_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions", "approve"]:
+        await h.complete(handle, kind)
+    await h.complete(
+        handle, "crc", {"action": "send_back", "stage": "adjudication", "note": "cite clause"}
+    )
+    for kind in ["approve", "crc", "release_payment"]:
+        await h.complete(handle, kind)
+
+    assert (await handle.result()).draft == "partial"
+    assert h.opened_kinds() == [
+        "confirm_registration", "confirm_deductions", "approve", "crc", "approve", "crc",
+        "release_payment",
+    ]  # fmt: skip
+    assert h.monitoring.actions(Stage.ADJUDICATION).count("stage_completed") == 2
+    # The letter goes out only after the CRC upheld the partial.
+    actions = [(e.stage, e.action) for e in h.monitoring.recorded]
+    upheld = actions.index((Stage.DECISION, "stage_completed"))
+    assert actions.index((Stage.COMMUNICATION, "stage_completed")) > upheld
+
+
+async def test_payment_waits_for_the_finance_release(harness: Harness) -> None:
+    handle = await harness.start()
+    for kind in ["confirm_registration", "confirm_deductions", "approve"]:
+        await harness.complete(handle, kind)
+    await harness.wait_for(
+        lambda: bool(harness.tasks.unfinished("release_payment")), "release checkpoint"
+    )
+
+    assert harness.settlement.calls == [("check_payee", None)]  # nothing paid yet
+    assert "payee_checked" in harness.monitoring.actions(Stage.SETTLEMENT)
+
+    await harness.complete(handle, "release_payment")
+    assert (await handle.result()).status == "closed"
+    assert harness.settlement.calls == [("check_payee", None), ("settle", uuid.UUID(PERSON))]
+    assert harness.monitoring.actions(Stage.SETTLEMENT)[-2:] == ["stage_completed", "claim_closed"]
+
+
+async def test_a_release_without_the_release_action_reopens_the_finance_task(
+    harness: Harness,
+) -> None:
+    handle = await harness.start()
+    for kind in ["confirm_registration", "confirm_deductions", "approve"]:
+        await harness.complete(handle, kind)
+    await harness.complete(handle, "release_payment", {"action": "confirm"})
+    await harness.wait_for(
+        lambda: "outcome_refused" in harness.monitoring.actions(Stage.SETTLEMENT), "refusal"
+    )
+    await harness.wait_for(
+        lambda: bool(harness.tasks.unfinished("release_payment")), "release task again"
+    )
+    [again] = harness.tasks.unfinished("release_payment")
+    assert "release" in again.payload["error"]
+
+    await harness.complete(handle, "release_payment")
+    assert (await handle.result()).status == "closed"
+
+
+async def test_a_rejection_skips_the_finance_release_and_closes(reject_harness: Harness) -> None:
+    h = reject_harness
+    handle = await h.start()
+    for kind in ["confirm_registration", "confirm_deductions", "approve", "crc"]:
+        await h.complete(handle, kind)
+
+    result = await handle.result()
+
+    assert (result.status, result.draft) == ("closed", "reject")
+    assert "release_payment" not in h.opened_kinds()
+    assert h.settlement.calls == [("check_payee", None), ("settle", None)]

@@ -85,7 +85,9 @@ class UserRoleRow(Base):
         Uuid, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     role: Mapped[str] = mapped_column(String(40), primary_key=True)
-    approval_limit: Mapped[Decimal | None] = mapped_column(Money)
+    # APPROVER rows: the largest amount this user may approve. NULL on an APPROVER row means
+    # no limit (senior approver). Unused for other roles.
+    max_amount: Mapped[Decimal | None] = mapped_column(Money)
 
 
 # --- Intake and documents -----------------------------------------------------------------
@@ -180,6 +182,7 @@ class ClaimRow(Base):
     deadline: Mapped[datetime | None] = mapped_column(UTCDateTime)
     workflow_id: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
 
 class StageRecordRow(Base):
@@ -193,6 +196,42 @@ class StageRecordRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JsonType)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     created_by: Mapped[str] = mapped_column(String(100))
+
+
+# --- Communication ------------------------------------------------------------------------
+
+
+class QueryRow(Base):
+    """A query to the claimant. Each change is also appended to stage_records (stage query)."""
+
+    __tablename__ = "queries"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    claim_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("claims.id"), index=True)
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JsonType)
+    status: Mapped[str] = mapped_column(String(20))  # open, overdue, answered, closed
+    letter_id: Mapped[UUID | None] = mapped_column(Uuid)
+    deadline: Mapped[datetime] = mapped_column(UTCDateTime)
+    reminders: Mapped[list[int]] = mapped_column(JsonType, default=list)  # days sent
+    reply_submission_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("submissions.id"))
+    raised_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    answered_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class LetterRow(Base):
+    __tablename__ = "letters"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    claim_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("claims.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))  # approval, partial, rejection, query
+    query_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("queries.id"))
+    decision_version: Mapped[int | None] = mapped_column(Integer)
+    recipient: Mapped[str | None] = mapped_column(String(320))  # email address
+    pdf_key: Mapped[str] = mapped_column(String(100), unique=True)
+    sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    send_error: Mapped[str | None] = mapped_column(Text)
+    content: Mapped[dict[str, Any]] = mapped_column(JsonType)  # the Letter record
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
 # --- Work and audit -----------------------------------------------------------------------
@@ -211,6 +250,8 @@ class TaskRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JsonType, default=dict)
     deadline: Mapped[datetime] = mapped_column(UTCDateTime)
     status: Mapped[str] = mapped_column(String(20))  # open, taken, done, escalated
+    # Approver tasks: the amount the approver's limit must cover. None for other tasks.
+    authority_amount: Mapped[Decimal | None] = mapped_column(Money)
     assignee: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("users.id"))
     outcome: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

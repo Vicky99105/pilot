@@ -42,12 +42,33 @@ class SubmissionView(BaseModel):
     warnings: list[str]
 
 
+class LetterView(BaseModel):
+    letter_id: UUID
+    kind: str  # approval, partial, rejection, query
+    created_at: datetime
+    pdf_key: str
+    download_url: str  # GET /api/files/{pdf_key}, permission checked
+    sent: bool
+
+
+class OpenQueryView(BaseModel):
+    query_id: UUID
+    items: list[str]
+    status: str  # open, or overdue once the deadline has passed
+    raised_at: datetime
+    deadline: datetime
+    reply_url: str  # POST, multipart
+
+
 class ClaimDetail(ClaimSummary):
     policy_number: str | None
     member_id: str | None
     hospital_id: str | None
     submitted_by: UUID | None
+    closed_at: datetime | None = None
     submissions: list[SubmissionView]
+    letters: list[LetterView] = []  # oldest first
+    open_query: OpenQueryView | None = None
 
 
 class StoredFile(BaseModel):
@@ -66,5 +87,5 @@ class ClaimQueryService(Protocol):
     async def get(self, claim_id: UUID) -> ClaimDetail | None: ...
 
     async def stored_file(self, storage_key: str) -> StoredFile | None:
-        """An uploaded file or a rendered page image, by its storage key."""
+        """An uploaded file, a rendered page image or a letter PDF, by its storage key."""
         ...

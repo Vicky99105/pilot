@@ -20,13 +20,13 @@ class DefaultUserService:
             roles = list(
                 await session.scalars(select(UserRoleRow).where(UserRoleRow.user_id == user_id))
             )
-        limits = [r.approval_limit for r in roles if r.approval_limit is not None]
+        approver = next((r for r in roles if r.role == Role.APPROVER.value), None)
         return User(
             id=row.id,
             name=row.name,
             kind=row.kind,
             roles=sorted(Role(r.role) for r in roles),
-            approval_limit=max(limits) if limits else None,
+            max_amount=approver.max_amount if approver else None,
             hospital_id=row.hospital_id,
             policy_number=row.policy_number,
             member_id=row.member_id,

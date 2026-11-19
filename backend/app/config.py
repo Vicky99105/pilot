@@ -25,3 +25,12 @@ class Settings(BaseSettings):
     file_store_dir: Path = Path("/data/files")
     # Base64 of 32 random bytes. Required before any file is stored.
     file_encryption_key: SecretStr | None = None
+    # Letters by email. Off by default (shadow mode): letters are recorded, never sent. When
+    # on, only addresses in NOTIFICATION_ALLOWLIST (comma-separated) can receive mail.
+    notifications_graph_enabled: bool = False
+    notification_allowlist: str = ""
+    graph_sender: str | None = None
+    graph_access_token: SecretStr | None = None
+    # Query loop: days the claimant has to reply, and the days after raising to remind them.
+    query_reply_days: int = 15
+    query_reminder_days: list[int] = [3, 7]

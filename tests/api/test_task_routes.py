@@ -9,7 +9,7 @@ from app.config import Settings
 from app.main import create_app
 from app.services.monitoring.contract import ClaimStatusRow
 from app.services.users.contract import User
-from app.shared.types import Role
+from app.shared.types import Role, Stage
 from tests.fakes import FakeHealthService
 from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.tasks import FakeTaskService
@@ -27,9 +27,12 @@ NOW = datetime(2026, 11, 19, 6, 0, tzinfo=UTC)
 
 
 class Api:
-    def __init__(self, client: httpx.AsyncClient, tasks: FakeTaskService) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, tasks: FakeTaskService, monitoring: FakeMonitoring
+    ) -> None:
         self.client = client
         self.tasks = tasks
+        self.monitoring = monitoring
 
     def as_user(self, user: User) -> dict[str, str]:
         return {"X-User-Id": str(user.id)}
@@ -46,16 +49,17 @@ async def api() -> AsyncIterator[Api]:
         dwell_seconds=60,
         deadline=None,
     )
+    monitoring = FakeMonitoring([row])
     app = create_app(
         UNREACHABLE,
         health_service=FakeHealthService(),
         task_service=tasks,
-        monitoring=FakeMonitoring([row]),
+        monitoring=monitoring,
         user_service=FakeUserService([OPS, FINANCE, MEMBER]),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield Api(client, tasks)
+        yield Api(client, tasks, monitoring)
 
 
 async def _open(api: Api, kind: str, role: Role, hours: int = 1) -> str:
@@ -138,4 +142,19 @@ async def test_monitoring_claims_is_for_staff_only(api: Api) -> None:
 
     assert staff.status_code == 200
     assert staff.json()[0]["claim_number"] == "CLM-1"
+    assert member.status_code == 403
+
+
+async def test_a_claims_event_history_is_for_staff_only(api: Api) -> None:
+    claim_id = uuid4()
+    await api.monitoring.record_event(
+        claim_id=claim_id, stage=Stage.INTAKE, action="stage_completed", actor="system"
+    )
+    path = f"/api/claims/{claim_id}/events"
+
+    staff = await api.client.get(path, headers=api.as_user(OPS))
+    member = await api.client.get(path, headers=api.as_user(MEMBER))
+
+    assert staff.status_code == 200
+    assert [(e["stage"], e["action"]) for e in staff.json()] == [("intake", "stage_completed")]
     assert member.status_code == 403

@@ -87,7 +87,22 @@ class SubmissionRejected(Exception):
 
 
 class IntakeService(Protocol):
-    async def accept(self, submission: SubmissionInput) -> Submission: ...
+    async def accept(self, submission: SubmissionInput) -> Submission:
+        """A submission with parent_claim_id is a follow-up: it joins the parent claim and
+        the parent's workflow gets the followup_received signal."""
+        ...
+
+    async def accept_followup(
+        self,
+        parent_claim_id: UUID,
+        *,
+        submitted_by: UUID,
+        channel: Channel,
+        files: list[UploadedFile],
+        request_type: RequestType = RequestType.QUERY_REPLY,
+    ) -> Submission:
+        """A follow-up with the parent claim's form, such as a query reply."""
+        ...
 
     async def get(self, submission_id: UUID) -> Submission | None: ...
 
@@ -100,3 +115,9 @@ class WorkflowStarter(Protocol):
     async def start_claim(
         self, *, workflow_id: str, submission_id: UUID, request_type: RequestType
     ) -> None: ...
+
+
+class FollowupSignaller(Protocol):
+    """Sends followup_received(submission_id) to a claim's running workflow."""
+
+    async def followup_received(self, *, workflow_id: str, submission_id: UUID) -> None: ...

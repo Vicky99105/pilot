@@ -5,11 +5,18 @@ from app.shared.types import RequestType
 
 
 class FakeWorkflowStarter:
-    """Records starts and refuses a repeated workflow ID, like Temporal does."""
+    """Implements WorkflowStarter and FollowupSignaller. Records starts and follow-up
+    signals, and refuses a repeated workflow ID, like Temporal does."""
 
     def __init__(self, *, unavailable: bool = False) -> None:
         self.started: dict[str, tuple[UUID, RequestType]] = {}
+        self.followups: list[tuple[str, UUID]] = []
         self.unavailable = unavailable
+
+    async def followup_received(self, *, workflow_id: str, submission_id: UUID) -> None:
+        if self.unavailable:
+            raise ConnectionError("temporal unreachable")
+        self.followups.append((workflow_id, submission_id))
 
     async def start_claim(
         self, *, workflow_id: str, submission_id: UUID, request_type: RequestType

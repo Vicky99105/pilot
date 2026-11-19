@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.database.models import ClaimRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.services.classification.contract import DocumentSet
 from app.services.digitisation import prompts
@@ -26,7 +27,15 @@ from app.services.digitisation.contract import (
 from app.services.file_store.contract import FileStore
 from app.services.intake.contract import ClaimForm
 from app.services.model_gateway.contract import ModelGateway, ModelRole
-from app.shared.types import Stage
+from app.shared.types import DocType, Stage
+
+# The ClaimRecord sections each extracted document type supplies.
+SECTIONS: dict[DocType, tuple[str, ...]] = {
+    DocType.CLAIM_FORM_PART_A: ("identity", "hospital", "admission", "claimed", "claim_form_bank"),
+    DocType.DISCHARGE_SUMMARY: ("clinical",),
+    DocType.FINAL_BILL: ("bill",),
+    DocType.CANCELLED_CHEQUE: ("bank",),
+}
 
 
 class DefaultDigitisationService:
@@ -36,6 +45,7 @@ class DefaultDigitisationService:
         file_store: FileStore,
         gateway: ModelGateway,
     ) -> None:
+        self._sessions = sessions
         self._files = file_store
         self._gateway = gateway
         self._records = StageRecordRepository(sessions)
@@ -49,6 +59,8 @@ class DefaultDigitisationService:
             return ClaimRecord.model_validate(latest.payload)
 
         doc_set = DocumentSet.model_validate(classified.payload)
+        previous = ClaimRecord.model_validate(latest.payload) if latest is not None else None
+        follow_up = previous is not None and doc_set.submission_id != await self._first(claim_id)
         image_keys = {p.page_id: p.image_key for p in doc_set.pages}
         docs = {}
         for doc in doc_set.documents:  # the first document of each type is read
@@ -66,6 +78,9 @@ class DefaultDigitisationService:
                 purpose=prompts.purpose(doc_type),
             )
         record = assemble(claim_id, classified.version, docs, replies)
+        if follow_up:
+            assert previous is not None
+            record = _merge(previous, record, list(docs))
         return await self._finish(record, created_by="model")
 
     async def apply_corrections(
@@ -99,6 +114,29 @@ class DefaultDigitisationService:
         )
         return record
 
+    async def _first(self, claim_id: UUID) -> UUID | None:
+        """The claim's first submission. Other submissions are follow-ups."""
+        async with self._sessions() as session:
+            claim = await session.get(ClaimRow, claim_id)
+        return claim.submission_id if claim else None
+
     async def _form(self, claim_id: UUID) -> ClaimForm | None:
         intake = await self._records.latest(claim_id, Stage.INTAKE)
         return ClaimForm.model_validate(intake.payload["form"]) if intake else None
+
+
+def _merge(previous: ClaimRecord, reply: ClaimRecord, read: list[DocType]) -> ClaimRecord:
+    """A follow-up's documents replace the sections they supply; the rest stay as they
+    were, including a person's corrections to them."""
+    merged = previous.model_copy(deep=True)
+    merged.classification_version = reply.classification_version
+    replaced: list[str] = []
+    for doc_type in read:
+        for section in SECTIONS[doc_type]:
+            setattr(merged, section, getattr(reply, section))
+            replaced.append(section)
+        merged.documents[doc_type] = reply.documents[doc_type]
+    merged.corrected_fields = [
+        p for p in merged.corrected_fields if p.split(".", 1)[0] not in replaced
+    ]
+    return merged
