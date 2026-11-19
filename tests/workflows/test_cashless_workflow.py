@@ -200,3 +200,63 @@ async def test_a_missed_clock_is_recorded_and_nothing_is_approved_for_it(h: Harn
     await h.complete(handle, "approve")
     await h.wait_for(lambda: ("awaiting_discharge", "preauth") in h.cashless.calls, "wait")
     await handle.terminate()
+
+
+# --- P2-6: hold and resume --------------------------------------------------------------
+
+
+async def test_a_hold_stops_the_clock_and_a_resume_moves_it_on(h: Harness) -> None:
+    """A supervisor holds the claim with the approver task open. Two hours pass on hold: the
+    1-hour clock does not breach. The resume moves the clock, the claim's deadline and its
+    open tasks' deadlines on by the time held, and the claim goes on."""
+    handle = await h.start()
+    await h.complete(handle, "confirm_registration")
+    await h.complete(handle, "confirm_deductions")
+    await h.wait_for(lambda: bool(h.tasks.unfinished("approve")), "the approver task")
+
+    await handle.signal(ClaimWorkflow.hold)
+    await h.wait_for(lambda: bool(h.actions("clock_paused")), "the pause")
+    await h.env.sleep(timedelta(hours=2))
+    assert h.actions("clock_breached") == []
+    await handle.signal(ClaimWorkflow.resume)
+    await h.wait_for(lambda: bool(h.actions("clock_resumed")), "the resume")
+
+    [resumed] = h.actions("clock_resumed")
+    assert resumed["paused_seconds"] >= 2 * 3600
+    [(_, shifted)] = h.tasks.shifted
+    assert shifted == resumed["paused_seconds"]
+    assert {e.stage.value for e in h.monitoring.recorded if "clock_" in e.action} == {"monitoring"}
+    assert not any(e.moves_status for e in h.monitoring.recorded if "clock_" in e.action)
+    await h.complete(handle, "approve")
+    await h.wait_for(lambda: ("awaiting_discharge", "preauth") in h.cashless.calls, "wait")
+    assert h.actions("clock_breached") == []
+    await handle.terminate()
+
+
+async def test_a_held_claim_runs_no_further_stage_until_resumed(h: Harness) -> None:
+    handle = await h.start()
+    await h.wait_for(lambda: bool(h.tasks.unfinished("confirm_registration")), "registration")
+
+    await handle.signal(ClaimWorkflow.hold)
+    await h.wait_for(lambda: bool(h.actions("clock_paused")), "the pause")
+    await h.complete(handle, "confirm_registration")
+    await asyncio.sleep(0.5)
+    assert not h.tasks.unfinished("confirm_deductions")  # bill review waits for the resume
+
+    await handle.signal(ClaimWorkflow.resume)
+    await h.wait_for(lambda: bool(h.tasks.unfinished("confirm_deductions")), "bill review")
+    await handle.terminate()
+
+
+async def test_a_second_hold_and_a_resume_without_a_hold_change_nothing(h: Harness) -> None:
+    handle = await h.start()
+    await h.wait_for(lambda: bool(h.tasks.unfinished("confirm_registration")), "registration")
+
+    await handle.signal(ClaimWorkflow.resume)  # not held: ignored
+    await handle.signal(ClaimWorkflow.hold)
+    await handle.signal(ClaimWorkflow.hold)  # already held: ignored
+    await h.wait_for(lambda: bool(h.actions("clock_paused")), "the pause")
+    await asyncio.sleep(0.3)
+
+    assert len(h.actions("clock_paused")) == 1 and h.actions("clock_resumed") == []
+    await handle.terminate()

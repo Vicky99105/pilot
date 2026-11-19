@@ -119,6 +119,10 @@ class ClaimSpec:
     submitted_by: UUID | None = None
     # How the claim arrived: reimbursement, or a cashless discharge from a network hospital.
     request_type: RequestType = RequestType.REIMBURSEMENT
+    # The document types the claim's classified set holds: R25 looks for the KYC document.
+    documents: tuple[DocType, ...] = (DocType.KYC,)
+    gender: str | None = None  # as written on Part A
+    bill_on_letterhead: bool | None = None  # None: not read
 
 
 def claim_record(claim_id: UUID, spec: ClaimSpec) -> ClaimRecord:
@@ -131,6 +135,7 @@ def claim_record(claim_id: UUID, spec: ClaimSpec) -> ClaimRecord:
             policy_number=f(spec.policy_number),
             member_id=f(spec.member_id),
             date_of_birth=f(spec.dob),
+            gender=f(spec.gender) if spec.gender else Field(value=None, confidence=0.0),
         ),
         hospital=HospitalDetails(name=f(spec.hospital_name), city=f(spec.hospital_city)),
         admission=Admission(
@@ -141,7 +146,13 @@ def claim_record(claim_id: UUID, spec: ClaimSpec) -> ClaimRecord:
         claimed=ClaimedAmounts(total=f(spec.claimed)),
         clinical=spec.clinical,
         documents={DocType.DISCHARGE_SUMMARY: DISCHARGE_DOC},
-        bill=Bill(lines=spec.lines, grand_total=f(total)),
+        bill=Bill(
+            lines=spec.lines,
+            grand_total=f(total),
+            on_letterhead=f(spec.bill_on_letterhead)
+            if spec.bill_on_letterhead is not None
+            else Field(value=None, confidence=0.0),
+        ),
     )
 
 
@@ -194,6 +205,13 @@ async def add_digitised_claim(
         row.claim_id = claim_id
     records = StageRecordRepository(sessions)
     await records.append(claim_id, Stage.INTAKE, {"form": form}, created_by="test")
+    documents = [{"doc_type": d.value} for d in spec.documents]
+    await records.append(
+        claim_id,
+        Stage.CLASSIFICATION,
+        {"submission_id": str(submission_id), "documents": documents},
+        created_by="test",
+    )
     await records.append(
         claim_id,
         Stage.DIGITISATION,

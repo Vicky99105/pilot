@@ -1,6 +1,7 @@
 """Versioned stage outputs. A write always appends a new version; nothing is updated."""
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -111,3 +112,12 @@ class StageRecordRepository:
                 .where(StageRecordRow.claim_id == claim_id)
             )
             return {Stage(r.stage): _to_record(r) for r in rows}
+
+    async def settled_paid(self, claim_id: UUID) -> Decimal:
+        """What the claim's settlements have paid so far: each settled record's paid amount.
+        Zero until a settlement is settled. A reconsideration pays only the difference."""
+        paid = Decimal("0.00")
+        for record in await self.history(claim_id, Stage.SETTLEMENT):
+            if record.payload.get("status") == "settled":
+                paid += Decimal(str(record.payload.get("paid_amount") or "0"))
+        return paid

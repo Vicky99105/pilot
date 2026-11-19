@@ -5,10 +5,12 @@ import { isStaff } from '../../lib/users'
 import { downloadFile } from '../../hooks/useFileUrl'
 import { useAsync } from '../../hooks/useAsync'
 import { EventHistory } from '../monitoring/EventHistory'
+import { ClaimOverrides } from '../overrides/OverrideTable'
 import { Button, Card, Chip, Detail, ErrorList, Loading, Notice } from '../ui/primitives'
 import { FilePicker } from './FilePicker'
 import { JOURNEY, journeyIndex, statusLabel, statusTone } from './status'
 import { CashlessPanel } from './CashlessPanel'
+import { ReconsiderationRequest, Reconsiderations } from './Reconsideration'
 import { SubmissionResult } from './SubmissionResult'
 import { REIMBURSEMENT_SLOTS, slotParts, type SlotFiles } from './uploads'
 
@@ -47,6 +49,13 @@ export function ClaimView({ claimId, user }: { claimId: string; user: User }) {
         </dl>
       </Card>
 
+      {claim.held_at && (
+        <Notice tone="warn">
+          On hold since {dateTime(claim.held_at)}
+          {claim.hold_reason && <>: {claim.hold_reason}</>}. Work on this claim resumes when a supervisor releases it.
+        </Notice>
+      )}
+
       {claim.open_query && !staff && <QueryReply query={claim.open_query} channel={user.kind} onReplied={reload} />}
       {claim.open_query && staff && (
         <Notice tone="warn">
@@ -69,9 +78,17 @@ export function ClaimView({ claimId, user }: { claimId: string; user: User }) {
         </div>
       </div>
 
+      {claim.reconsiderations.length > 0 && <Reconsiderations items={claim.reconsiderations} />}
+      {claim.status === 'closed' && !staff && <ReconsiderationRequest claim={claim} channel={user.kind} onSent={reload} />}
+
       {staff && (
         <Card title="Event history">
           <EventHistory claimId={claim.claim_id} />
+        </Card>
+      )}
+      {staff && (
+        <Card title="Overrides">
+          <ClaimOverrides claimId={claim.claim_id} />
         </Card>
       )}
     </div>

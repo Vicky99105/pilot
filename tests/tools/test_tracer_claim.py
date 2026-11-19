@@ -59,7 +59,7 @@ def test_deductions_are_consistent_and_follow_the_policy_limits(
     """A member reimbursement: AG095 is mapped (guideline and stay norm) but its rate does not
     cap the claim under this wording. The policy's own rules apply: R11 takes the gloves, R12
     reads the nursing lines as List II item 38 (part of the room charges), and the room cap
-    with the proportionate deduction (R13) takes the rest."""
+    (R13) with the proportionate deduction (R15) takes the rest."""
     _, truth = bundle
     sheet = truth["sheet"]
     for line in sheet["lines"]:
@@ -78,7 +78,7 @@ def test_deductions_are_consistent_and_follow_the_policy_limits(
         ("R11", "ANNEX-I"): {"consumables"},
         ("R12", "ANNEX-II"): {"nursing"},
         ("R13", "ROOM-CAP"): {"room"},
-        ("R13", "PROP-DED"): {"ot", "professional_fees"},
+        ("R15", "PROP-DED"): {"ot", "professional_fees"},
     }
     assert not any(d["rule_id"] in ("R20", "R23", "R24") for ln in sheet["lines"]
                    for d in ln["deductions"])  # fmt: skip
@@ -87,7 +87,7 @@ def test_deductions_are_consistent_and_follow_the_policy_limits(
     nursing = [ln for ln in sheet["lines"] if ln["head"] == "nursing"]
     assert len(nursing) == 4 and all(D(ln["admissible"]) == 0 for ln in nursing)
     assert all("List II item 38" in ln["reason"] for ln in nursing)
-    assert sheet["rules_failed"] == ["R11", "R12", "R13"]
+    assert sheet["rules_failed"] == ["R11", "R12", "R13", "R15"]
     assert truth["expected"]["approver_band"] == "approver"  # payable within Rs 1 lakh
 
 

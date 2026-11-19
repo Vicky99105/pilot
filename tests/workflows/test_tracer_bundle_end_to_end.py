@@ -174,6 +174,8 @@ def _script(truth: dict[str, Any]) -> dict[str, list[Any]]:
         "bill_package_choice": [{"procedure_1": package}] * 2,
         "medical_ped_reread": [{"statements": []}] * 2,
         "medical_findings": [{"findings": [], "query_items": []}] * 2,
+        # The bill is 2.83 times the AG095 rate: the tariff outlier flag (RF11) fires.
+        "risk_explanation": [{"text": "The bill is well above the package rate."}] * 2,
         "adjudication_decide": [query, partial],
     }
 
@@ -269,6 +271,11 @@ async def test_the_generated_bundle_runs_from_a_merged_upload_to_closed(
         truth["expected"]["guideline_code"],
         truth["expected"]["los_norm_days"],
     )
+
+    risk = await records.latest(claim_id, Stage.RISK)
+    assert risk is not None
+    assert [h["rule_id"] for h in risk.payload["hits"]] == ["RF11"]  # tariff outlier
+    assert (risk.payload["score"], risk.payload["refer"]) == (20, False)
 
     letters = [r.payload["kind"] for r in await records.history(claim_id, Stage.COMMUNICATION)]
     assert letters == truth["expected"]["letters"]

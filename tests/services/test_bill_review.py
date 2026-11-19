@@ -22,6 +22,7 @@ from app.services.bill_review.contract import (
 )
 from app.services.bill_review.service import DefaultBillReviewService
 from app.services.knowledge_base.service import DefaultKnowledgeBase
+from app.services.overrides.service import DefaultOverrideLog
 from app.services.registration.contract import RegistrationService
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.contract import Head, RulesEngine
@@ -90,7 +91,7 @@ def by_line(sheet: DeductionSheet) -> dict[int, tuple[Head, Decimal, Decimal, st
 async def test_worked_example_admits_138500_and_pays_131575(env: Env) -> None:
     """No package (no procedure coded). Sunrise's agreement gives 10% off non-package
     charges, except medicines and implants (R24), then the room cap and the proportionate
-    deduction apply to what is left (R13). The discount on the room lowers the room rate
+    deduction apply to what is left (R13, R15). The discount on the room lowers the room rate
     the proportion uses (Rs 6,750 against the Rs 5,000 cap), so the linked heads end where
     they did before the discount; only diagnostics keep the 10% off. A cashless claim: the
     agreement's discount binds the hospital."""
@@ -107,7 +108,7 @@ async def test_worked_example_admits_138500_and_pays_131575(env: Env) -> None:
         6: (Head.IMPLANTS, D("40000.00"), D("0.00"), None),
         7: (Head.DIAGNOSTICS, D("13500.00"), D("1500.00"), "NON-PKG-DISC"),
     }
-    assert [ln.rule_id for ln in sheet.lines] == ["R13"] * 4 + [None, None, "R24"]
+    assert [ln.rule_id for ln in sheet.lines] == ["R13"] + ["R15"] * 3 + [None, None, "R24"]
     # Every rule that took something off a line, in order: the discount, then the cap.
     assert [(d.rule_id, d.amount) for d in sheet.lines[0].deductions] == [
         ("R24", D("3000.00")),
@@ -119,7 +120,8 @@ async def test_worked_example_admits_138500_and_pays_131575(env: Env) -> None:
     assert sheet.co_pay == D("6925.00")
     assert sheet.payable == D("131575.00")
     assert sheet.package is None  # nothing to map without a procedure
-    assert sheet.rule_results[-1].rule_id == "R21"
+    assert [r.rule_id for r in sheet.rule_results[-2:]] == ["R21", "R22"]
+    assert sheet.rule_results[-1].passed  # every deduction cites its clause
     assert sheet.flagged_lines == []
     stored = await StageRecordRepository(env.sessions).history(claim_id, Stage.BILL_REVIEW)
     assert [(r.version, r.created_by) for r in stored] == [(1, "code")]
@@ -278,6 +280,26 @@ async def test_a_person_edit_is_a_new_version_and_recomputes_the_co_pay(env: Env
     assert await env.service.review(claim_id) == sheet
 
 
+async def test_a_person_deduction_with_no_clause_fails_r22_and_is_a_finding(env: Env) -> None:
+    """Line 5 (pharmacy) had nothing deducted, so it has no clause. A person takes Rs 1,000
+    off it: the sheet still pays it, but R22 fails and the bill processor sees why."""
+    claim_id = await env.registered()
+    await env.service.review(claim_id)
+
+    sheet = await env.service.apply_edits(
+        claim_id,
+        [LineEdit(line_id=5, admissible=D("24000"), reason="Two strips were not used")],
+        actor="task:t1",
+    )
+
+    r22 = [r for r in sheet.rule_results if r.rule_id == "R22"]
+    assert len(r22) == 1 and not r22[0].passed
+    assert "line 5" in r22[0].reason
+    assert [f.kind for f in sheet.findings] == ["uncited_deduction"]
+    assert [r.rule_id for r in sheet.rule_results].count("R21") == 1
+    assert sheet.payable == D("132050.00")  # R22 never deducts: (140000 - 1000) less 5%
+
+
 @pytest.mark.parametrize(
     "edit",
     [
@@ -355,7 +377,7 @@ async def test_an_itemised_bill_is_capped_at_the_agreed_package_rate(env: Env) -
     [r20] = [r for r in sheet.rule_results if r.rule_id == "R20"]
     assert (r20.clause_ref, r20.amount_effect) == ("AGREED-TARIFF", D("-44182.00"))
     # No room cap or proportionate deduction on lines the package prices.
-    assert not any(d.rule_id in ("R13", "R14") for ln in sheet.lines for d in ln.deductions)
+    assert not any(d.rule_id in ("R13", "R14", "R15") for ln in sheet.lines for d in ln.deductions)
 
 
 async def test_a_reimbursement_maps_the_package_but_pays_on_the_policys_own_limits(
@@ -377,9 +399,9 @@ async def test_a_reimbursement_maps_the_package_but_pays_on_the_policys_own_limi
     assert not any(ln.in_package for ln in sheet.lines)
     assert {(n, found[n].admissible, found[n].rule_id) for n in (1, 2, 3, 4, 7)} == {
         (1, D("20000.00"), "R13"),
-        (2, D("2400.00"), "R13"),
-        (3, D("12333.33"), "R13"),
-        (4, D("12000.00"), "R13"),
+        (2, D("2400.00"), "R15"),
+        (3, D("12333.33"), "R15"),
+        (4, D("12000.00"), "R15"),
         (7, D("0.00"), "R11"),
     }
     assert not any(d.rule_id in ("R20", "R23", "R24") for ln in sheet.lines for d in ln.deductions)
@@ -667,3 +689,20 @@ async def test_the_final_bill_is_held_to_the_approved_total_r26(env: Env) -> Non
     assert (r26.passed, r26.amount_effect) == (False, D("-4300.00"))
     assert sheet.admissible_total == D("33000.00")
     assert sheet.payable == D("31350.00")
+
+
+async def test_deduction_edits_are_written_to_the_override_log(env: Env) -> None:
+    claim_id = await env.registered()
+    await env.service.review(claim_id)
+
+    await env.service.apply_edits(
+        claim_id,
+        [LineEdit(line_id=7, admissible=D("5000"), reason="Only one CT scan was advised")],
+        actor="user:00000000-0000-4000-8000-000000000003",
+    )
+
+    log = await DefaultOverrideLog(env.sessions).list(claim_id=claim_id)
+    assert [(o.kind, o.stage.value, o.field, o.before, o.after, o.reason) for o in log] == [
+        ("deduction_edit", "bill_review", "line 7 admissible", "15000.00", "5000.00",
+         "Only one CT scan was advised"),
+    ]  # fmt: skip

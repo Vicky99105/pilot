@@ -10,6 +10,10 @@
    then the sum insured block released with utilised = the paid amount, then the claim
    closes. A rejected claim needs no release: its whole block is released and it closes.
 
+A reconsidered claim was paid before. Its new decision pays only what it adds: the paid
+amount is the decided amount less what earlier settlements paid, never below zero. Nothing to
+add needs no release and creates no payment instruction.
+
 Callers import this module only.
 """
 
@@ -46,7 +50,9 @@ class SettlementRecord(BaseModel):
     claim_id: UUID
     decision_version: int
     final_decision: FinalDecision
-    paid_amount: Decimal  # zero for a reject
+    decided_amount: Decimal | None = None  # the decision's amount, before earlier payments
+    previously_paid: Decimal = Decimal("0.00")  # what earlier settlements paid
+    paid_amount: Decimal  # what this settlement pays: zero for a reject
     payee: Payee | None  # None for a reject
     payee_checks: list[PayeeCheck]
     status: Literal["awaiting_release", "settled"]

@@ -20,6 +20,7 @@ from app.services.digitisation.service import DefaultDigitisationService
 from app.services.intake.contract import ClaimForm, Submission, SubmissionInput, UploadedFile
 from app.services.intake.service import DefaultIntakeService
 from app.services.model_gateway.contract import ModelRole
+from app.services.overrides.service import DefaultOverrideLog
 from app.services.page_prep.service import DefaultPagePreparer
 from app.shared.seed_ids import MEMBER_USER_ID
 from app.shared.types import Code, DocType, PageRef, RequestType, Stage
@@ -329,6 +330,20 @@ async def test_low_confidence_uses_a_stricter_bar_for_handwriting(env: Env) -> N
     assert record.low_confidence_fields == ["identity.patient_name", "identity.member_id"]
 
 
+async def test_the_bill_letterhead_is_read_as_a_risk_signal_never_a_field_to_fix(
+    env: Env,
+) -> None:
+    env.replies[DocType.FINAL_BILL]["on_letterhead"] = v(False, confidence=0.4)
+
+    record = await env.extract()
+
+    assert record.bill.on_letterhead.value is False
+    assert "bill.on_letterhead" not in record.low_confidence_fields
+    [call] = [c for c in env.gateway.calls if c.purpose == "extract_final_bill"]
+    assert call.schema is not None
+    assert "on_letterhead" in call.schema.model_json_schema()["properties"]
+
+
 async def test_a_missing_document_leaves_its_fields_for_an_operator(env: Env) -> None:
     record = await env.extract(pages=PAGES[:-1])
 
@@ -567,3 +582,19 @@ async def test_the_claimed_hospital_expenses_must_match_the_bill_grand_total(env
     }
     detail = checks(record)["claimed_matches_bill"]
     assert "52000.00" in detail and "48250.00" in detail
+
+
+async def test_field_fixes_are_written_to_the_override_log(env: Env) -> None:
+    env.replies[DocType.FINAL_BILL]["grand_total"] = v("49250", confidence=0.7)
+    submission = await env.claim()
+    await env.service.extract(submission.claim_id)
+
+    await env.service.apply_corrections(
+        submission.claim_id, {"bill.grand_total": "48250"}, actor="user:ops"
+    )
+
+    log = await DefaultOverrideLog(env.sessions).list(claim_id=submission.claim_id)
+    assert [(o.kind, o.field, o.before, o.after) for o in log] == [
+        ("field_fix", "bill.grand_total", "49250.00", "48250"),
+    ]
+    assert log[0].user_id is None  # "user:ops" names no user ID

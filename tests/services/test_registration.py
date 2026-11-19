@@ -11,10 +11,11 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
-from app.database.models import ClaimRow
+from app.database.models import ClaimRow, HospitalRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.integrations.core.contract import InsuredMember, MemberPolicy, PremiumPayment
+from app.services.overrides.service import DefaultOverrideLog
 from app.services.registration.contract import (
     InvalidOverride,
     NotDigitised,
@@ -28,7 +29,13 @@ from app.shared.seed_ids import HOSPITAL_ROHINI_IDS, PRODUCT_UIN
 from app.shared.types import RequestType, RuleResult, Stage
 from tests.database.factories import add_claim
 from tests.fakes.core import FakeMoneyService, FakePolicyService
-from tests.services.claim_builders import MEMBER, POLICY, ClaimSpec, add_digitised_claim
+from tests.services.claim_builders import (
+    MEMBER,
+    POLICY,
+    ClaimSpec,
+    add_digitised_claim,
+    bill_line,
+)
 
 D = Decimal
 
@@ -105,8 +112,11 @@ async def test_a_clean_claim_registers_blocks_and_gets_a_claim_number(env: Env) 
 
     result = await env.service.register(claim_id)
 
-    assert [r.rule_id for r in result.rule_results] == ["R3", "R1", "R2", "R5", "R10"]
+    assert [r.rule_id for r in result.rule_results] == [
+        "R3", "R1", "R2", "R4", "R5", "R8", "R10", "R25"
+    ]  # fmt: skip
     assert all(r.passed for r in result.rule_results), result.rule_results
+    assert result.hospital.network
     assert (result.member.match, result.member.member_id) == ("exact_id", MEMBER)
     assert (result.hospital.match, result.hospital.rohini_id) == (
         "rohini_id",
@@ -357,3 +367,96 @@ async def test_a_cashless_claim_keeps_its_block_across_requests(env: Env) -> Non
     assert first.block_ref is not None and len(env.money.blocks) == 1
     assert second.block_ref == first.block_ref
     assert env.money.releases == {}
+
+
+async def test_a_claim_of_one_lakh_or_more_without_kyc_fails_r25(env: Env) -> None:
+    claim_id = await env.claim(ClaimSpec(documents=()))
+
+    result = await env.service.register(claim_id)
+
+    r25 = rule(result, "R25")
+    assert not r25.passed and "PAN or Aadhaar" in r25.reason
+    assert r25.clause_ref == "KYC"
+
+
+async def test_a_claim_below_one_lakh_needs_no_kyc(env: Env) -> None:
+    lines = [bill_line(1, "Room Charges", "General ward", "60000")]
+    claim_id = await env.claim(ClaimSpec(documents=(), claimed=D("60000.00"), lines=lines))
+
+    result = await env.service.register(claim_id)
+
+    assert rule(result, "R25").passed
+
+
+async def test_an_unknown_hospital_fails_r4(env: Env) -> None:
+    claim_id = await env.claim(
+        ClaimSpec(hospital_id=None, hospital_name="Nowhere Clinic", hospital_city="Shimla")
+    )
+
+    result = await env.service.register(claim_id)
+
+    r4 = rule(result, "R4")
+    assert (r4.passed, r4.clause_ref) == (False, "HOSPITAL")
+    assert "not in the hospital register" in r4.reason
+
+
+async def test_a_cashless_claim_at_a_hospital_outside_the_network_fails_r4(env: Env) -> None:
+    async with env.sessions.begin() as session:
+        row = await session.get(HospitalRow, HOSPITAL_ROHINI_IDS[1])
+        assert row is not None
+        row.network = False
+    reimbursement = await env.claim(ClaimSpec(hospital_id=HOSPITAL_ROHINI_IDS[1]))
+    cashless = await env.claim(
+        ClaimSpec(
+            hospital_id=HOSPITAL_ROHINI_IDS[1],
+            request_type=RequestType.DISCHARGE,
+            admission_date=date(2026, 9, 1),
+            discharge_date=date(2026, 9, 3),
+        )
+    )
+
+    assert rule(await env.service.register(reimbursement), "R4").passed
+    r4 = rule(await env.service.register(cashless), "R4")
+    assert not r4.passed and "network hospital" in r4.reason
+
+
+async def test_registration_overrides_are_written_to_the_override_log(env: Env) -> None:
+    claim_id = await env.claim(ClaimSpec(member_id="MOCK-M-000101-09", dob=date(1985, 1, 1)))
+    await env.service.register(claim_id)
+    user = "user:00000000-0000-4000-8000-000000000003"
+
+    await env.service.apply_overrides(
+        claim_id,
+        RegistrationOverrides(member_id=MEMBER, reason="KYC shows DOB typo on the claim form"),
+        actor=user,
+    )
+
+    log = await DefaultOverrideLog(env.sessions).list(claim_id=claim_id)
+    assert [(o.kind, o.field, o.before, o.after) for o in log] == [
+        ("registration_override", "member", None, MEMBER),
+    ]
+    assert log[0].reason == "KYC shows DOB typo on the claim form"
+    assert (log[0].actor, str(log[0].user_id)) == (user, user.removeprefix("user:"))
+
+
+async def test_a_reconsidered_claim_blocks_only_what_it_may_still_pay(env: Env) -> None:
+    """The claim was settled for Rs 1,00,000 of its Rs 1,70,000, and settlement released
+    its block. The reconsideration's new record registers again: the old block is not
+    released a second time, and the new block is the Rs 70,000 still claimable."""
+    claim_id = await env.claim()
+    first = await env.service.register(claim_id)
+    records = StageRecordRepository(env.sessions)
+    await records.append(claim_id, Stage.SETTLEMENT,
+                         {"status": "settled", "paid_amount": "100000.00"},
+                             created_by="test")  # fmt: skip
+    latest = await records.latest(claim_id, Stage.DIGITISATION)
+    assert latest is not None
+    await records.append(claim_id, Stage.DIGITISATION, latest.payload, created_by="model")
+
+    again = await env.service.register(claim_id)
+
+    assert (again.claimed_amount, again.block_amount) == (D("170000.00"), D("70000.00"))
+    assert again.block_ref is not None and again.block_ref.amount == D("70000.00")
+    assert first.block_ref is not None
+    assert env.money.releases == {}  # settlement released the first block already
+    assert rule(again, "R25").passed  # KYC is judged on the full claim

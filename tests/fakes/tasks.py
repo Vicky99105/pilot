@@ -28,6 +28,7 @@ class FakeTaskService:
         self.roles = roles or {}
         self.signaller = signaller or FakeWorkflowSignaller()
         self.tasks: dict[UUID, Task] = {}
+        self.shifted: list[tuple[UUID, int]] = []  # shift_deadlines calls: (claim, seconds)
 
     async def open_task(
         self,
@@ -111,3 +112,6 @@ class FakeTaskService:
         if task is None or task.role not in self.roles.get(user_id, set()):
             return None
         return task
+
+    async def shift_deadlines(self, *, claim_id: UUID, seconds: int) -> None:
+        self.shifted.append((claim_id, seconds))

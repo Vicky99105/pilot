@@ -31,6 +31,7 @@ from app.services.medical_review.service import (
     DefaultMedicalReviewService,
     document_options,
 )
+from app.services.overrides.service import DefaultOverrideLog
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.types import DocType, RequestType, Stage
@@ -261,7 +262,7 @@ async def test_the_review_reads_the_packages_guideline_and_norm_and_reruns_the_r
     assert set(guideline.sections) == {"claim_documents", "alos", "clinical_pointers"}
     assert [c.code.code for c in findings.verified_codes] == ["K35.32"]  # from step 1
     assert [(r.rule_id, r.passed) for r in findings.rule_results] == [
-        ("R5", True), ("R6", True), ("R7", True), ("R9", True),
+        ("R5", True), ("R6", True), ("R7", True), ("R8", True), ("R9", True),
     ]  # fmt: skip
     # The hospital wrote K35.8; the review found a more specific code.
     [hospital] = [f for f in findings.findings if f.kind == "hospital_codes"]
@@ -553,6 +554,10 @@ async def test_a_history_older_than_the_policy_fails_r6_within_the_wait(env: Env
     [r6] = [r for r in findings.rule_results if r.rule_id == "R6"]
     assert (r6.passed, r6.clause_ref) == (False, "Excl01")
     assert findings.adverse is True
+    # Not declared, and within the 60-month moratorium: R8 lets the insurer contest it.
+    [r8] = [r for r in findings.rule_results if r.rule_id == "R8"]
+    assert (r8.passed, r8.clause_ref) == (False, "MORATORIUM")
+    assert any(f.rule_id == "R8" and f.severity == "adverse" for f in findings.findings)
 
 
 async def test_the_pre_existing_re_read_reads_only_the_cited_history_pages(env: Env) -> None:
@@ -730,3 +735,17 @@ async def test_a_preauth_checks_the_guidelines_preauth_documents(env: Env) -> No
     text = "\n".join(m.content for m in gateway.calls[-1].messages or [] if
                      isinstance(m.content, str))  # fmt: skip
     assert "preauth_documents" not in text  # a document list is never shown to the model
+
+
+async def test_an_overrule_is_written_to_the_override_log(env: Env) -> None:
+    service, claim_id = await _reviewed_with_failed_wait(env)
+    findings = await service.review(claim_id)
+    [eligibility] = [f for f in findings.findings if f.kind == "eligibility"]
+
+    await service.overrule(claim_id, [eligibility.finding_id], "Portability", actor="user:x")
+
+    log = await DefaultOverrideLog(env.sessions).list(claim_id=claim_id)
+    assert [(o.kind, o.field, o.after, o.reason) for o in log] == [
+        ("medical_overrule", f"finding {eligibility.finding_id}", "overruled", "Portability"),
+    ]
+    assert log[0].before == {"severity": "adverse", "text": eligibility.text}

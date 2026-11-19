@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from app.shared.types import Role
+from app.shared.types import Role, SystemOfMedicine
 
 STAFF_ROLES = frozenset(Role) - {Role.HOSPITAL_USER, Role.MEMBER}
 
@@ -22,6 +22,7 @@ class User(BaseModel):
     hospital_id: str | None = None
     policy_number: str | None = None
     member_id: str | None = None
+    system_of_medicine: SystemOfMedicine | None = None  # medical officers
 
 
 class UserService(Protocol):

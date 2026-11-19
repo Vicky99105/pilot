@@ -16,7 +16,7 @@ from app.shared.errors import PermanentError
 from app.shared.types import RuleResult
 
 # Rules registration runs, in this order.
-REGISTRATION_RULES = ["R3", "R1", "R2", "R5", "R10"]
+REGISTRATION_RULES = ["R3", "R1", "R2", "R4", "R5", "R8", "R10", "R25"]
 
 MemberMatchKind = Literal["exact_id", "name_dob", "doubtful", "none", "person"]
 HospitalMatchKind = Literal["rohini_id", "name_city", "none", "person"]
@@ -50,6 +50,7 @@ class MatchedHospital(BaseModel):
     name: str | None
     city: str | None
     differential_billing: bool  # True when unknown: the conservative reading
+    network: bool = False  # in the insurer's network (R4)
 
 
 class DuplicateClaim(BaseModel):
@@ -68,7 +69,8 @@ class RegistrationResult(BaseModel):
     hospital: MatchedHospital
     admission_date: date | None
     accident: bool
-    block_amount: Decimal | None
+    block_amount: Decimal | None  # the claimed amount, less what earlier settlements paid
+    claimed_amount: Decimal | None = None  # what the claim asks for, in full
     rule_results: list[RuleResult]
     duplicates: list[DuplicateClaim]
     block_ref: BlockRef | None  # None when nothing could be blocked

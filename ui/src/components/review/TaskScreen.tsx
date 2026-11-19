@@ -2,9 +2,10 @@ import { useCallback, useMemo, useState, type ComponentType } from 'react'
 import { api, ApiError, type ClaimPages, type PageRef, type Task, type User } from '../../lib/api'
 import { rupees } from '../../lib/format'
 import { href, navigate } from '../../lib/router'
-import { ROLE_LABELS } from '../../lib/users'
+import { ROLE_LABELS, SYSTEM_LABELS } from '../../lib/users'
 import { useAsync } from '../../hooks/useAsync'
 import { useNow } from '../../hooks/useNow'
+import { ClaimOverrides } from '../overrides/OverrideTable'
 import { Button, Card, Chip, ErrorList, Loading, Notice } from '../ui/primitives'
 import { PageViewer } from './PageViewer'
 import { UrgencyChip } from './Queue'
@@ -125,6 +126,7 @@ function TaskLoaded({ task }: { task: Task }) {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Chip>{ROLE_LABELS[task.role] ?? task.role}</Chip>
+          {task.system_of_medicine && <Chip tone="accent">{SYSTEM_LABELS[task.system_of_medicine]}</Chip>}
           {!done && <UrgencyChip task={task} now={now} />}
           {task.status === 'escalated' && <Chip tone="danger">Escalated</Chip>}
         </div>
@@ -160,6 +162,10 @@ function TaskLoaded({ task }: { task: Task }) {
           </div>
         </Card>
       </div>
+
+      <Card title="Overrides on this claim">
+        <ClaimOverrides claimId={task.claim_id} />
+      </Card>
     </div>
   )
 }

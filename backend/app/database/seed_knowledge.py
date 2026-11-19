@@ -165,6 +165,32 @@ POLICY_CLAUSES: list[tuple[str, str, str]] = [
         "approved enhancement. A change of diagnosis needs a fresh approval.",
     ),
     (
+        "HOSPITAL",
+        "Hospital",
+        "A claim is paid only for treatment in a hospital registered with the local "
+        "authorities, as the hospital register shows it. Cashless treatment is available only "
+        "at a network hospital; treatment elsewhere is claimed for reimbursement.",
+    ),
+    (
+        "MORATORIUM",
+        "Moratorium period",
+        "After 60 continuous months of cover, no policy or claim can be contested for "
+        "non-disclosure or misrepresentation, except for proven fraud. Permanent exclusions "
+        "and the product's limits still apply.",
+    ),
+    (
+        "DEDUCTION-REASONS",
+        "Reasons for deductions",
+        "Every amount deducted from a claim is shown with the policy clause it relies on, so "
+        "the insured person can see why each amount was not paid.",
+    ),
+    (
+        "KYC",
+        "Identity documents",
+        "A claim of Rs 1 lakh or more needs the insured person's PAN or Aadhaar on file "
+        "before it is paid.",
+    ),
+    (
         "Excl07",
         "Change-of-gender treatments",
         "Treatment to change the characteristics of the body to those of the opposite sex is "

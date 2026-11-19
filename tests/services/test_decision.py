@@ -17,6 +17,7 @@ from app.services.decision.contract import (
     NotAuthorised,
 )
 from app.services.decision.service import DefaultDecisionService
+from app.services.overrides.service import DefaultOverrideLog
 from app.shared.seed_ids import DOCTOR_USER_ID, OPS_USER_ID, SENIOR_USER_ID
 from app.shared.types import Role, Stage
 from tests.services.decided_claims import BREACH_PAYABLE, CLEAN_PAYABLE, adjudicated_claim
@@ -219,3 +220,40 @@ async def test_recording_is_idempotent_per_task(
 
     assert again == first
     assert await service.latest(claim.claim_id) == first
+
+
+async def test_a_decision_override_is_written_to_the_override_log(
+    sessions: async_sessionmaker[AsyncSession], service: DecisionService
+) -> None:
+    claim = await adjudicated_claim(sessions, "approve")
+
+    await service.record(
+        claim.claim_id,
+        ApproverOutcome(
+            action="override",
+            approver_id=DOCTOR_USER_ID,
+            decision="partial",
+            amount=D("15000"),
+            reason="Pharmacy bill not itemised",
+        ),
+    )
+
+    log = await DefaultOverrideLog(sessions).list(claim_id=claim.claim_id)
+    assert sorted((o.kind, o.field, o.before, o.after) for o in log) == [
+        ("decision_override", "amount", "19237.50", "15000.00"),
+        ("decision_override", "decision", "approve", "partial"),
+    ]
+    assert {o.user_id for o in log} == {DOCTOR_USER_ID}
+    assert {o.reason for o in log} == {"Pharmacy bill not itemised"}
+
+
+async def test_an_approval_as_drafted_writes_no_override(
+    sessions: async_sessionmaker[AsyncSession], service: DecisionService
+) -> None:
+    claim = await adjudicated_claim(sessions, "approve")
+
+    await service.record(
+        claim.claim_id, ApproverOutcome(action="approve", approver_id=DOCTOR_USER_ID)
+    )
+
+    assert await DefaultOverrideLog(sessions).list(claim_id=claim.claim_id) == []

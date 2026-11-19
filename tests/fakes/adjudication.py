@@ -26,3 +26,6 @@ class FakeAdjudicationTools:
         if not items:
             return None
         return items.pop(0) if len(items) > 1 else items[0]
+
+    async def get_stage_history(self, stage: Stage) -> list[StageSnapshot]:
+        return list(self._snapshots.get(stage, []))[-1:]

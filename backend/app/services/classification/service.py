@@ -16,6 +16,7 @@ from app.database.models import (
     SubmissionRow,
 )
 from app.database.repositories.document_checklists import checklist
+from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import StageRecordRepository, append_in_session
 from app.services.classification import prompts
 from app.services.classification._helpers import group_pages, mismatches, small_jpeg
@@ -29,6 +30,7 @@ from app.services.classification.contract import (
 )
 from app.services.file_store.contract import FileStore
 from app.services.model_gateway.contract import ModelGateway, ModelRole
+from app.services.overrides.contract import OverrideEntry
 from app.services.page_prep.contract import PagePreparer, PreparedPage
 from app.shared.errors import PermanentError
 from app.shared.types import DocType, RequestType, Stage
@@ -81,7 +83,24 @@ class DefaultClassificationService:
             else p
             for p in current.pages
         ]
-        return await self._store(claim_id, current.submission_id, pages, created_by=actor)
+        stored = await self._store(claim_id, current.submission_id, pages, created_by=actor)
+        await OverrideRepository(self._sessions).append(
+            [
+                OverrideEntry(
+                    claim_id=claim_id,
+                    stage=Stage.CLASSIFICATION,
+                    kind="label_fix",
+                    field=f"page {p.seq}",
+                    before=p.doc_type.value,
+                    after=labels[p.page_id].value,
+                    reason="",
+                    actor=actor,
+                )
+                for p in current.pages
+                if p.page_id in labels and labels[p.page_id] != p.doc_type
+            ]
+        )
+        return stored
 
     async def _claim_of(self, submission_id: UUID) -> UUID:
         async with self._sessions() as session:

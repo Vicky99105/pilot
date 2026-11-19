@@ -7,7 +7,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
@@ -93,9 +93,23 @@ class DefaultIntakeService:
         stored = await self._get_existing(submission_id)
         if submission.parent_claim_id is None:
             await self._start(stored)
+        elif submission.request_type is RequestType.RECONSIDERATION:
+            # The claim's run has ended; a new run decides it again, under its own ID.
+            await self._start(stored, workflow_id=await self._reconsideration_id(stored))
         else:
             await self._signal_followup(stored)
         return await self._get_existing(submission_id)
+
+    async def _reconsideration_id(self, submission: Submission) -> str:
+        """The run ID for the claim's nth reconsideration: "<claim>:reconsideration:<n>"."""
+        async with self._sessions() as session:
+            count = await session.scalar(
+                select(func.count(SubmissionRow.id)).where(
+                    SubmissionRow.claim_id == submission.claim_id,
+                    SubmissionRow.request_type == RequestType.RECONSIDERATION.value,
+                )
+            )
+        return f"{submission.claim_id}:reconsideration:{count or 1}"
 
     async def accept_followup(
         self,
@@ -319,11 +333,12 @@ class DefaultIntakeService:
         slots = {f.slot for f in checked}
         return [d for d in required if d not in slots]
 
-    async def _start(self, submission: Submission) -> bool:
-        """Start the claim's workflow and record its ID. A start Temporal refuses as a
-        duplicate is ignored. Returns False, with one warning on the submission, when the
-        workflow service cannot be reached; the reconciler tries again later."""
-        workflow_id = str(submission.claim_id)
+    async def _start(self, submission: Submission, *, workflow_id: str | None = None) -> bool:
+        """Start the claim's workflow and record its ID (the claim ID, or the run ID given
+        for a reconsideration). A start Temporal refuses as a duplicate is ignored. Returns
+        False, with one warning on the submission, when the workflow service cannot be
+        reached; the reconciler tries again later."""
+        workflow_id = workflow_id or str(submission.claim_id)
         try:
             await self._starter.start_claim(
                 workflow_id=workflow_id,

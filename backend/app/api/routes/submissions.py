@@ -6,7 +6,16 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ValidationError
 from starlette.datastructures import FormData, UploadFile
 
-from app.api.deps import Cashless, Claims, CurrentUser, Files, Intake, Permissions, Queries
+from app.api.deps import (
+    Cashless,
+    Claims,
+    CurrentUser,
+    Files,
+    Intake,
+    Permissions,
+    Queries,
+    Reconsiderations,
+)
 from app.integrations.core.contract import PermissionService
 from app.services.cashless.contract import NoOriginalsDue, OriginalsStatus
 from app.services.claims.contract import ChecklistItem, ClaimDetail, ClaimSummary
@@ -17,6 +26,7 @@ from app.services.intake.contract import (
     SubmissionRejected,
     UploadedFile,
 )
+from app.services.reconsideration.contract import NotReconsiderable, Reconsideration
 from app.services.users.contract import STAFF_ROLES, User
 from app.shared.types import DocType, RequestType, Role
 
@@ -185,6 +195,51 @@ async def send_request(
         )
     except SubmissionRejected as exc:
         raise HTTPException(422, exc.reasons) from None
+
+
+class ReconsiderationForm(BaseModel):
+    """The multipart "form" part of a reconsideration request."""
+
+    grounds: str
+
+
+@router.post("/claims/{claim_id}/reconsideration", status_code=201, response_model=Reconsideration)
+async def reconsider(
+    claim_id: UUID,
+    request: Request,
+    user: CurrentUser,
+    claims: Claims,
+    permissions: Permissions,
+    reconsiderations: Reconsiderations,
+) -> Reconsideration:
+    """Multipart: a "form" part with {"grounds": "..."}, then the new evidence by slot or
+    "merged". Only the claimant (the member or hospital who can see the claim) may ask, and
+    only for a closed claim."""
+    if user.kind not in ("member", "hospital"):
+        raise HTTPException(403, "only the claimant asks for a reconsideration")
+    parts = await request.form()
+    raw = parts.get("form")
+    if not isinstance(raw, str):
+        raise HTTPException(422, 'missing "form" part with the grounds as JSON')
+    try:
+        form = ReconsiderationForm.model_validate_json(raw)
+    except ValidationError as exc:
+        raise HTTPException(422, exc.errors(include_url=False, include_context=False)) from None
+    detail = await claims.get(claim_id)
+    if detail is None or not await can_see(
+        user, permissions, policy_number=detail.policy_number, hospital_id=detail.hospital_id
+    ):
+        raise HTTPException(404, "claim not found")
+    try:
+        return await reconsiderations.request(
+            claim_id,
+            grounds=form.grounds,
+            submitted_by=user.id,
+            channel="member" if user.kind == "member" else "hospital",
+            files=await _uploads(parts),
+        )
+    except NotReconsiderable as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @router.get("/checklists/{request_type}", response_model=list[ChecklistItem])

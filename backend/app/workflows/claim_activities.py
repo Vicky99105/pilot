@@ -34,6 +34,7 @@ from app.shared.types import DocType, Stage
 from app.workflows.claim_models import (
     CashlessStepInput,
     ClaimInput,
+    ClockInput,
     CorrectionInput,
     DecisionStep,
     EventInput,
@@ -609,7 +610,7 @@ class ClaimActivities:
         return StageResult(
             claim_id=inp.claim_id,
             stage=inp.stage,
-            needs_checkpoint=record.final_decision in ("approve", "partial"),
+            needs_checkpoint=record.paid_amount > 0,  # the finance release
             checkpoint_payload=record.model_dump(mode="json"),
         )
 
@@ -709,6 +710,29 @@ class ClaimActivities:
                 action=inp.action,
                 actor=inp.actor,
                 detail=inp.detail,
+                moves_status=inp.moves_status,
+            )
+        )
+
+    @activity.defn(name="clock_resumed")
+    async def clock_resumed(self, inp: ClockInput) -> None:
+        """A resumed claim: its deadlines move on by the time it was held."""
+        await _non_retryable_on_permanent(
+            self._tasks.shift_deadlines(claim_id=inp.claim_id, seconds=inp.paused_seconds)
+        )
+        await _non_retryable_on_permanent(
+            self._monitoring.record_event(
+                claim_id=inp.claim_id,
+                stage=Stage.MONITORING,
+                action="clock_resumed",
+                actor="workflow",
+                detail={
+                    "paused_seconds": inp.paused_seconds,
+                    "clock_deadline": inp.clock_deadline.isoformat()
+                    if inp.clock_deadline
+                    else None,
+                },
+                moves_status=False,
             )
         )
 
@@ -729,6 +753,7 @@ class ClaimActivities:
             "begin_request",
             "await_discharge",
             "cancel_request",
+            "clock_resumed",
         ]
         return [getattr(self, n) for n in names]
 

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -495,3 +495,25 @@ async def test_one_reason_naming_r26_explains_every_line_it_spread_over(env: Env
     draft = await env.service(gateway).draft(claim_id)
 
     assert (draft.self_check_errors, draft.guardrail_passed) == ([], True)
+
+
+async def test_a_document_in_any_classified_set_is_not_outstanding(env: Env) -> None:
+    """A claim's documents arrive in several sets: the bundle, a query reply, and a
+    reconsideration's new evidence. A document any set holds is received, not only one in
+    the latest set."""
+    claim_id = await env.reviewed()
+    repo = StageRecordRepository(env.sessions)
+    intake = await repo.latest(claim_id, Stage.INTAKE)
+    assert intake is not None
+    await repo.append(claim_id, Stage.INTAKE,
+                      {**intake.payload, "missing_documents": ["payment_receipt"]},
+                      created_by="test")  # fmt: skip
+    for doc_type in ("payment_receipt", "other"):  # the reply, then the reconsideration
+        await repo.append(claim_id, Stage.CLASSIFICATION,
+                          {"submission_id": str(uuid4()), "documents": [{"doc_type": doc_type}]},
+                          created_by="test")  # fmt: skip
+    gateway = FakeModelGateway({"adjudication_decide": [PARTIAL]})
+
+    draft = await env.service(gateway).draft(claim_id)
+
+    assert (draft.expected_decision, draft.decision) == ("partial", "partial")

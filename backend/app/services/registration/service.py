@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models import ClaimRow, HospitalRow, SubmissionRow, utcnow
+from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import (
     StageRecordRepository,
     append_in_session,
@@ -20,6 +21,7 @@ from app.database.repositories.stage_records import (
 from app.integrations.core.contract import MemberPolicy, MoneyService, PolicyService
 from app.services.digitisation.contract import ClaimRecord
 from app.services.intake.contract import ClaimForm
+from app.services.overrides.contract import OverrideEntry
 from app.services.registration._helpers import claim_number, names_match, normalise, overlaps
 from app.services.registration.contract import (
     REGISTRATION_RULES,
@@ -32,10 +34,18 @@ from app.services.registration.contract import (
     RegistrationOverrides,
     RegistrationResult,
 )
-from app.services.rules.contract import Claimant, Facts, MemberMatch, RulesEngine
-from app.shared.types import CASHLESS_REQUESTS, RequestType, RuleResult, Stage
+from app.services.rules.contract import (
+    Claimant,
+    Facts,
+    HospitalFacts,
+    MemberMatch,
+    RulesEngine,
+)
+from app.shared.routes import claim_route
+from app.shared.types import CASHLESS_REQUESTS, DocType, RequestType, RuleResult, Stage
 
 CENTS = Decimal("0.01")
+ZERO = Decimal("0.00")
 CLAIM_NUMBER_ATTEMPTS = 3
 
 
@@ -78,8 +88,17 @@ class DefaultRegistrationService:
         discharged = record.admission.discharge_date.value or (
             form.discharge_date if form else None
         )
-        amount = _amount(record, form)
+        claimed = _amount(record, form)
+        paid = await self._records.settled_paid(claim_id)
+        # A reconsidered claim blocks only what it may still pay: earlier settlements used
+        # the rest of the claim, and their blocks are released.
+        amount = max(claimed - paid, ZERO) if claimed is not None else None
         accident = bool(record.admission.accident.value)
+        hospital = await self._match_hospital(
+            claim.hospital_id or (form.hospital_id if form else None),
+            record.hospital.name.value or (form.hospital_name if form else None),
+            record.hospital.city.value,
+        )
 
         if policy is None:
             match = MemberMatch(kind="none", member=None, score=0.0, reason="no policy found")
@@ -95,6 +114,13 @@ class DefaultRegistrationService:
                 policy=policy,
                 claimant=claimant,
                 amount=amount,
+                claimed=claimed,
+                hospital=HospitalFacts(
+                    rohini_id=hospital.rohini_id if hospital.match != "none" else None,
+                    network=hospital.network,
+                ),
+                claim_route=claim_route(RequestType(claim.request_type)),
+                kyc_on_file=DocType.KYC in await self._held(claim_id),
             )
             product = self._rules.product(policy.product_uin)
             rule_results = self._rules.evaluate(REGISTRATION_RULES, facts, product)
@@ -113,14 +139,11 @@ class DefaultRegistrationService:
             claim_number=claim.claim_number or "",
             member=member,
             policy=_summary(policy) if policy else None,
-            hospital=await self._match_hospital(
-                claim.hospital_id or (form.hospital_id if form else None),
-                record.hospital.name.value or (form.hospital_name if form else None),
-                record.hospital.city.value,
-            ),
+            hospital=hospital,
             admission_date=admitted,
             accident=accident,
             block_amount=amount,
+            claimed_amount=claimed,
             rule_results=rule_results,
             duplicates=await self._duplicates(
                 claim_id, member.member_id or claimant.member_id, admitted, discharged
@@ -129,6 +152,8 @@ class DefaultRegistrationService:
         )
         version = (latest.version if latest else 0) + 1
         previous = RegistrationResult.model_validate(latest.payload) if latest else None
+        if paid > 0:
+            previous = None  # settlement released the earlier block: block afresh
         if (
             previous is not None
             and previous.block_ref is not None
@@ -154,6 +179,7 @@ class DefaultRegistrationService:
         if latest is None:
             raise InvalidOverride(f"claim {claim_id} has no registration to override")
         result = RegistrationResult.model_validate(latest.payload)
+        before = result.model_copy(deep=True)
         if (overrides.member_id or overrides.hospital_id) and not overrides.reason:
             raise InvalidOverride("a member or hospital override needs a reason")
         if overrides.member_id:
@@ -163,7 +189,9 @@ class DefaultRegistrationService:
         for rule_id, why in overrides.rules.items():
             _accept_rule(result, rule_id, why.strip())
         await self._block(result, latest.version + 1)
-        return await self._store(result, created_by=actor)
+        stored = await self._store(result, created_by=actor)
+        await OverrideRepository(self._sessions).append(_override_entries(before, overrides, actor))
+        return stored
 
     # --- Facts ---------------------------------------------------------------------------
 
@@ -175,6 +203,14 @@ class DefaultRegistrationService:
         intake = await self._records.latest(claim_id, Stage.INTAKE)
         form = ClaimForm.model_validate(intake.payload["form"]) if intake else None
         return claim, form
+
+    async def _held(self, claim_id: UUID) -> set[DocType]:
+        """Document types in any of the claim's classified sets (the bundle and replies)."""
+        return {
+            DocType(document["doc_type"])
+            for record in await self._records.history(claim_id, Stage.CLASSIFICATION)
+            for document in record.payload.get("documents", [])
+        }
 
     async def _find_policy(
         self, policy_number: str | None, member_id: str | None
@@ -362,7 +398,41 @@ def _hospital(row: HospitalRow, match: Any) -> MatchedHospital:
         name=row.name,
         city=row.city,
         differential_billing=row.differential_billing,
+        network=row.network,
     )
+
+
+def _override_entries(
+    before: RegistrationResult, overrides: RegistrationOverrides, actor: str
+) -> list[OverrideEntry]:
+    """One entry for each machine value a person changed: the member, the hospital, and
+    each rule accepted despite the code."""
+
+    def entry(field: str, was: Any, now: Any, reason: str) -> OverrideEntry:
+        return OverrideEntry(
+            claim_id=before.claim_id,
+            stage=Stage.REGISTRATION,
+            kind="registration_override",
+            field=field,
+            before=was,
+            after=now,
+            reason=reason,
+            actor=actor,
+        )
+
+    entries = []
+    if overrides.member_id and overrides.member_id != before.member.member_id:
+        entries.append(entry("member", before.member.member_id, overrides.member_id,
+                             overrides.reason))  # fmt: skip
+    if overrides.hospital_id and overrides.hospital_id != before.hospital.rohini_id:
+        entries.append(entry("hospital", before.hospital.rohini_id, overrides.hospital_id,
+                             overrides.reason))  # fmt: skip
+    was = {r.rule_id: r for r in before.rule_results}
+    for rule_id, why in overrides.rules.items():
+        if rule_id in was and not was[rule_id].passed:
+            entries.append(entry(rule_id, f"failed: {was[rule_id].reason}", "accepted",
+                                 why.strip()))  # fmt: skip
+    return entries
 
 
 def _accept_rule(result: RegistrationResult, rule_id: str, reason: str) -> None:

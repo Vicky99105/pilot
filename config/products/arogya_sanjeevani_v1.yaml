@@ -47,6 +47,20 @@ sub_limits:
 pre_hospitalisation_days: 30
 post_hospitalisation_days: 60
 pre_existing_waiting_months: 36
+# R8: after 60 months of continuous cover, no claim can be contested for non-disclosure or
+# misrepresentation, except for proven fraud (IRDAI master circular 2024, moratorium).
+moratorium_months: 60
+
+# R4: every claim needs a hospital the register holds (the wording's "Hospital" definition);
+# a cashless claim also needs a network hospital. A reimbursement may come from any
+# registered hospital.
+hospital:
+  network_required_for: [cashless]
+
+# R25: from Rs 1 lakh claimed, the claim needs PAN or Aadhaar on file (insurer KYC practice;
+# the reimbursement checklist asks for the KYC document from the same amount).
+kyc:
+  threshold: 100000
 
 # Excl02: the wording's specified conditions, in its order, with ICD ranges. Ranges follow
 # KnowledgeBase.code_in_ranges: one code covers the codes below it; "A-B" covers both ends
@@ -236,6 +250,10 @@ clauses:
   package_inclusions: PACKAGE-INCL
   non_package_discount: NON-PKG-DISC
   preauth: PREAUTH
+  hospital: HOSPITAL
+  moratorium: MORATORIUM
+  deduction_reasons: DEDUCTION-REASONS
+  kyc: KYC
   # Non-payable annexure, by IRDAI list number.
   non_payable:
     I: ANNEX-I

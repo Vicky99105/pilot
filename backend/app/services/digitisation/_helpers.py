@@ -327,6 +327,7 @@ def _read_bill(r: FinalBillReply, doc: ClassifiedDocument) -> Bill:
             for s in r.section_totals
         ],
         grand_total=read(r.grand_total),
+        on_letterhead=read(r.on_letterhead),
     )
 
 
@@ -778,6 +779,11 @@ def _fields(value: Any, path: str) -> Iterator[tuple[str, Field[Any]]]:
             yield from _fields(item, f"{path}.{i}")
 
 
+# Fields read only as risk signals (RF9). A person never fixes them, so they are never low
+# confidence fields.
+RISK_SIGNALS = frozenset({"bill.on_letterhead", "interim_bill.on_letterhead"})
+
+
 def low_confidence_fields(record: ClaimRecord, sections: set[str] | None = None) -> list[str]:
     """Paths of fields below the confidence bar. With sections, only those sections are
     scanned: a cashless request supplies only some documents, and the others are not
@@ -785,7 +791,8 @@ def low_confidence_fields(record: ClaimRecord, sections: set[str] | None = None)
     return [
         path
         for path, field in _fields(record, "")
-        if (sections is None or path.split(".", 1)[0] in sections)
+        if path not in RISK_SIGNALS
+        and (sections is None or path.split(".", 1)[0] in sections)
         and field.confidence < (LOW_CONFIDENCE_HANDWRITTEN if field.handwritten else LOW_CONFIDENCE)
     ]
 
@@ -793,6 +800,19 @@ def low_confidence_fields(record: ClaimRecord, sections: set[str] | None = None)
 def quantize_money(record: ClaimRecord) -> None:
     for _, field in _fields(record, ""):
         field.value = _money(field.value)
+
+
+def field_value(data: dict[str, Any], path: str) -> Any:
+    """The value of the Field at a dotted path in a dumped ClaimRecord, or None."""
+    node: Any = data
+    for part in path.split("."):
+        if isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        elif isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return None
+    return node.get("value") if isinstance(node, dict) else None
 
 
 def set_field(data: dict[str, Any], path: str, value: Any) -> None:

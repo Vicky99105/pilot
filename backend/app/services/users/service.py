@@ -30,4 +30,5 @@ class DefaultUserService:
             hospital_id=row.hospital_id,
             policy_number=row.policy_number,
             member_id=row.member_id,
+            system_of_medicine=row.system_of_medicine,
         )

@@ -14,7 +14,7 @@ Order, each rule on what the earlier ones left admissible:
    caps the package charges at the package total (multi-procedure rule), spread over the
    lines in proportion.
 3. Per line outside the package: R24 (agreed non-package discount, never on medicines or
-   implants), R13 (room cap and proportionate deduction), R14 (ICU cap).
+   implants), R13 (room cap), R14 (ICU cap), R15 (proportionate deduction).
 4. Claim: R19 (ambulance), R16 (cataract), R17 (modern treatments), R26 (pre-auth), each
    spread over the lines; then R21 (co-pay) on the admissible total.
 
@@ -94,7 +94,7 @@ class PackageMapping(BaseModel):
     billed_as_package: bool  # the bill has a package charge line
 
 
-BillFindingKind = Literal["drug_price", "package", "diagnosis_package"]
+BillFindingKind = Literal["drug_price", "package", "diagnosis_package", "uncited_deduction"]
 
 
 class BillFinding(BaseModel):

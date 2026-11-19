@@ -338,7 +338,7 @@ def test_r11_pays_an_item_the_product_pays_and_deducts_one_paid_only_with_an_exc
     assert "Sterile gloves are paid" in gloves.reason
 
 
-# --- R13: room cap and proportionate deduction --------------------------------------------
+# --- R13 room cap and R15 proportionate deduction -----------------------------------------
 
 # Worked example: SI 3 lakh, room Rs 7,500 a day for 4 days against a Rs 5,000 cap.
 WORKED_LINES = [
@@ -361,8 +361,10 @@ def test_r13_and_r21_worked_example_pays_133000(
     engine: RulesEngine, product: ProductConfig
 ) -> None:
     results = [
-        one(engine, "R13", Facts(line=line, room=WORKED_ROOM), product) for line in WORKED_LINES
-    ]
+        one(engine, "R13" if line.head is Head.ROOM else "R15", Facts(line=line, room=WORKED_ROOM),
+            product)
+        for line in WORKED_LINES
+    ]  # fmt: skip
     admissible = sum(
         (line.claimed + r.amount_effect for line, r in zip(WORKED_LINES, results, strict=True)),
         D("0"),
@@ -385,11 +387,15 @@ def test_r13_and_r21_worked_example_pays_133000(
     assert admissible + copay.amount_effect == D("133000.00")
 
 
-def test_r13_no_proportionate_deduction_without_differential_billing(
+def test_r15_no_proportionate_deduction_without_differential_billing(
     engine: RulesEngine, product: ProductConfig
 ) -> None:
     room = WORKED_ROOM.model_copy(update={"differential_billing": False})
-    results = [one(engine, "R13", Facts(line=line, room=room), product) for line in WORKED_LINES]
+    results = [
+        one(engine, "R13" if line.head is Head.ROOM else "R15", Facts(line=line, room=room),
+            product)
+        for line in WORKED_LINES
+    ]  # fmt: skip
 
     assert [r.amount_effect for r in results] == [D("-10000.00")] + [D("0")] * 6
     assert "no differential billing" in results[1].reason

@@ -11,7 +11,10 @@ from app.services.claims.contract import ClaimQueryService
 from app.services.file_store.contract import FileStore
 from app.services.intake.contract import IntakeService
 from app.services.monitoring.contract import Monitoring
+from app.services.overrides.contract import OverrideLog
 from app.services.query.contract import QueryService
+from app.services.reconsideration.contract import ReconsiderationService
+from app.services.supervision.contract import SupervisionService
 from app.services.tasks.contract import TaskService
 from app.services.users.contract import STAFF_ROLES, User, UserService
 
@@ -61,6 +64,21 @@ def get_cashless_service(request: Request) -> CashlessService:
     return service
 
 
+def get_supervision(request: Request) -> SupervisionService:
+    service: SupervisionService = request.app.state.supervision_service
+    return service
+
+
+def get_override_log(request: Request) -> OverrideLog:
+    service: OverrideLog = request.app.state.override_log
+    return service
+
+
+def get_reconsideration(request: Request) -> ReconsiderationService:
+    service: ReconsiderationService = request.app.state.reconsideration_service
+    return service
+
+
 async def current_user(
     users: Annotated[UserService, Depends(get_user_service)],
     x_user_id: Annotated[str | None, Header()] = None,
@@ -92,3 +110,6 @@ Files = Annotated[FileStore, Depends(get_file_store)]
 Permissions = Annotated[PermissionService, Depends(get_permission_service)]
 Queries = Annotated[QueryService, Depends(get_query_service)]
 Cashless = Annotated[CashlessService, Depends(get_cashless_service)]
+Supervision = Annotated[SupervisionService, Depends(get_supervision)]
+Overrides = Annotated[OverrideLog, Depends(get_override_log)]
+Reconsiderations = Annotated[ReconsiderationService, Depends(get_reconsideration)]

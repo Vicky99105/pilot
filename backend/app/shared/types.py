@@ -29,6 +29,16 @@ class Field(BaseModel, Generic[T]):
     handwritten: bool = False
 
 
+# How a claim reaches the insurer: through the network hospital (cashless: pre-auth,
+# enhancement, discharge) or from the insured person after paying the bill (reimbursement).
+ClaimRoute = Literal["cashless", "reimbursement"]
+
+
+# The system of medicine a treatment belongs to. Medical officers review only their own.
+SystemOfMedicine = Literal["allopathy", "ayush"]
+DEFAULT_SYSTEM_OF_MEDICINE: SystemOfMedicine = "allopathy"
+
+
 class RuleResult(BaseModel):
     rule_id: str
     passed: bool

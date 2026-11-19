@@ -7,9 +7,12 @@ from uuid import UUID
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config import Settings
 from app.database.models import ClaimRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
+from app.services.registration.service import DefaultRegistrationService
+from app.services.rules.service import DefaultRulesEngine
 from app.services.settlement.contract import (
     PayeeCheckFailed,
     PaymentNotReleased,
@@ -217,3 +220,63 @@ async def test_a_cashless_discharge_pays_the_hospital_and_releases_the_authorise
     assert payment.amount == BREACH_PAYABLE
     assert list(claim.money.releases.values()) == [(block.block_id, BREACH_PAYABLE)]
     assert settled.released == D("45000.00") - BREACH_PAYABLE
+
+
+async def test_a_reconsidered_decision_pays_only_what_it_adds(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    """The partial was settled. On reconsideration the claim registers again (a new block of
+    what is still claimable) and the approver decides Rs 1,000 more: settlement pays that
+    Rs 1,000 and releases the rest of the new block."""
+    claim = await decided_claim(sessions, "partial")
+    settlement = service(sessions, claim.money)
+    await settlement.check_payee(claim.claim_id)
+    first = await settlement.settle(claim.claim_id, released_by=FINANCE_USER_ID)
+    records = StageRecordRepository(sessions)
+    digitised = await records.latest(claim.claim_id, Stage.DIGITISATION)
+    assert digitised is not None
+    await records.append(claim.claim_id, Stage.DIGITISATION, digitised.payload,
+                         created_by="model")  # fmt: skip
+    rules = DefaultRulesEngine(Settings().config_dir / "products")
+    registration = await DefaultRegistrationService(
+        sessions, claim.policies, claim.money, rules
+    ).register(claim.claim_id)
+    decision = await records.latest(claim.claim_id, Stage.DECISION)
+    assert decision is not None
+    more = BREACH_PAYABLE + D("1000.00")
+    await records.append(claim.claim_id, Stage.DECISION,
+                         {**decision.payload, "final_amount": str(more)},
+                             created_by="test")  # fmt: skip
+
+    checked = await settlement.check_payee(claim.claim_id)
+    settled = await settlement.settle(claim.claim_id, released_by=FINANCE_USER_ID)
+
+    assert (checked.previously_paid, checked.paid_amount) == (BREACH_PAYABLE, D("1000.00"))
+    assert first.paid_amount == BREACH_PAYABLE
+    assert [p.amount for p in claim.money.payments.values()] == [BREACH_PAYABLE, D("1000.00")]
+    assert registration.block_ref is not None
+    assert claim.money.releases[f"{claim.claim_id}release{settled.decision_version}"] == (
+        registration.block_ref.block_id,
+        D("1000.00"),
+    )
+    assert settled.status == "settled"
+
+
+async def test_a_reconsideration_that_adds_nothing_needs_no_release_and_pays_nothing(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    claim = await decided_claim(sessions, "partial")
+    settlement = service(sessions, claim.money)
+    await settlement.check_payee(claim.claim_id)
+    await settlement.settle(claim.claim_id, released_by=FINANCE_USER_ID)
+    records = StageRecordRepository(sessions)
+    decision = await records.latest(claim.claim_id, Stage.DECISION)
+    assert decision is not None
+    await records.append(claim.claim_id, Stage.DECISION, decision.payload, created_by="test")
+
+    checked = await settlement.check_payee(claim.claim_id)
+    settled = await settlement.settle(claim.claim_id, released_by=None)
+
+    assert (checked.paid_amount, settled.payment_ref, settled.status) == (D("0.00"), None,
+                                                                         "settled")  # fmt: skip
+    assert len(claim.money.payments) == 1

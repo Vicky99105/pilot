@@ -140,6 +140,18 @@ def _authorisation_table(letter: Letter, style: Any) -> Table:
 
 
 def _opening(letter: Letter) -> str:
+    text = _decision_opening(letter)
+    note = letter.reconsideration
+    if note is None:
+        return text
+    return (
+        f"We have reconsidered your claim (request {note.number}) on the grounds you gave: "
+        f"{note.grounds} {text} We paid {rupees(note.previously_paid)} on this claim before, "
+        f"so this decision pays {rupees(note.paid_now)} more."
+    )
+
+
+def _decision_opening(letter: Letter) -> str:
     if letter.kind == "authorisation":
         return (
             "We authorise the cashless treatment below at the network hospital, subject to "

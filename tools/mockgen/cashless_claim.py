@@ -27,7 +27,7 @@ The admission:
   paid the approved amount.
 
 Every expected amount comes from the real rules engine, run on the ground-truth lines in
-bill review's order (R11, R12, R18, R23, R20, R24, R13, R14, R19, R16, R17, R26, then R21),
+bill review's order (R11, R12, R18, R23, R20, R24, R13, R14, R15, R19, R16, R17, R26, then R21),
 the estimate phases on the estimate heads and the discharge on the bill. All data is
 synthetic.
 """
@@ -343,7 +343,7 @@ def expected_sheet(
     r20 = spread(
         "R20", covered, {"package": package.model_copy(update={"package_total": total}), **route}
     )
-    for row in payable():  # 3. R24, then R13 and R14
+    for row in payable():  # 3. R24, then R13, R14 and R15
         apply(
             row,
             "R24",
@@ -360,7 +360,7 @@ def expected_sheet(
         sum_insured=SUM_INSURED, room_rate_per_day=rate, differential_billing=DIFFERENTIAL_BILLING
     )
     for row in payable():
-        for rule_id in ("R13", "R14"):
+        for rule_id in ("R13", "R14", "R15"):
             apply(row, rule_id, {"room": room, "package": package, **route})
     ambulance = [row for row in payable() if row["head"] == Head.AMBULANCE.value]  # 4. claim
     if ambulance:

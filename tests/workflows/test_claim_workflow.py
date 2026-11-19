@@ -5,6 +5,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -566,3 +567,43 @@ async def test_a_rejection_skips_the_finance_release_and_closes(reject_harness: 
     assert (result.status, result.draft) == ("closed", "reject")
     assert "release_payment" not in h.opened_kinds()
     assert h.settlement.calls == [("check_payee", None), ("settle", None)]
+
+
+# --- P2-6: reconsideration --------------------------------------------------------------
+
+
+async def test_a_reconsideration_reads_its_evidence_then_re_enters_at_registration(
+    harness: Harness,
+) -> None:
+    """The run that decides a closed claim again: classification and digitisation read the new
+    evidence (a follow-up on the claim), then registration and every later stage run again,
+    and settlement pays what the new decision adds."""
+    evidence = uuid.uuid4()
+    handle = await harness.env.client.start_workflow(
+        ClaimWorkflow.run,
+        ClaimInput(submission_id=evidence, request_type=RequestType.RECONSIDERATION),
+        id=f"claim-{uuid.uuid4()}:reconsideration:1",
+        task_queue=TASK_QUEUE,
+    )
+    for kind in ["confirm_registration", "confirm_deductions", "approve", "release_payment"]:
+        await harness.complete(handle, kind)
+
+    result = await handle.result()
+
+    assert (result.status, result.draft) == ("closed", "approve")
+    assert harness.classification.classified == [evidence]
+    stages = [e.stage.value for e in harness.monitoring.recorded if e.action == "stage_completed"]
+    assert stages[:4] == ["intake", "classification", "digitisation", "registration"]
+    assert "settlement" in stages and stages[-1] == "monitoring"
+
+
+async def test_a_decision_that_adds_nothing_to_pay_needs_no_finance_release() -> None:
+    async for h in _harness(ClaimActivities):
+        h.settlement.to_pay = Decimal("0.00")
+        handle = await h.start()
+        for kind in ["confirm_registration", "confirm_deductions", "approve"]:
+            await h.complete(handle, kind)
+
+        assert (await handle.result()).status == "closed"
+        assert "release_payment" not in h.opened_kinds()
+        assert h.settlement.calls == [("check_payee", None), ("settle", None)]

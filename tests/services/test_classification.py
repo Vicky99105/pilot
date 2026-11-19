@@ -18,6 +18,7 @@ from app.services.classification.service import DefaultClassificationService
 from app.services.intake.contract import ClaimForm, Submission, SubmissionInput, UploadedFile
 from app.services.intake.service import DefaultIntakeService
 from app.services.model_gateway.contract import ModelRole
+from app.services.overrides.service import DefaultOverrideLog
 from app.services.page_prep.service import DefaultPagePreparer
 from app.shared.seed_ids import MEMBER_USER_ID
 from app.shared.types import DocType, RequestType, Stage
@@ -230,3 +231,16 @@ async def test_slotted_uploads_keep_the_missing_documents_intake_found(env: Env)
 def test_every_document_type_has_a_labelling_guide() -> None:
     assert set(DOC_TYPE_GUIDE) == set(DocType)
     assert DocType("ot_notes") in DOC_TYPE_GUIDE
+
+
+async def test_label_fixes_are_written_to_the_override_log(env: Env) -> None:
+    submission = await env.submit((None, ["PART A", "BILL", "BILL 2"]))
+    service = env.service([label(A, 0.95), label(D, 0.4), label(B, 0.9)])
+    before = await service.classify(submission.submission_id)
+
+    await service.apply_labels(submission.claim_id, {before.pages[1].page_id: B}, actor="user:ops")
+
+    log = await DefaultOverrideLog(env.sessions).list(claim_id=submission.claim_id)
+    assert [(o.kind, o.field, o.before, o.after) for o in log] == [
+        ("label_fix", "page 2", D.value, B.value),
+    ]

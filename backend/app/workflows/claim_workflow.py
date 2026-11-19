@@ -39,6 +39,7 @@ with workflow.unsafe.imports_passed_through():
         CashlessStepInput,
         ClaimInput,
         ClaimResult,
+        ClockInput,
         CorrectionInput,
         DecisionStep,
         EventInput,
@@ -62,7 +63,6 @@ MODEL_RETRY = RetryPolicy(
     maximum_attempts=8,
     non_retryable_error_types=["PermanentError"],
 )
-PAID: tuple[FinalDecision, ...] = ("approve", "partial")
 
 # Stages after intake, in order. Query and monitoring run outside this list. Medical review
 # runs in two steps around bill review: coding first, because bill review maps the verified
@@ -192,6 +192,7 @@ class ClaimWorkflow:
         self._followups: list[str] = []
         self._followups_used = 0
         self._held = False
+        self._held_since: datetime | None = None
         self._claim_id: UUID | None = None
         self._submission_id: UUID | None = None
         self._final: FinalDecision | None = None
@@ -209,12 +210,42 @@ class ClaimWorkflow:
         self._followups.append(submission_id)
 
     @workflow.signal
-    def hold(self) -> None:
-        self._held = True
+    async def hold(self) -> None:
+        """A supervisor's hold: no further stage starts and the clock stops. The supervisor
+        service records who held the claim and why; the workflow records the paused clock."""
+        if self._held:
+            return
+        self._held, self._held_since = True, workflow.now()
+        await workflow.wait_condition(lambda: self._claim_id is not None)
+        await self._event(
+            Stage.MONITORING,
+            "clock_paused",
+            {"clock_deadline": self._clock.isoformat() if self._clock else None},
+            moves_status=False,
+        )
 
     @workflow.signal
-    def resume(self) -> None:
-        self._held = False
+    async def resume(self) -> None:
+        """The claim goes on. Its clock, deadline and open tasks' deadlines move on by the
+        time it was held."""
+        if not self._held or self._held_since is None:
+            return
+        paused = workflow.now() - self._held_since
+        self._held, self._held_since = False, None
+        if self._clock is not None:
+            self._clock += paused
+        await workflow.wait_condition(lambda: self._claim_id is not None)
+        assert self._claim_id is not None
+        await workflow.execute_activity_method(
+            ClaimActivities.clock_resumed,
+            ClockInput(
+                claim_id=self._claim_id,
+                paused_seconds=int(paused.total_seconds()),
+                clock_deadline=self._clock,
+            ),
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=RETRY,
+        )
 
     @workflow.run
     async def run(self, claim: ClaimInput) -> ClaimResult:
@@ -229,8 +260,11 @@ class ClaimWorkflow:
         if claim.request_type is RequestType.PREAUTH:
             await self._cashless()
         else:
+            # A reimbursement, or a reconsideration: its new evidence is classified and read
+            # (a follow-up on the claim), then the claim re-enters at registration.
             await self._pipeline(PIPELINE)
         await self._run_stage(Stage.MONITORING)
+        await workflow.wait_condition(workflow.all_handlers_finished)
         return ClaimResult(claim_id=claim_id, status="closed", draft=self._final)
 
     async def _pipeline(self, pipeline: list[Stage]) -> None:
@@ -300,26 +334,35 @@ class ClaimWorkflow:
 
     async def _watch_clock(self, request: CashlessRequest, answered: int) -> None:
         """Record clock_breached when the request's clock passes before it is answered.
-        The record is the only effect: a person still decides."""
+        The record is the only effect: a person still decides. A hold stops the clock; the
+        resume moves it on by the time held, so the wait starts again."""
         if request.clock_deadline is None:
             return
-        left = request.clock_deadline - workflow.now()
-        try:
-            if left <= timedelta(0):
-                raise TimeoutError
-            await workflow.wait_condition(lambda: self._answered > answered, timeout=left)
-        except TimeoutError:
-            if self._answered > answered:
-                return
+        while self._answered == answered:
+            deadline = self._clock or request.clock_deadline
+            if self._held:
+                await workflow.wait_condition(lambda: not self._held or self._answered > answered)
+                continue
+            left = deadline - workflow.now()
+            if left > timedelta(0):
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._answered > answered or self._held, timeout=left
+                    )
+                    continue
+                except TimeoutError:
+                    if self._held or self._answered > answered:
+                        continue
             await self._event(
                 Stage.MONITORING,
                 "clock_breached",
                 {
                     "request_type": request.request_type.value,
                     "submission_id": str(request.submission_id),
-                    "clock_deadline": request.clock_deadline.isoformat(),
+                    "clock_deadline": deadline.isoformat(),
                 },
             )
+            return
 
     async def _checkpoints(
         self, stage: Stage, result: StageResult, reachable: list[Stage]
@@ -400,7 +443,7 @@ class ClaimWorkflow:
     async def _settle(self, reachable: list[Stage]) -> Stage | None:
         """Payee checks, then the finance release for a paid claim, then settle."""
         checked = await self._run_stage(Stage.SETTLEMENT)
-        if self._final in PAID:
+        if checked.needs_checkpoint:  # something to pay: a reconsideration may add nothing
             outcome = await self._checkpoint(
                 Stage.SETTLEMENT, RELEASE_PAYMENT, checked.checkpoint_payload
             )
@@ -579,7 +622,8 @@ class ClaimWorkflow:
                         claim_id=self._claim_id,
                         stage=stage,
                         outcome=outcome,
-                        actor=f"task:{self._last_task_id}",
+                        # The person, so the stage record and the override log name them.
+                        actor=f"user:{outcome.get('completed_by')}",
                     ),
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=RETRY,
@@ -638,11 +682,24 @@ class ClaimWorkflow:
         sla = workflow.now() + CHECKPOINT_SLA
         return min(sla, self._clock) if self._clock is not None else sla
 
-    async def _event(self, stage: Stage, action: str, detail: dict[str, Any] | None = None) -> None:
+    async def _event(
+        self,
+        stage: Stage,
+        action: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        moves_status: bool = True,
+    ) -> None:
         assert self._claim_id is not None
         await workflow.execute_activity_method(
             ClaimActivities.record_event,
-            EventInput(claim_id=self._claim_id, stage=stage, action=action, detail=detail),
+            EventInput(
+                claim_id=self._claim_id,
+                stage=stage,
+                action=action,
+                detail=detail,
+                moves_status=moves_status,
+            ),
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=RETRY,
         )

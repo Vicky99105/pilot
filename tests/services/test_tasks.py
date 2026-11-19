@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import ClaimRow, SubmissionRow
+from app.database.models import ClaimRow, HospitalRow, SubmissionRow
 from app.services.tasks.contract import (
     ClaimBrief,
     Task,
@@ -216,3 +216,106 @@ async def test_queue_tasks_carry_the_claim_brief_and_when_they_opened(ctx: Ctx) 
         assert task is not None
         assert task.claim == expected
         assert task.created_at is not None
+
+
+# --- P2-6: system of medicine, held claims, reassignment -----------------------------------
+
+
+async def at_hospital(ctx: Ctx, system_of_medicine: str) -> None:
+    """Put ctx's claim at a hospital of that system of medicine."""
+    async with ctx.sessions.begin() as session:
+        session.add(
+            HospitalRow(rohini_id="8900000000097", name="Ayush Wellness Centre", city="Pune",
+                        state="Maharashtra", network=True, differential_billing=False,
+                        system_of_medicine=system_of_medicine, source="test",
+                        source_version="v")
+        )  # fmt: skip
+        claim = await session.get(ClaimRow, ctx.claim_id)
+        assert claim is not None
+        claim.hospital_id = "8900000000097"
+
+
+async def test_a_medical_task_carries_the_treatments_system_of_medicine(ctx: Ctx) -> None:
+    await at_hospital(ctx, "ayush")
+    allopathy = await add_user(ctx.sessions, "allopath", [Role.MEDICAL_OFFICER],
+                               system_of_medicine="allopathy")  # fmt: skip
+    ayush = await add_user(ctx.sessions, "vaidya", [Role.MEDICAL_OFFICER],
+                           system_of_medicine="ayush")  # fmt: skip
+
+    task = await ctx.open("medical_findings", Role.MEDICAL_OFFICER, hours=1)
+
+    assert task.system_of_medicine == "ayush"
+    assert await ctx.service.list_queue(user_id=allopathy) == []
+    assert await ctx.service.take_next(user_id=allopathy) is None
+    assert await ctx.service.get_task(task_id=task.id, user_id=allopathy) is None
+    with pytest.raises(TaskNotAllowed, match="system of medicine"):
+        await ctx.service.complete(task_id=task.id, user_id=allopathy, outcome={})
+    assert [t.id for t in await ctx.service.list_queue(user_id=ayush)] == [task.id]
+
+
+async def test_a_medical_task_at_an_allopathic_or_unknown_hospital_is_allopathy(
+    ctx: Ctx,
+) -> None:
+    doctor = await add_user(ctx.sessions, "doctor", [Role.MEDICAL_OFFICER])  # no stream set
+
+    task = await ctx.open("medical_findings", Role.MEDICAL_OFFICER, hours=1)
+    other = await ctx.open("confirm_deductions", Role.BILL_PROCESSOR, hours=1, workflow_id="wf-9")
+
+    assert (task.system_of_medicine, other.system_of_medicine) == ("allopathy", None)
+    assert [t.id for t in await ctx.service.list_queue(user_id=doctor)] == [task.id]
+
+
+async def test_tasks_of_a_held_claim_leave_the_queues_and_cannot_be_completed(ctx: Ctx) -> None:
+    ops = await add_user(ctx.sessions, "ops", [Role.CLAIMS_OPERATOR])
+    task = await ctx.open("confirm_registration", Role.CLAIMS_OPERATOR, hours=1)
+    async with ctx.sessions.begin() as session:
+        claim = await session.get(ClaimRow, ctx.claim_id)
+        assert claim is not None
+        claim.held_at, claim.hold_reason = NOW, "Fraud tip-off"
+
+    assert await ctx.service.list_queue(user_id=ops) == []
+    assert await ctx.service.take_next(user_id=ops) is None
+    with pytest.raises(TaskNotAllowed, match="on hold"):
+        await ctx.service.complete(task_id=task.id, user_id=ops, outcome={})
+
+
+async def test_a_task_is_reassigned_only_to_an_eligible_user(ctx: Ctx) -> None:
+    first = await add_user(ctx.sessions, "first", [Role.APPROVER], max_amount=Decimal("100000"))
+    second = await add_user(ctx.sessions, "second", [Role.APPROVER], max_amount=Decimal("100000"))
+    low = await add_user(ctx.sessions, "low", [Role.APPROVER], max_amount=Decimal("10000"))
+    ops = await add_user(ctx.sessions, "ops", [Role.CLAIMS_OPERATOR])
+    task = await ctx.open("approve", Role.APPROVER, hours=1, authority_amount=Decimal("50000"))
+    assert await ctx.service.take_next(user_id=first) is not None
+
+    eligible = await ctx.service.eligible_assignees(task_id=task.id)
+    moved = await ctx.service.reassign(task_id=task.id, to_user_id=second)
+
+    assert {a.user_id for a in eligible} == {first, second}
+    assert (moved.status, moved.assignee) == ("taken", second)
+    assert [t.id for t in await ctx.service.list_queue(user_id=second)] == [task.id]
+    assert await ctx.service.list_queue(user_id=first) == []
+    for refused in (low, ops):
+        with pytest.raises(TaskNotAllowed):
+            await ctx.service.reassign(task_id=task.id, to_user_id=refused)
+    await ctx.service.complete(task_id=task.id, user_id=second, outcome={"action": "approve"})
+    with pytest.raises(TaskAlreadyDone):
+        await ctx.service.reassign(task_id=task.id, to_user_id=first)
+
+
+async def test_shift_deadlines_moves_the_claim_and_its_open_tasks(ctx: Ctx) -> None:
+    ops = await add_user(ctx.sessions, "ops", [Role.CLAIMS_OPERATOR])
+    done = await ctx.open("a", Role.CLAIMS_OPERATOR, hours=1, workflow_id="wf-a")
+    await ctx.service.complete(task_id=done.id, user_id=ops, outcome={})
+    open_task = await ctx.open("b", Role.CLAIMS_OPERATOR, hours=2, workflow_id="wf-b")
+    async with ctx.sessions.begin() as session:
+        claim = await session.get(ClaimRow, ctx.claim_id)
+        assert claim is not None
+        claim.deadline = NOW
+
+    await ctx.service.shift_deadlines(claim_id=ctx.claim_id, seconds=3600)
+
+    queue = await ctx.service.list_queue(user_id=ops)
+    assert [(t.id, t.deadline) for t in queue] == [(open_task.id, NOW + timedelta(hours=3))]
+    async with ctx.sessions() as session:
+        claim = await session.get(ClaimRow, ctx.claim_id)
+    assert claim is not None and claim.deadline == NOW + timedelta(hours=1)

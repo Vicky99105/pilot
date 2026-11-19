@@ -4,7 +4,7 @@ import re
 from decimal import Decimal
 
 from app.services.bill_review.contract import DeductionLine
-from app.services.rules.contract import ClaimRoute, Head
+from app.services.rules.contract import Head
 from app.shared.types import RequestType
 
 ZERO = Decimal("0.00")
@@ -63,13 +63,3 @@ def room_rate_per_day(lines: list[DeductionLine], days: dict[int, Decimal]) -> D
     if not room or total_days <= 0:
         return None
     return sum((ln.claimed for ln in room), ZERO) / total_days
-
-
-def claim_route(request_type: RequestType) -> ClaimRoute | None:
-    """Cashless or reimbursement, from the request type the claim was opened with. None for
-    a request type that opens no claim of its own (a query reply, for example)."""
-    if request_type in CASHLESS_REQUESTS:
-        return "cashless"
-    if request_type is RequestType.REIMBURSEMENT:
-        return "reimbursement"
-    return None

@@ -54,9 +54,12 @@ class DefaultSettlementService:
         checks: list[PayeeCheck] = []
         claim = await self._claim(claim_id)
         cashless = RequestType(claim.request_type) in CASHLESS_REQUESTS
-        if decision.final_decision in PAID and cashless:
+        previously_paid = await self._records.settled_paid(claim_id)
+        decided = decision.final_amount if decision.final_decision in PAID else ZERO
+        to_pay = max(decided - previously_paid, ZERO)
+        if to_pay > 0 and cashless:
             payee, checks = await self._hospital_payee(claim)
-        elif decision.final_decision in PAID:
+        elif to_pay > 0:
             record = await self._claim_record(claim_id)
             checks = payee_checks(
                 record.bank,
@@ -75,7 +78,9 @@ class DefaultSettlementService:
             claim_id=claim_id,
             decision_version=version,
             final_decision=decision.final_decision,
-            paid_amount=decision.final_amount,
+            decided_amount=decision.final_amount,
+            previously_paid=previously_paid,
+            paid_amount=to_pay,
             payee=payee,
             payee_checks=checks,
             status="awaiting_release",
@@ -96,7 +101,7 @@ class DefaultSettlementService:
         if checked.status == "settled":
             return checked
         registration = await self._registration(claim_id)
-        paid = checked.final_decision in PAID
+        paid = checked.paid_amount > 0
         payment_ref = None
         if paid:
             if released_by is None or not await self._is_finance(released_by):

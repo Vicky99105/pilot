@@ -285,7 +285,7 @@ def r11_non_payable(facts: Facts, product: ProductConfig) -> RuleResult:
     )
 
 
-# --- R13: room and ICU caps with proportionate deduction ----------------------------------
+# --- R13: room cap ------------------------------------------------------------------------
 
 
 def daily_cap(percent: Decimal, maximum: Decimal, sum_insured: Decimal) -> Decimal:
@@ -296,29 +296,43 @@ def r13_room_cap(facts: Facts, product: ProductConfig) -> RuleResult:
     if facts.line is None or facts.room is None:
         return _missing("R13", *_absent(line=facts.line, room=facts.room))
     line, room = facts.line, facts.room
-    clauses = product.clauses
     if in_package(line.head, facts, product):
         return _priced_by_package("R13", facts)
     if line.head is Head.ICU:
         return RuleResult(rule_id="R13", passed=True, reason="an ICU line: R14 caps it")
     if line.head is Head.ROOM:
         return _daily_cap("R13", line, room, product)
+    reason = f"not a room line: R15 reduces {line.head.value} in proportion, where it applies"
+    return RuleResult(rule_id="R13", passed=True, reason=reason)
+
+
+# --- R15: proportionate deduction ----------------------------------------------------------
+
+
+def r15_proportionate(facts: Facts, product: ProductConfig) -> RuleResult:
+    if facts.line is None or facts.room is None:
+        return _missing("R15", *_absent(line=facts.line, room=facts.room))
+    line, room = facts.line, facts.room
+    if in_package(line.head, facts, product):
+        return _priced_by_package("R15", facts)
     rules = product.proportionate_deduction
+    clause = product.clauses.proportionate_deduction
     if line.head not in rules.linked_heads:
-        kind = "excluded from" if line.head in rules.excluded_heads else "not subject to"
-        reason = f"{line.head.value} is {kind} proportionate deduction"
-        return RuleResult(rule_id="R13", passed=True, reason=reason)
-    clause = clauses.proportionate_deduction
+        if line.head in rules.excluded_heads:
+            reason = f"{line.head.value} is excluded from proportionate deduction"
+            return RuleResult(rule_id="R15", passed=True, reason=reason, clause_ref=clause)
+        reason = f"{line.head.value} is not subject to proportionate deduction"
+        return RuleResult(rule_id="R15", passed=True, reason=reason)
     if rules.only_with_differential_billing and not room.differential_billing:
         reason = "hospital has no differential billing; no proportionate deduction"
-        return RuleResult(rule_id="R13", passed=True, reason=reason, clause_ref=clause)
+        return RuleResult(rule_id="R15", passed=True, reason=reason, clause_ref=clause)
     cap = daily_cap(
         product.room_rent.percent_of_sum_insured, product.room_rent.max_per_day, room.sum_insured
     )
     room_rate = room.room_rate_per_day
     if room_rate is None or room_rate <= cap:
         return RuleResult(
-            rule_id="R13", passed=True, reason="room within its cap", clause_ref=clause
+            rule_id="R15", passed=True, reason="room within its cap", clause_ref=clause
         )
     admissible = money(line.claimed * cap / room_rate)
     reason = (
@@ -326,7 +340,7 @@ def r13_room_cap(facts: Facts, product: ProductConfig) -> RuleResult:
         f"cap, ratio {cap / room_rate * HUNDRED:.2f}%"
     )
     return RuleResult(
-        rule_id="R13",
+        rule_id="R15",
         passed=False,
         amount_effect=admissible - money(line.claimed),
         reason=reason,
@@ -873,27 +887,141 @@ def r21_co_pay(facts: Facts, product: ProductConfig) -> RuleResult:
     )
 
 
+# --- R4: hospital registered, and in the network for cashless ------------------------------
+
+
+def r4_hospital(facts: Facts, product: ProductConfig) -> RuleResult:
+    if facts.hospital is None or facts.claim_route is None:
+        return _missing("R4", *_absent(hospital=facts.hospital, claim_route=facts.claim_route))
+    clause = product.clauses.hospital
+    hospital, route = facts.hospital, facts.claim_route
+    if hospital.rohini_id is None:
+        reason = (
+            "the treating hospital is not in the hospital register; a person checks that it "
+            "is a registered hospital"
+        )
+        return RuleResult(rule_id="R4", passed=False, reason=reason, clause_ref=clause)
+    needs_network = route in product.hospital.network_required_for
+    if needs_network and not hospital.network:
+        reason = (
+            f"a {route} claim needs a network hospital; {hospital.rohini_id} is registered but "
+            "outside the network"
+        )
+        return RuleResult(rule_id="R4", passed=False, reason=reason, clause_ref=clause)
+    where = "in the network" if hospital.network else "outside the network"
+    reason = f"hospital {hospital.rohini_id} is registered and {where}"
+    return RuleResult(rule_id="R4", passed=True, reason=reason, clause_ref=clause)
+
+
+# --- R8: moratorium on contesting non-disclosure -----------------------------------------
+
+
+def r8_moratorium(facts: Facts, product: ProductConfig) -> RuleResult:
+    """After the moratorium a condition that was not declared can no longer be contested.
+    Before it, a condition that started before inception and was not declared is a
+    non-disclosure a person must look at."""
+    clause = product.clauses.moratorium
+    months = product.moratorium_months
+    if months is None:
+        return RuleResult(rule_id="R8", passed=True, reason="the product has no moratorium")
+    if facts.policy is None or facts.admission_date is None:
+        return _missing("R8", *_absent(policy=facts.policy, admission_date=facts.admission_date))
+    policy, admitted = facts.policy, facts.admission_date
+    ends = add_months(policy.continuous_cover_start, months)
+    before = sorted(d for d in facts.pre_existing_onsets if d < policy.inception_date)
+    declared = [c.code for c in policy.declared_peds]
+    treated_declared = any(code_in_ranges(c, declared) for c in facts.diagnosis_codes if declared)
+    if not before or treated_declared:
+        reason = f"no undisclosed pre-existing condition found; the moratorium starts {ends}"
+        return RuleResult(rule_id="R8", passed=True, reason=reason, clause_ref=clause)
+    found = f"a condition that started by {before[0]}, before inception, was not declared"
+    if admitted >= ends:
+        reason = (
+            f"{found}, but {months} months of continuous cover ended on {ends}: the claim "
+            "cannot be contested for non-disclosure"
+        )
+        return RuleResult(rule_id="R8", passed=True, reason=reason, clause_ref=clause)
+    reason = (
+        f"{found}; within the {months}-month moratorium (ends {ends}) the claim can be "
+        "contested for non-disclosure"
+    )
+    return RuleResult(rule_id="R8", passed=False, reason=reason, clause_ref=clause)
+
+
+# --- R22: every deduction cites its clause -----------------------------------------------
+
+
+def r22_deductions_cited(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.deduction_reasons
+    if facts.deductions is None:
+        return _missing("R22", "deductions")
+    taken = [d for d in facts.deductions if d.amount > 0]
+    if not taken:
+        return RuleResult(rule_id="R22", passed=True, reason="no deductions", clause_ref=clause)
+    uncited = [d for d in taken if not d.clause_ref]
+    if not uncited:
+        reason = f"every deduction cites a clause ({len(taken)} deductions)"
+        return RuleResult(rule_id="R22", passed=True, reason=reason, clause_ref=clause)
+    named = ", ".join(
+        f"line {d.line_id} ({d.rule_id or d.judged_by}, {_rupees(d.amount)})"
+        if d.line_id is not None
+        else f"{d.rule_id or d.judged_by} ({_rupees(d.amount)})"
+        for d in uncited
+    )
+    reason = f"deductions with no clause: {named}"
+    return RuleResult(rule_id="R22", passed=False, reason=reason, clause_ref=clause)
+
+
+# --- R25: PAN or Aadhaar from the KYC threshold -------------------------------------------
+
+
+def r25_kyc(facts: Facts, product: ProductConfig) -> RuleResult:
+    clause = product.clauses.kyc
+    if facts.claimed is None:
+        return _missing("R25", "claimed")
+    threshold = money(product.kyc.threshold)
+    claimed = money(facts.claimed)
+    if claimed < threshold:
+        reason = f"{_rupees(claimed)} claimed is below the {_rupees(threshold)} KYC threshold"
+        return RuleResult(rule_id="R25", passed=True, reason=reason, clause_ref=clause)
+    if facts.kyc_on_file is None:
+        return _missing("R25", "kyc_on_file")
+    if facts.kyc_on_file:
+        reason = f"{_rupees(claimed)} claimed; PAN or Aadhaar is on file"
+        return RuleResult(rule_id="R25", passed=True, reason=reason, clause_ref=clause)
+    reason = (
+        f"{_rupees(claimed)} claimed, at or above {_rupees(threshold)}: the claim needs PAN or "
+        "Aadhaar, and none is on file"
+    )
+    return RuleResult(rule_id="R25", passed=False, reason=reason, clause_ref=clause)
+
+
 RULES: dict[str, Rule] = {
     "R1": r1_premium_received,
     "R2": r2_in_force,
     "R3": r3_member_match,
+    "R4": r4_hospital,
     "R5": r5_initial_wait,
     "R6": r6_pre_existing,
     "R7": r7_specific_waiting,
+    "R8": r8_moratorium,
     "R9": r9_exclusions,
     "R10": r10_sum_insured,
     "R11": r11_non_payable,
     "R12": r12_unclear_line,
     "R13": r13_room_cap,
     "R14": r14_icu_cap,
+    "R15": r15_proportionate,
     "R16": r16_cataract,
     "R17": r17_modern_treatments,
     "R18": r18_pre_post,
     "R19": r19_ambulance,
     "R20": r20_package_cap,
     "R21": r21_co_pay,
+    "R22": r22_deductions_cited,
     "R23": r23_package_inclusions,
     "R24": r24_non_package_discount,
+    "R25": r25_kyc,
     "R26": r26_preauth,
     "DRUG-PRICE": drug_price,
 }

@@ -9,12 +9,14 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models import ClaimRow
+from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import StageRecordRepository
 from app.services.classification.contract import DocumentSet
 from app.services.digitisation import prompts
 from app.services.digitisation._helpers import (
     assemble,
     failed_checks,
+    field_value,
     fill_stay,
     low_confidence_fields,
     quantize_money,
@@ -29,6 +31,7 @@ from app.services.digitisation.contract import (
 from app.services.file_store.contract import FileStore
 from app.services.intake.contract import ClaimForm
 from app.services.model_gateway.contract import ModelGateway, ModelRole
+from app.services.overrides.contract import OverrideEntry
 from app.shared.types import CASHLESS_REQUESTS, DocType, RequestType, Stage
 
 # The ClaimRecord sections each extracted document type supplies.
@@ -108,7 +111,23 @@ class DefaultDigitisationService:
             *record.corrected_fields,
             *(p for p in fields if p not in record.corrected_fields),
         ]
-        return await self._finish(record, created_by=actor)
+        stored = await self._finish(record, created_by=actor)
+        await OverrideRepository(self._sessions).append(
+            [
+                OverrideEntry(
+                    claim_id=claim_id,
+                    stage=Stage.DIGITISATION,
+                    kind="field_fix",
+                    field=path,
+                    before=field_value(latest.payload, path),
+                    after=value,
+                    reason="",
+                    actor=actor,
+                )
+                for path, value in fields.items()
+            ]
+        )
+        return stored
 
     async def _finish(self, record: ClaimRecord, *, created_by: str) -> ClaimRecord:
         fill_stay(record)

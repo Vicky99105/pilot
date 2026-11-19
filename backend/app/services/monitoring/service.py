@@ -33,6 +33,7 @@ class DefaultMonitoring:
         action: str,
         actor: str,
         detail: dict[str, Any] | None = None,
+        moves_status: bool = True,
     ) -> None:
         now = self._now()
         async with self._sessions.begin() as session:
@@ -47,6 +48,8 @@ class DefaultMonitoring:
                     created_at=now,
                 )
             )
+            if not moves_status:
+                return
             claim = await session.get(ClaimRow, claim_id, with_for_update=True)
             if claim is not None and claim.status not in (stage.value, CLOSED):
                 claim.status, claim.status_changed_at = stage.value, now

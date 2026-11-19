@@ -21,7 +21,7 @@ The claim:
   policy's own rules do. "Gloves" is on the non-payable list I, so R11 deducts it. The four
   nursing lines are read by R12 as List II item 38 (nursing is part of the room charges),
   so they are deducted in full. The room cap (Rs 5,000 a day) and the proportionate
-  deduction (R13) then reduce the room, OT and professional fee lines by 2/3.
+  deduction (R13, R15) then reduce the room, OT and professional fee lines by 2/3.
 - Bundle: claim form Part A (typed), claim form Part B (hospital), discharge summary,
   operation theatre notes, the histopathology report of the appendix (a mandatory document
   of the SG017B guideline, as in a real appendicectomy file), itemised final bill, cancelled
@@ -29,7 +29,7 @@ The claim:
   separately as the query reply.
 
 The ground truth's deductions come from the real rules engine run on the ground-truth bill
-lines in bill review's order (R11, R12, R18, R23, R20, R24, R13, R14, R19, R16, R17, R26,
+lines in bill review's order (R11, R12, R18, R23, R20, R24, R13, R14, R15, R19, R16, R17, R26,
 then R21), so every expected amount is exact. The R12 reading is the expected outcome with
 the wording's non-payable lists loaded, as in the acceptance environment; tests/pg checks
 that those lists send exactly R12_READINGS' lines to R12 and hold the item as written here.
@@ -459,7 +459,7 @@ def expected_sheet(
     total = sum((ln["admissible"] for ln in covered), D("0"))
     spread("R20", covered, {"package": package.model_copy(update={"package_total": total}),
                             **route})  # fmt: skip
-    # 3. R24, then R13 and R14 with the room rate of the room lines outside the package.
+    # 3. R24, then R13, R14 and R15 with the room rate of the room lines outside the package.
     for line in payable():
         apply(line, "R24", {"package": package, "non_package_discount_percent":
                             NON_PACKAGE_DISCOUNT, **route})  # fmt: skip
@@ -472,7 +472,7 @@ def expected_sheet(
     room = RoomFacts(sum_insured=SUM_INSURED, room_rate_per_day=room_rate,
                      differential_billing=DIFFERENTIAL_BILLING)  # fmt: skip
     for line in payable():
-        for rule_id in ("R13", "R14"):
+        for rule_id in ("R13", "R14", "R15"):
             apply(line, rule_id, {"room": room, "package": package, **route})
     # 4. Claim: R19 (no ambulance line), R16, R17, R26, then R21.
     for rule_id in ("R16", "R17", "R26"):

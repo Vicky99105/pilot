@@ -100,6 +100,10 @@ class AdjudicationTools(Protocol):
         """The latest stored record of a stage for this claim."""
         ...
 
+    async def get_stage_history(self, stage: Stage) -> list[StageSnapshot]:
+        """Every stored record of a stage for this claim, oldest first."""
+        ...
+
 
 class DefaultAdjudicationTools:
     def __init__(
@@ -123,3 +127,9 @@ class DefaultAdjudicationTools:
         if record is None:
             return None
         return StageSnapshot(stage=stage, version=record.version, payload=record.payload)
+
+    async def get_stage_history(self, stage: Stage) -> list[StageSnapshot]:
+        return [
+            StageSnapshot(stage=stage, version=r.version, payload=r.payload)
+            for r in await self._records.history(self._claim_id, stage)
+        ]

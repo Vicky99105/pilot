@@ -441,13 +441,20 @@ class FakeSettlementService:
     def __init__(self, final: Decision = "approve") -> None:
         self.final = final
         self.calls: list[tuple[str, UUID | None]] = []
+        # What the decision pays now: zero for a reject, or a reconsideration that adds
+        # nothing; set it to zero to test that case.
+        self.to_pay = Decimal("1000.00")
+
+    @property
+    def paid(self) -> Decimal:
+        return self.to_pay if self.final in ("approve", "partial") else Decimal("0.00")
 
     def _record(self, claim_id: UUID, status: Any) -> SettlementRecord:
         return SettlementRecord(
             claim_id=claim_id,
             decision_version=1,
             final_decision=self.final,  # type: ignore[arg-type]
-            paid_amount=Decimal("0.00"),
+            paid_amount=self.paid,
             payee=None,
             payee_checks=[],
             status=status,
@@ -464,7 +471,7 @@ class FakeSettlementService:
         return self._record(claim_id, "awaiting_release")
 
     async def settle(self, claim_id: UUID, *, released_by: UUID | None) -> SettlementRecord:
-        if self.final in ("approve", "partial") and released_by is None:
+        if self.paid > 0 and released_by is None:
             raise PaymentNotReleased("needs a finance release")
         self.calls.append(("settle", released_by))
         return self._record(claim_id, "settled")

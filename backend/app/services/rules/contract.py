@@ -7,6 +7,10 @@ config/products/. Money is Decimal rupees, quantized to 2 places.
 Rules R1 to R26 return a RuleResult each. DRUG-PRICE is a check that never deducts: a failed
 result is a finding for the bill processor (pharmacy line above the NPPA ceiling plus GST).
 
+R22 checks the deduction sheet itself: every amount taken off a line names its clause. It
+never deducts. R4 and R25 are registration checks; R8 runs at registration and again on the
+verified facts after medical review, like R6, R7 and R9.
+
 RuleResult conventions:
 - passed=False means an adverse finding: a failed check or a deduction for a breach.
 - amount_effect is the change to the payable amount, zero or negative.
@@ -16,7 +20,8 @@ RuleResult conventions:
   person sees the gap at the checkpoint.
 - Package pricing (R20, R23, R24) applies only on the claim routes the product config lists
   in packages.pricing_applies_to. On another route those rules pass and the room and ICU caps
-  (R13, R14) apply to every line, whether or not a package was mapped.
+  (R13, R14) and the proportionate deduction (R15) apply to every line, whether or not a
+  package was mapped.
 
 Callers import this module only.
 """
@@ -30,7 +35,9 @@ from pydantic import BaseModel, model_validator
 
 from app.integrations.core.contract import InsuredMember, MemberPolicy
 from app.shared.errors import PermanentError
-from app.shared.types import RuleResult
+from app.shared.types import ClaimRoute, RuleResult
+
+__all__ = ["ClaimRoute"]
 
 
 class Head(StrEnum):
@@ -73,6 +80,19 @@ class ProportionateDeduction(BaseModel):
 
 class CoPay(BaseModel):
     percent: Decimal
+
+
+class HospitalRules(BaseModel):
+    """R4: the claim routes that need a network hospital. Every route needs a hospital the
+    hospital register holds."""
+
+    network_required_for: list[ClaimRoute]
+
+
+class Kyc(BaseModel):
+    """R25: from this claimed amount, the claim needs PAN or Aadhaar on file."""
+
+    threshold: Decimal
 
 
 class InitialWaiting(BaseModel):
@@ -157,11 +177,6 @@ class MultiProcedure(BaseModel):
     addon: Decimal
 
 
-# How a claim reaches the insurer: through the network hospital (cashless: pre-auth,
-# enhancement, discharge) or from the insured person after paying the bill (reimbursement).
-ClaimRoute = Literal["cashless", "reimbursement"]
-
-
 class Packages(BaseModel):
     """How the product pays a hospital's package (R20, R23, R24, R13 and R14)."""
 
@@ -205,6 +220,10 @@ class Clauses(BaseModel):
     package_inclusions: str  # R23
     non_package_discount: str  # R24
     preauth: str  # R26
+    hospital: str  # R4
+    moratorium: str  # R8
+    deduction_reasons: str  # R22
+    kyc: str  # R25
     non_payable: dict[str, str]  # IRDAI list number ("I" to "IV") -> clause
 
 
@@ -224,6 +243,9 @@ class ProductConfig(BaseModel):
     pre_hospitalisation_days: int | None = None
     post_hospitalisation_days: int | None = None
     pre_existing_waiting_months: int | None = None
+    moratorium_months: int | None = None  # R8; None: the product has no moratorium
+    hospital: HospitalRules
+    kyc: Kyc
     specific_waiting: SpecificWaiting | None = None
     packages: Packages
     non_payable_judging: NonPayableJudging
@@ -310,6 +332,23 @@ class NonPayableJudgement(BaseModel):
     confidence: float
 
 
+class HospitalFacts(BaseModel):
+    """R4: the treating hospital as the hospital register holds it."""
+
+    rohini_id: str | None  # None: no hospital in the register matched the claim
+    network: bool = False
+
+
+class DeductionCitation(BaseModel):
+    """R22: one amount taken off a bill line, and the clause it cites."""
+
+    line_id: int | None
+    rule_id: str | None  # None for a person's edit
+    amount: Decimal
+    clause_ref: str | None
+    judged_by: Literal["code", "model", "person"] = "code"
+
+
 class PreAuthFacts(BaseModel):
     approved_total: Decimal  # the pre-auth plus every enhancement
     diagnosis_codes: list[str] = []  # as approved
@@ -323,22 +362,28 @@ class Facts(BaseModel):
     policy: MemberPolicy | None = None
     claimant: Claimant | None = None
     amount: Decimal | None = None  # the amount to block (R10)
-    line: LineFacts | None = None  # the bill line under review (R11, R13)
-    room: RoomFacts | None = None  # R13
+    line: LineFacts | None = None  # the bill line under review (R11 to R15, R18, R23, R24)
+    room: RoomFacts | None = None  # R13, R14, R15
     non_payable: list[NonPayableItem] = []  # R11
     admissible_total: Decimal | None = None  # before co-pay (R16, R17, R21, R26)
     sum_insured: Decimal | None = None  # R16, R17
     discharge_date: date | None = None  # R18
-    diagnosis_codes: list[str] = []  # verified ICD-10-CM codes (R6, R7, R9, R26)
+    diagnosis_codes: list[str] = []  # verified ICD-10-CM codes (R6, R7, R8, R9, R26)
     procedure_codes: list[str] = []  # verified ICD-10-PCS codes (R7, R9, R16, R17)
-    pre_existing_onsets: list[date] = []  # R6: latest start dates of conditions found
+    pre_existing_onsets: list[date] = []  # R6, R8: latest start dates of conditions found
     judgement: NonPayableJudgement | None = None  # R12
-    package: PackageFacts | None = None  # R13, R14, R20, R23, R24
-    claim_route: ClaimRoute | None = None  # R13, R14, R20, R23, R24: does the agreement bind?
+    package: PackageFacts | None = None  # R13, R14, R15, R20, R23, R24
+    # R4: does the route need a network hospital; R13 to R15, R20, R23, R24: does the
+    # hospital agreement bind?
+    claim_route: ClaimRoute | None = None
     non_package_discount_percent: Decimal | None = None  # R24, from the hospital agreement
     ambulance_total: Decimal | None = None  # R19: ambulance lines after the earlier rules
     preauth: PreAuthFacts | None = None  # R26; None for a reimbursement with no pre-auth
     drug: DrugFacts | None = None  # DRUG-PRICE
+    hospital: HospitalFacts | None = None  # R4
+    claimed: Decimal | None = None  # R25: the amount the claim asks for
+    kyc_on_file: bool | None = None  # R25: the claim holds a PAN or Aadhaar document
+    deductions: list[DeductionCitation] | None = None  # R22: every amount taken off a line
 
 
 MatchKind = Literal["exact_id", "name_dob", "doubtful", "none"]

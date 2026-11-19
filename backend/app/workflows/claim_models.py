@@ -59,6 +59,15 @@ class EventInput(BaseModel):
     action: str
     actor: str = "workflow"
     detail: dict[str, Any] | None = None
+    moves_status: bool = True
+
+
+class ClockInput(BaseModel):
+    """A resumed claim: how long it was held, and the cashless clock it now has."""
+
+    claim_id: UUID
+    paused_seconds: int
+    clock_deadline: datetime | None = None
 
 
 class CorrectionInput(BaseModel):

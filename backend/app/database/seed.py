@@ -31,6 +31,7 @@ from app.database.models import (
 )
 from app.database.seed_knowledge import NON_PAYABLE_ITEMS, POLICY_CLAUSES
 from app.shared.seed_ids import (
+    AYUSH_DOCTOR_USER_ID,
     DOCTOR_USER_ID,
     FINANCE_USER_ID,
     HOSPITAL_ROHINI_IDS,
@@ -41,6 +42,7 @@ from app.shared.seed_ids import (
     OPS_USER_ID,
     PRODUCT_UIN,
     SENIOR_USER_ID,
+    SUPERVISOR_USER_ID,
 )
 from app.shared.types import DocType, RequestType, Role
 
@@ -68,9 +70,11 @@ USERS = [
         email="desk@sunrise-hospital.example",
     ),
     UserRow(id=OPS_USER_ID, name="Ops", kind="staff"),
-    UserRow(id=DOCTOR_USER_ID, name="Doctor", kind="staff"),
+    UserRow(id=DOCTOR_USER_ID, name="Doctor", kind="staff", system_of_medicine="allopathy"),
     UserRow(id=FINANCE_USER_ID, name="Finance", kind="staff"),
     UserRow(id=SENIOR_USER_ID, name="Senior approver", kind="staff"),
+    UserRow(id=SUPERVISOR_USER_ID, name="Supervisor", kind="staff"),
+    UserRow(id=AYUSH_DOCTOR_USER_ID, name="AYUSH doctor", kind="staff", system_of_medicine="ayush"),
 ]
 
 ROLES = [
@@ -85,6 +89,8 @@ ROLES = [
     UserRoleRow(user_id=FINANCE_USER_ID, role=Role.FINANCE.value),
     # Same role as the doctor's approver row, with no limit: approves above Rs 1 lakh.
     UserRoleRow(user_id=SENIOR_USER_ID, role=Role.APPROVER.value),
+    UserRoleRow(user_id=SUPERVISOR_USER_ID, role=Role.SUPERVISOR.value),
+    UserRoleRow(user_id=AYUSH_DOCTOR_USER_ID, role=Role.MEDICAL_OFFICER.value),
 ]
 
 # (name, city, state, pincode, beds, differential billing). The nursing home charges one

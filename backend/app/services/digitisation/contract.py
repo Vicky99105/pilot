@@ -104,6 +104,7 @@ class Bill(BaseModel):  # from the itemised final bill
     lines: list[BillLine] = []
     section_totals: list[SectionTotal] = []
     grand_total: Field[Decimal] = missing()
+    on_letterhead: Field[bool] = missing()  # printed on the hospital's letterhead (risk RF9)
 
 
 class Bank(BaseModel):

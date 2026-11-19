@@ -5,7 +5,7 @@
 2. review(): the full review against the package bill review mapped: the package's
    guideline and length-of-stay norm, a pre-existing disease re-read of the cited history
    pages, findings and query items, and the eligibility rules the verified codes can change
-   (R5, R6, R7 and R9).
+   (R5 to R9).
 
 These guarantees hold for every MedicalCoding and MedicalFindings:
 - Every verified code was returned by a knowledge-base lookup during the run that produced

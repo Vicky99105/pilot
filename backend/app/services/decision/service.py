@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models import UserRoleRow, utcnow
+from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import StageRecordRepository
 from app.services.adjudication.contract import DraftDecision
 from app.services.decision.contract import (
@@ -29,6 +30,7 @@ from app.services.decision.contract import (
     Override,
     Routing,
 )
+from app.services.overrides.contract import OverrideEntry
 from app.shared.types import Role, Stage
 
 ZERO = Decimal("0.00")
@@ -130,7 +132,23 @@ class DefaultDecisionService:
             crc_required=final is not None and final in self._matrix.crc_required_for,
             decided_at=self._now(),
         )
-        return await self._store(record, created_by=f"user:{outcome.approver_id}")
+        stored = await self._store(record, created_by=f"user:{outcome.approver_id}")
+        await OverrideRepository(self._sessions).append(
+            [
+                OverrideEntry(
+                    claim_id=claim_id,
+                    stage=Stage.DECISION,
+                    kind="decision_override",
+                    field=o.field,
+                    before=o.before,
+                    after=o.after,
+                    reason=record.reason,
+                    actor=f"user:{outcome.approver_id}",
+                )
+                for o in overrides
+            ]
+        )
+        return stored
 
     async def review_crc(self, claim_id: UUID, outcome: CrcOutcome) -> DecisionRecord:
         latest = await self.latest(claim_id)

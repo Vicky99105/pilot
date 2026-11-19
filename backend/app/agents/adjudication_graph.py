@@ -104,13 +104,15 @@ async def run_adjudication(
         medical_snap = await tools.get_stage_result(Stage.MEDICAL_REVIEW)
         risk_snap = await tools.get_stage_result(Stage.RISK)
         intake = await tools.get_stage_result(Stage.INTAKE)
-        classified = await tools.get_stage_result(Stage.CLASSIFICATION)
+        # Every classified set: the bundle, each query reply, a reconsideration's evidence.
+        classified = await tools.get_stage_history(Stage.CLASSIFICATION)
         medical = MedicalFindings.model_validate(medical_snap.payload) if medical_snap else None
         risk = RiskReport.model_validate(risk_snap.payload) if risk_snap else None
 
         received = {
             d.get("doc_type")
-            for d in (classified.payload.get("documents", []) if classified else [])
+            for snapshot in classified
+            for d in snapshot.payload.get("documents", [])
         }
         missing = intake.payload.get("missing_documents", []) if intake else []
         outstanding = [d for d in missing if d not in received]
@@ -140,7 +142,7 @@ async def run_adjudication(
             "bill_review": reviewed.version,
             "medical_review": medical_snap.version if medical_snap else None,
             "risk": risk_snap.version if risk_snap else None,
-            "classification": classified.version if classified else None,
+            "classification": classified[-1].version if classified else None,
         }
         inputs = AdjudicationInputs(
             registration=registration,

@@ -32,6 +32,16 @@ class DeductionRow(BaseModel):
     clause_ref: str | None
 
 
+class ReconsiderationNote(BaseModel):
+    """A decision letter after a reconsideration: what was asked and what it adds."""
+
+    number: int
+    grounds: str
+    previous_decision: str | None
+    previously_paid: Decimal
+    paid_now: Decimal  # the amount payable less what was paid before, never below zero
+
+
 class Letter(BaseModel):
     letter_id: UUID
     claim_id: UUID
@@ -52,6 +62,7 @@ class Letter(BaseModel):
     request_type: str | None = None  # authorisation letters: preauth, enhancement, discharge
     previous_total: Decimal | None = None  # authorisation letters: approved earlier
     approved_total: Decimal | None = None  # authorisation letters: approved in all
+    reconsideration: ReconsiderationNote | None = None  # a decision made on reconsideration
     pdf_key: str
     sent: bool
     send_error: str | None = None

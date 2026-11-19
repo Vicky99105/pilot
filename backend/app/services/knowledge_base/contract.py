@@ -286,3 +286,8 @@ class KnowledgeBase(Protocol):
     async def package_crosswalk(self, scheme: str, package_code: str) -> PackageCrosswalk | None:
         """Our crosswalk row for a package, or None when the package is not in it."""
         ...
+
+    async def city_tier(self, hospital_id: str) -> str | None:
+        """The CGHS city tier (X, Y or Z) of the hospital's city, or None when the rate list
+        names no tier for it."""
+        ...

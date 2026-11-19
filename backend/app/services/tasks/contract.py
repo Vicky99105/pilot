@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from app.shared.types import Role
+from app.shared.types import Role, SystemOfMedicine
 
 TaskStatus = Literal["open", "taken", "done", "escalated"]
 
@@ -34,6 +34,9 @@ class Task(BaseModel):
     outcome: dict[str, Any] | None
     # Approver tasks: the user's approver max_amount must cover this (empty: no limit).
     authority_amount: Decimal | None = None
+    # Medical officer tasks: the treatment's system of medicine; only medical officers of
+    # that system see the task. None for other roles.
+    system_of_medicine: SystemOfMedicine | None = None
     created_at: datetime | None = None
     claim: ClaimBrief | None = None  # set on queue reads: list_queue, take_next, get_task
 
@@ -43,7 +46,13 @@ class TaskNotFound(Exception):
 
 
 class TaskNotAllowed(Exception):
-    """The user lacks the task's role or the approval limit, or another user took the task."""
+    """The user lacks the task's role, the approval limit or the system of medicine, another
+    user took the task, or the claim is on hold."""
+
+
+class Assignee(BaseModel):
+    user_id: UUID
+    name: str
 
 
 class TaskAlreadyDone(Exception):
@@ -73,6 +82,20 @@ class TaskService(Protocol):
         ...
 
     async def get_task(self, *, task_id: UUID, user_id: UUID) -> Task | None: ...  # role-checked
+
+    async def eligible_assignees(self, *, task_id: UUID) -> list[Assignee]:
+        """Users who may do the task: its role, the approval limit, the system of medicine."""
+        ...
+
+    async def reassign(self, *, task_id: UUID, to_user_id: UUID) -> Task:
+        """Give an unfinished task to an eligible user, taken by them. The supervisor service
+        checks who may reassign and records the audit event."""
+        ...
+
+    async def shift_deadlines(self, *, claim_id: UUID, seconds: int) -> None:
+        """Move the claim's deadline and its unfinished tasks' deadlines later by seconds: a
+        resumed claim gets back the time it was held."""
+        ...
 
 
 class WorkflowSignaller(Protocol):

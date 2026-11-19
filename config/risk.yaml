@@ -1,0 +1,55 @@
+# Fraud and risk scoring parameters. Code computes every flag and the score; a model only
+# writes the explanation. Changing a weight or a threshold is a change to this file only.
+version: 1
+
+# Refer to an investigator when the score (the sum of the hits' weights, capped at 100) is
+# at or above this.
+refer_at: 60
+# A claim of this amount or more is referred whatever its score (value-threshold trigger).
+investigate_from_amount: 100000
+
+# Flag ID -> weight.
+weights:
+  RF1: 40   # admitted soon after policy inception
+  RF2: 30   # claimed amount over a share of the sum insured
+  RF3: 60   # a file with the same hash was submitted on another claim
+  RF4: 20   # admitted close to the policy's expiry
+  RF5: 30   # the same diagnosis repeated at one hospital or by one doctor
+  RF6: 50   # the stay overlaps another claim's stay for the same member
+  RF7: 25   # a sudden jump in the hospital's claim volume
+  RF8: 15   # room charged above the regional norm for the city tier
+  RF9: 20   # bill not on the hospital's letterhead, or handwritten
+  RF10: 30  # ID, date of birth (age) or gender differs from the insured member
+  RF11: 20  # bill far above the package rate (tariff outlier)
+  RF12: 15  # stay far beyond the length-of-stay norm (stay outlier)
+
+near_start_days: 30  # RF1: days from inception
+near_expiry_days: 30  # RF4: days to the policy end
+high_claim_share: 0.5  # RF2: of the sum insured
+
+repeated_diagnosis:  # RF5
+  lookback_days: 90
+  min_other_claims: 3  # other claims with the same 3-character ICD-10-CM category
+
+volume_jump:  # RF7
+  recent_days: 30
+  baseline_days: 90  # the window before the recent one
+  ratio: 2.0  # recent count against the baseline's average per recent window
+  min_recent: 5
+
+# RF8: the most a room a day should cost, by CGHS city tier. Pilot assumption standing in
+# for the insurer's regional norms: replace with the insurer's own table.
+room_norm_per_day:
+  X: 5000
+  Y: 4000
+  Z: 3000
+
+outlier:
+  # RF11: the bill total against the mapped package rate.
+  tariff_ratio: 1.5
+  # RF12: days of stay beyond the length-of-stay norm.
+  los_extra_days: 2
+  # The outlier score (0 to 100): points for each whole 10% the bill is above the package
+  # rate, and for each day the stay is beyond the norm.
+  tariff_points_per_10_percent: 5
+  los_points_per_day: 10

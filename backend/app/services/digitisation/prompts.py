@@ -107,6 +107,7 @@ class FinalBillReply(BaseModel):
     lines: list[BillLineReply] = []
     section_totals: list[SectionTotalReply] = []
     grand_total: Extracted[Amount] = Extracted()
+    on_letterhead: Extracted[bool] = Extracted()
 
 
 class CancelledChequeReply(BaseModel):
@@ -205,7 +206,8 @@ PROMPTS = {
     "and the grand total. A bill line has the section heading it sits under (as written, "
     'for example "Room Charges" or "Pharmacy"), its date, description, quantity, rate and '
     "amount. Give each line one confidence and its page. List section totals only when "
-    "the bill prints them.",
+    "the bill prints them. Also say whether the bill is printed on the hospital's "
+    "letterhead (true or false).",
     DocType.CANCELLED_CHEQUE: _COMMON + "Document: cancelled cheque or bank passbook page.\n"
     "Extract: the account number, IFSC code, account holder name and bank name.",
     DocType.PREAUTH_FORM: _COMMON

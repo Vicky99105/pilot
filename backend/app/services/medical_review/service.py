@@ -3,7 +3,7 @@
 code(): build the case file and run the coding graph.
 review(): read the package bill review mapped, its guideline and length-of-stay norm,
 re-read the cited history pages for pre-existing disease, run the review graph, then re-run
-R5, R6, R7 and R9 on the verified codes."""
+R5 to R9 on the verified codes."""
 
 import re
 from uuid import UUID
@@ -30,6 +30,7 @@ from app.agents.prompts import (
     reread_schema,
 )
 from app.database.models import PolicyClauseRow
+from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import StageRecord, StageRecordRepository
 from app.integrations.core.contract import MemberPolicy, PolicyService
 from app.services.bill_review.contract import DeductionSheet
@@ -49,11 +50,12 @@ from app.services.medical_review.contract import (
     NotReadyForMedicalReview,
 )
 from app.services.model_gateway.contract import ModelGateway, ModelRole
+from app.services.overrides.contract import OverrideEntry
 from app.services.registration.contract import RegistrationResult
 from app.services.rules.contract import Facts, RulesEngine
 from app.shared.types import DocType, PageRef, RuleResult, Stage
 
-RERUN_RULES = ["R5", "R6", "R7", "R9"]
+RERUN_RULES = ["R5", "R6", "R7", "R8", "R9"]
 # The names the claimant reads for the medical document types.
 DOCUMENT_NAMES = {
     DocType.DISCHARGE_SUMMARY: "Discharge summary",
@@ -274,6 +276,22 @@ class DefaultMedicalReviewService:
         )
         await self._records.append(
             claim_id, Stage.MEDICAL_REVIEW, overruled.model_dump(mode="json"), created_by=actor
+        )
+        await OverrideRepository(self._sessions).append(
+            [
+                OverrideEntry(
+                    claim_id=claim_id,
+                    stage=Stage.MEDICAL_REVIEW,
+                    kind="medical_overrule",
+                    field=f"finding {f.finding_id}",
+                    before={"severity": f.severity, "text": f.text},
+                    after="overruled",
+                    reason=reason,
+                    actor=actor,
+                )
+                for f in current.findings
+                if f.finding_id in chosen and not f.overruled
+            ]
         )
         return overruled
 

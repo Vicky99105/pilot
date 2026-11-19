@@ -1,7 +1,7 @@
 """Default TaskService on the claims database, and the Temporal WorkflowSignaller."""
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -12,8 +12,17 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 
 from app.config import Settings
-from app.database.models import ClaimRow, SubmissionRow, TaskRow, UserRoleRow, utcnow
+from app.database.models import (
+    ClaimRow,
+    HospitalRow,
+    SubmissionRow,
+    TaskRow,
+    UserRoleRow,
+    UserRow,
+    utcnow,
+)
 from app.services.tasks.contract import (
+    Assignee,
     ClaimBrief,
     Task,
     TaskAlreadyDone,
@@ -21,7 +30,7 @@ from app.services.tasks.contract import (
     TaskNotFound,
     WorkflowSignaller,
 )
-from app.shared.types import Role
+from app.shared.types import DEFAULT_SYSTEM_OF_MEDICINE, Role
 
 AVAILABLE = ("open", "escalated")
 UNFINISHED = ("open", "taken", "escalated")
@@ -42,6 +51,7 @@ def _to_task(row: TaskRow, claim: ClaimBrief | None = None) -> Task:
         assignee=row.assignee,
         outcome=row.outcome,
         authority_amount=row.authority_amount,
+        system_of_medicine=row.system_of_medicine,
         created_at=row.created_at,
         claim=claim,
     )
@@ -84,8 +94,15 @@ async def _roles(session: AsyncSession, user_id: UUID) -> dict[str, Decimal | No
     return {r.role: r.max_amount for r in rows}
 
 
-def _allowed(roles: dict[str, Decimal | None]) -> ColumnElement[bool]:
-    """Tasks of the user's roles whose authority amount, if any, the role's limit covers."""
+async def _stream(session: AsyncSession, user_id: UUID) -> str:
+    """The system of medicine a user reviews: their own, else the default."""
+    found = await session.scalar(select(UserRow.system_of_medicine).where(UserRow.id == user_id))
+    return found or DEFAULT_SYSTEM_OF_MEDICINE
+
+
+def _allowed(roles: dict[str, Decimal | None], stream: str) -> ColumnElement[bool]:
+    """Tasks of the user's roles whose authority amount, if any, the role's limit covers,
+    and whose system of medicine, if any, is the user's. Tasks of a held claim are left out."""
     clauses = [
         TaskRow.role == role
         if limit is None
@@ -95,16 +112,36 @@ def _allowed(roles: dict[str, Decimal | None]) -> ColumnElement[bool]:
         )
         for role, limit in roles.items()
     ]
-    return or_(*clauses) if clauses else false()
+    if not clauses:
+        return false()
+    return and_(
+        or_(*clauses),
+        or_(TaskRow.system_of_medicine.is_(None), TaskRow.system_of_medicine == stream),
+        ~select(ClaimRow.id)
+        .where(ClaimRow.id == TaskRow.claim_id, ClaimRow.held_at.is_not(None))
+        .exists(),
+    )
 
 
-def _refusal(row: TaskRow, roles: dict[str, Decimal | None]) -> str | None:
+def _refusal(row: TaskRow, roles: dict[str, Decimal | None], stream: str) -> str | None:
     if row.role not in roles:
         return "user does not hold the task's role"
     limit = roles[row.role]
     if row.authority_amount is not None and limit is not None and row.authority_amount > limit:
         return f"Rs {row.authority_amount:,.2f} is above the user's approval limit"
+    if row.system_of_medicine is not None and row.system_of_medicine != stream:
+        return f"the task is for the {row.system_of_medicine} system of medicine, not {stream}"
     return None
+
+
+async def _system_of_medicine(session: AsyncSession, claim_id: UUID) -> str:
+    """The treatment's system of medicine: the treating hospital's, else the default."""
+    found = await session.scalar(
+        select(HospitalRow.system_of_medicine)
+        .join(ClaimRow, ClaimRow.hospital_id == HospitalRow.rohini_id)
+        .where(ClaimRow.id == claim_id)
+    )
+    return found or DEFAULT_SYSTEM_OF_MEDICINE
 
 
 class DefaultTaskService:
@@ -153,6 +190,9 @@ class DefaultTaskService:
                 deadline=deadline,
                 status="open",
                 authority_amount=authority_amount,
+                system_of_medicine=await _system_of_medicine(session, claim_id)
+                if role is Role.MEDICAL_OFFICER
+                else None,
                 created_at=self._now(),
             )
             session.add(row)
@@ -164,7 +204,7 @@ class DefaultTaskService:
             rows = await session.scalars(
                 select(TaskRow)
                 .where(
-                    _allowed(roles),
+                    _allowed(roles, await _stream(session, user_id)),
                     or_(
                         TaskRow.status.in_(AVAILABLE),
                         and_(TaskRow.status == "taken", TaskRow.assignee == user_id),
@@ -180,7 +220,10 @@ class DefaultTaskService:
             roles = await _roles(session, user_id)
             row = await session.scalar(
                 select(TaskRow)
-                .where(_allowed(roles), TaskRow.status.in_(AVAILABLE))
+                .where(
+                    _allowed(roles, await _stream(session, user_id)),
+                    TaskRow.status.in_(AVAILABLE),
+                )
                 .order_by(TaskRow.deadline, TaskRow.created_at)
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -198,11 +241,14 @@ class DefaultTaskService:
                 raise TaskNotFound(str(task_id))
             if row.status == "done":
                 raise TaskAlreadyDone(str(task_id))
-            refusal = _refusal(row, await _roles(session, user_id))
+            refusal = _refusal(row, await _roles(session, user_id), await _stream(session, user_id))
             if refusal is not None:
                 raise TaskNotAllowed(refusal)
             if row.status == "taken" and row.assignee != user_id:
                 raise TaskNotAllowed("task is taken by another user")
+            claim = await session.get(ClaimRow, row.claim_id)
+            if claim is not None and claim.held_at is not None:
+                raise TaskNotAllowed("the claim is on hold; a supervisor resumes it")
             row.status, row.assignee, row.outcome = "done", user_id, outcome
             row.completed_at = self._now()
             task = _to_task(row)
@@ -217,10 +263,62 @@ class DefaultTaskService:
     async def get_task(self, *, task_id: UUID, user_id: UUID) -> Task | None:
         async with self._sessions() as session:
             row = await session.get(TaskRow, task_id)
-            if row is None or _refusal(row, await _roles(session, user_id)) is not None:
+            if row is None:
+                return None
+            roles, stream = await _roles(session, user_id), await _stream(session, user_id)
+            if _refusal(row, roles, stream) is not None:
                 return None
             [task] = await _with_briefs(session, [row])
             return task
+
+    async def eligible_assignees(self, *, task_id: UUID) -> list[Assignee]:
+        async with self._sessions() as session:
+            row = await session.get(TaskRow, task_id)
+            if row is None:
+                raise TaskNotFound(str(task_id))
+            users = await session.scalars(
+                select(UserRow)
+                .join(UserRoleRow, UserRoleRow.user_id == UserRow.id)
+                .where(UserRoleRow.role == row.role)
+                .order_by(UserRow.name)
+            )
+            found = []
+            for user in users:
+                roles = await _roles(session, user.id)
+                stream = user.system_of_medicine or DEFAULT_SYSTEM_OF_MEDICINE
+                if _refusal(row, roles, stream) is None:
+                    found.append(Assignee(user_id=user.id, name=user.name))
+            return found
+
+    async def reassign(self, *, task_id: UUID, to_user_id: UUID) -> Task:
+        async with self._sessions.begin() as session:
+            row = await session.get(TaskRow, task_id, with_for_update=True)
+            if row is None:
+                raise TaskNotFound(str(task_id))
+            if row.status == "done":
+                raise TaskAlreadyDone(str(task_id))
+            refusal = _refusal(
+                row, await _roles(session, to_user_id), await _stream(session, to_user_id)
+            )
+            if refusal is not None:
+                raise TaskNotAllowed(f"cannot reassign to that user: {refusal}")
+            row.status, row.assignee, row.taken_at = "taken", to_user_id, self._now()
+            [task] = await _with_briefs(session, [row])
+            return task
+
+    async def shift_deadlines(self, *, claim_id: UUID, seconds: int) -> None:
+        if seconds <= 0:
+            return
+        by = timedelta(seconds=seconds)
+        async with self._sessions.begin() as session:
+            claim = await session.get(ClaimRow, claim_id, with_for_update=True)
+            if claim is not None and claim.deadline is not None:
+                claim.deadline = claim.deadline + by
+            rows = await session.scalars(
+                select(TaskRow).where(TaskRow.claim_id == claim_id, TaskRow.status.in_(UNFINISHED))
+            )
+            for row in rows:
+                row.deadline = row.deadline + by
 
 
 class DefaultWorkflowSignaller:

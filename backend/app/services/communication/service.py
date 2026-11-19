@@ -11,7 +11,15 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import ClaimRow, LetterRow, QueryRow, SubmissionRow, UserRow, utcnow
+from app.database.models import (
+    ClaimRow,
+    LetterRow,
+    QueryRow,
+    ReconsiderationRow,
+    SubmissionRow,
+    UserRow,
+    utcnow,
+)
 from app.database.repositories.stage_records import StageRecordRepository, append_in_session
 from app.services.adjudication.contract import DraftDecision
 from app.services.bill_review.contract import DeductionSheet
@@ -28,6 +36,7 @@ from app.services.communication.contract import (
     Letter,
     LetterKind,
     NotReadyForLetter,
+    ReconsiderationNote,
 )
 from app.services.decision.contract import DecisionRecord
 from app.services.file_store.contract import FileStore
@@ -111,6 +120,9 @@ class DefaultCommunicationService:
             }
             if authorised["request_type"] == RequestType.DISCHARGE.value:
                 extra["amount"] = record.final_amount
+        note = await self._reconsideration(claim_id, record)
+        if note is not None:
+            extra["reconsideration"] = note
         letter = await self._letter(
             claim_id,
             kind=kind,
@@ -123,6 +135,32 @@ class DefaultCommunicationService:
             **extra,
         )
         return await self._store_and_send(letter)
+
+    async def _reconsideration(
+        self, claim_id: UUID, record: DecisionRecord
+    ) -> ReconsiderationNote | None:
+        """The reconsideration the decision answers: the claim's latest one asked before the
+        decision was made. None when the decision answers none."""
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(ReconsiderationRow)
+                .where(
+                    ReconsiderationRow.claim_id == claim_id,
+                    ReconsiderationRow.requested_at <= record.decided_at,
+                )
+                .order_by(ReconsiderationRow.number.desc())
+                .limit(1)
+            )
+        if row is None:
+            return None
+        payable = record.final_amount if record.final_decision in ("approve", "partial") else ZERO
+        return ReconsiderationNote(
+            number=row.number,
+            grounds=row.grounds,
+            previous_decision=row.previous_decision,
+            previously_paid=row.previously_paid,
+            paid_now=max(payable - row.previously_paid, ZERO),
+        )
 
     async def _authorisation(self, claim_id: UUID) -> dict[str, Any] | None:
         """The authorisation of the claim's current cashless request, if it has one."""

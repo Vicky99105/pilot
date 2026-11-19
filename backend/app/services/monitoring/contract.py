@@ -50,7 +50,12 @@ class Monitoring(Protocol):
         action: str,
         actor: str,
         detail: dict[str, Any] | None = None,
-    ) -> None: ...
+        moves_status: bool = True,
+    ) -> None:
+        """Append the event. With moves_status, the claim's status becomes the event's stage
+        (a closed claim stays closed). Events about the claim rather than a stage (a hold, a
+        paused clock, a reassignment) pass moves_status=False."""
+        ...
 
     async def claims_by_stage(self) -> list[ClaimStatusRow]: ...
 

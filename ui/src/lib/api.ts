@@ -69,6 +69,9 @@ export type RequestType =
 /** The requests a hospital sends on a claim its pre-auth opened. */
 export type LaterRequestType = 'enhancement' | 'discharge' | 'cancellation'
 
+/** The stream a medical officer reviews and a medical task belongs to. */
+export type SystemOfMedicine = 'allopathy' | 'ayush'
+
 export type User = {
   id: Uuid
   name: string
@@ -78,6 +81,7 @@ export type User = {
   hospital_id: string | null
   policy_number: string | null
   member_id: string | null
+  system_of_medicine: SystemOfMedicine | null
 }
 
 // --- Submit area ---------------------------------------------------------------------
@@ -200,6 +204,26 @@ export type OriginalsStatus = {
   received_by: Uuid | null
 }
 
+/** One reconsideration of a closed claim, as the claim detail lists it. */
+export type ReconsiderationView = {
+  number: number
+  grounds: string
+  requested_at: IsoDateTime
+  previous_decision: string | null
+  previous_amount: Money
+  previously_paid: Money
+}
+
+/** POST /api/claims/{id}/reconsideration returns this. */
+export type Reconsideration = ReconsiderationView & {
+  reconsideration_id: Uuid
+  claim_id: Uuid
+  submission_id: Uuid
+  workflow_id: string
+  requested_by: Uuid
+  previous_closed_at: IsoDateTime | null
+}
+
 export type ClaimDetail = ClaimSummary & {
   policy_number: string | null
   member_id: string | null
@@ -215,6 +239,10 @@ export type ClaimDetail = ClaimSummary & {
   authorisations: AuthorisationView[]
   originals_due_at: IsoDateTime | null
   originals_received_at: IsoDateTime | null
+  // Set while a supervisor holds the claim.
+  held_at: IsoDateTime | null
+  hold_reason: string | null
+  reconsiderations: ReconsiderationView[]
 }
 
 // --- Review area -----------------------------------------------------------------------
@@ -252,7 +280,10 @@ export type Task = {
   authority_amount: Money | null
   created_at: IsoDateTime | null
   claim: ClaimBrief | null
+  system_of_medicine: SystemOfMedicine | null // medical officer tasks only
 }
+
+export type Assignee = { user_id: Uuid; name: string }
 
 export type PageRef = { document_id: Uuid; page: number }
 
@@ -292,6 +323,83 @@ export type ClaimEvent = {
   detail: Record<string, unknown> | null
   created_at: IsoDateTime
 }
+
+// --- Supervision -----------------------------------------------------------------------
+
+export type QueueDepth = {
+  role: Role
+  unfinished: number // open, taken and escalated
+  taken: number
+  overdue: number
+  by_kind: Record<string, number>
+}
+
+export type NearBreach = {
+  task_id: Uuid
+  claim_id: Uuid
+  claim_number: string | null
+  kind: string
+  role: Role
+  deadline: IsoDateTime
+  minutes_left: number // negative once breached
+  assignee: string | null
+  held: boolean
+}
+
+export type UserActivity = {
+  user_id: Uuid
+  name: string
+  completed: number
+  decided: number
+  overridden: number
+  override_rate: number | null // 0..1
+}
+
+export type HeldClaim = {
+  claim_id: Uuid
+  claim_number: string | null
+  status: string
+  held_at: IsoDateTime
+  held_by: Uuid | null
+  reason: string
+}
+
+export type SupervisorOverview = {
+  generated_at: IsoDateTime
+  window_days: number
+  near_breach_minutes: number
+  queues: QueueDepth[]
+  near_breach: NearBreach[]
+  users: UserActivity[]
+  held_claims: HeldClaim[]
+}
+
+// --- Override log ------------------------------------------------------------------------
+
+export type OverrideKind =
+  | 'label_fix'
+  | 'field_fix'
+  | 'registration_override'
+  | 'deduction_edit'
+  | 'medical_overrule'
+  | 'decision_override'
+
+export type Override = {
+  override_id: Uuid
+  claim_id: Uuid
+  claim_number: string | null
+  stage: Stage | string
+  kind: OverrideKind | string
+  field: string | null
+  before: unknown
+  after: unknown
+  reason: string | null
+  actor: string
+  user_id: Uuid | null
+  created_at: IsoDateTime
+}
+
+export type OverrideFilter = { claim_id?: Uuid; user_id?: Uuid; limit?: number }
 
 // --- Transport ---------------------------------------------------------------------------
 
@@ -353,7 +461,9 @@ function json(body: unknown): RequestInit {
 /** A file part: its field name is the slot (a document type) or "merged". */
 export type UploadPart = { slot: DocType | 'merged'; file: File }
 
-function multipart(parts: UploadPart[], form?: SubmissionForm | { request_type: LaterRequestType }): FormData {
+type MultipartForm = SubmissionForm | { request_type: LaterRequestType } | { grounds: string }
+
+function multipart(parts: UploadPart[], form?: MultipartForm): FormData {
   const data = new FormData()
   if (form) data.append('form', JSON.stringify(form))
   for (const part of parts) data.append(part.slot, part.file, part.file.name)
@@ -384,13 +494,39 @@ export const api = {
   markOriginalsReceived: (claimId: Uuid) =>
     request<OriginalsStatus>(`/api/claims/${claimId}/originals-received`, { method: 'POST' }),
 
+  reconsider: (claimId: Uuid, grounds: string, parts: UploadPart[]) =>
+    request<Reconsideration>(`/api/claims/${claimId}/reconsideration`, {
+      method: 'POST',
+      body: multipart(parts, { grounds }),
+    }),
+
   queue: () => request<Task[]>('/api/tasks/queue'),
   takeNext: () => request<Task | null>('/api/tasks/next', { method: 'POST' }),
   task: (id: Uuid) => request<Task>(`/api/tasks/${id}`),
   complete: (id: Uuid, outcome: Record<string, unknown>) =>
     request<Task>(`/api/tasks/${id}/complete`, json({ outcome })),
 
+  assignees: (taskId: Uuid) => request<Assignee[]>(`/api/tasks/${taskId}/assignees`),
+  reassign: (taskId: Uuid, toUserId: Uuid, reason: string) =>
+    request<Task>(`/api/tasks/${taskId}/reassign`, json({ to_user_id: toUserId, reason })),
+
   monitoringClaims: () => request<ClaimStatusRow[]>('/api/monitoring/claims'),
+
+  supervisorOverview: (windowDays: number, nearBreachMinutes: number) =>
+    request<SupervisorOverview>(
+      `/api/supervisor/overview?window_days=${windowDays}&near_breach_minutes=${nearBreachMinutes}`,
+    ),
+  hold: (claimId: Uuid, reason: string) => request<HeldClaim>(`/api/claims/${claimId}/hold`, json({ reason })),
+  resume: (claimId: Uuid, reason: string) => request<null>(`/api/claims/${claimId}/resume`, json({ reason })),
+
+  overrides: (filter: OverrideFilter = {}) => {
+    const query = new URLSearchParams()
+    if (filter.claim_id) query.set('claim_id', filter.claim_id)
+    if (filter.user_id) query.set('user_id', filter.user_id)
+    if (filter.limit) query.set('limit', String(filter.limit))
+    const qs = query.toString()
+    return request<Override[]>(`/api/overrides${qs ? `?${qs}` : ''}`)
+  },
 }
 
 /** Files are permission checked by X-User-Id, so a plain link cannot fetch them. */

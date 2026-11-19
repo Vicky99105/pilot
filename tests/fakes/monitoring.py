@@ -15,6 +15,7 @@ class RecordedEvent:
     actor: str
     detail: dict[str, Any] | None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    moves_status: bool = True
 
 
 class FakeMonitoring:
@@ -32,8 +33,11 @@ class FakeMonitoring:
         action: str,
         actor: str,
         detail: dict[str, Any] | None = None,
+        moves_status: bool = True,
     ) -> None:
-        self.recorded.append(RecordedEvent(claim_id, stage, action, actor, detail))
+        self.recorded.append(
+            RecordedEvent(claim_id, stage, action, actor, detail, moves_status=moves_status)
+        )
 
     async def claims_by_stage(self) -> list[ClaimStatusRow]:
         return self.rows

@@ -76,6 +76,9 @@ class UserRow(Base):
     hospital_id: Mapped[str | None] = mapped_column(String(13))  # ROHINI ID
     policy_number: Mapped[str | None] = mapped_column(String(50))
     member_id: Mapped[str | None] = mapped_column(String(50))
+    # Medical officers: the system of medicine they review (allopathy or ayush). A medical
+    # officer with none set reviews allopathy.
+    system_of_medicine: Mapped[str | None] = mapped_column(String(20))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
@@ -192,6 +195,10 @@ class ClaimRow(Base):
     originals_due_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     originals_received_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     originals_received_by: Mapped[UUID | None] = mapped_column(Uuid)
+    # A supervisor's hold: set while held, cleared on resume. The events keep the history.
+    held_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+    held_by: Mapped[UUID | None] = mapped_column(Uuid)
+    hold_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class StageRecordRow(Base):
@@ -225,6 +232,26 @@ class QueryRow(Base):
     reply_submission_id: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("submissions.id"))
     raised_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     answered_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
+
+
+class ReconsiderationRow(Base):
+    """A claimant's request to decide a closed claim again, with what it was before."""
+
+    __tablename__ = "reconsiderations"
+    __table_args__ = (UniqueConstraint("claim_id", "number"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    claim_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("claims.id"), index=True)
+    number: Mapped[int] = mapped_column(Integer)
+    submission_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("submissions.id"))
+    workflow_id: Mapped[str] = mapped_column(String(100))
+    grounds: Mapped[str] = mapped_column(Text)
+    requested_by: Mapped[UUID] = mapped_column(Uuid, ForeignKey("users.id"))
+    requested_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+    previous_decision: Mapped[str | None] = mapped_column(String(20))
+    previous_amount: Mapped[Decimal] = mapped_column(Money)
+    previously_paid: Mapped[Decimal] = mapped_column(Money)
+    previous_closed_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
 
 class LetterRow(Base):
@@ -262,6 +289,8 @@ class TaskRow(Base):
     # Approver tasks: the amount the approver's limit must cover. None for other tasks.
     authority_amount: Mapped[Decimal | None] = mapped_column(Money)
     assignee: Mapped[UUID | None] = mapped_column(Uuid, ForeignKey("users.id"))
+    # Medical officer tasks: the treatment's system of medicine (allopathy or ayush).
+    system_of_medicine: Mapped[str | None] = mapped_column(String(20))
     outcome: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
     taken_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
@@ -280,6 +309,28 @@ class EventRow(Base):
     action: Mapped[str] = mapped_column(String(80))
     actor: Mapped[str] = mapped_column(String(100))
     detail: Mapped[dict[str, Any] | None] = mapped_column(JsonType)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class OverrideRow(Base):
+    """One change a person made to a machine suggestion. Append-only, like events."""
+
+    __tablename__ = "overrides"
+    __table_args__ = (
+        Index("ix_overrides_claim_time", "claim_id", "created_at"),
+        Index("ix_overrides_user_time", "user_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    claim_id: Mapped[UUID] = mapped_column(Uuid)
+    stage: Mapped[str] = mapped_column(String(40))
+    kind: Mapped[str] = mapped_column(String(40))
+    field: Mapped[str] = mapped_column(String(200))
+    before: Mapped[Any] = mapped_column(JsonType, nullable=True)
+    after: Mapped[Any] = mapped_column(JsonType, nullable=True)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    actor: Mapped[str] = mapped_column(String(100))
+    user_id: Mapped[UUID | None] = mapped_column(Uuid)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
@@ -703,6 +754,8 @@ class HospitalRow(Base):
     network: Mapped[bool] = mapped_column(Boolean, default=True)
     # False when the hospital charges the same rates whatever the room category.
     differential_billing: Mapped[bool] = mapped_column(Boolean, default=True)
+    # The system of medicine the hospital practises: allopathy or ayush (an AYUSH hospital).
+    system_of_medicine: Mapped[str] = mapped_column(String(20), default="allopathy")
     beds: Mapped[int | None] = mapped_column(Integer)
     registered_on: Mapped[date | None] = mapped_column(Date)
     source: Mapped[str] = mapped_column(String(60))

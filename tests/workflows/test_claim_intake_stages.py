@@ -36,6 +36,7 @@ from app.services.intake.contract import (
 from app.services.intake.service import DefaultIntakeService, DefaultWorkflowStarter
 from app.services.knowledge_base.service import DefaultKnowledgeBase
 from app.services.medical_review.contract import MedicalCoding
+from app.services.overrides.service import DefaultOverrideLog
 from app.services.page_prep.service import DefaultPagePreparer
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.service import DefaultRulesEngine
@@ -213,7 +214,7 @@ async def test_a_low_confidence_field_opens_fix_fields_and_resumes_after_it(
         assert (flagged["value"], flagged["confidence"]) == ("Asha Varma", 0.6)
         assert h.tasks.unfinished("confirm_registration") == []
 
-        task_id = await h.complete(
+        await h.complete(
             "fix_fields", {"action": "confirm", "fields": {"identity.patient_name": "Asha Verma"}}
         )
         await h.wait_for(
@@ -223,7 +224,7 @@ async def test_a_low_confidence_field_opens_fix_fields_and_resumes_after_it(
         history = await StageRecordRepository(sessions).history(
             submission.claim_id, Stage.DIGITISATION
         )
-        assert [r.created_by for r in history] == ["model", f"task:{task_id}"]
+        assert [r.created_by for r in history] == ["model", f"user:{MEMBER_USER_ID}"]
         assert history[-1].payload["low_confidence_fields"] == []
         assert history[-1].payload["identity"]["patient_name"]["value"] == "Asha Verma"
         assert "fix_labels" not in [
@@ -343,7 +344,7 @@ async def test_registration_and_bill_review_open_their_checkpoints_with_the_reco
         assert registration.role.value == "claims_operator"
         assert registration.payload["claim_number"].startswith("CLM-")
         assert [r["rule_id"] for r in registration.payload["rule_results"]] == [
-            "R3", "R1", "R2", "R5", "R10",
+            "R3", "R1", "R2", "R4", "R5", "R8", "R10", "R25",
         ]  # fmt: skip
         assert registration.payload["block_ref"] is not None
         assert h.tasks.unfinished("confirm_deductions") == []
@@ -376,7 +377,15 @@ async def test_a_person_edit_at_confirm_deductions_is_a_new_version_by_a_person(
         history = await StageRecordRepository(sessions).history(
             submission.claim_id, Stage.BILL_REVIEW
         )
-        assert [r.created_by for r in history] == ["code", f"task:{task_id}"]
+        assert [r.created_by for r in history] == ["code", f"user:{MEMBER_USER_ID}"]
+        # The person who made the edit is on the override log, with the task's reason.
+        [logged] = await DefaultOverrideLog(sessions).list(claim_id=submission.claim_id)
+        assert (logged.user_id, logged.field, logged.reason) == (
+            MEMBER_USER_ID,
+            "line 4 admissible",
+            "Stool culture not advised",
+        )
+        assert task_id
         line = next(ln for ln in history[-1].payload["lines"] if ln["line_id"] == 4)
         assert (line["judged_by"], line["admissible"]) == ("person", "20000.00")
         assert history[-1].payload["payable"] == "43937.50"
@@ -413,14 +422,14 @@ async def test_a_registration_override_is_stored_and_a_bad_one_reopens_the_task(
         assert "not on the policy" in again.payload["correction_error"]
 
         overrides = {"rules": {"R5": "Ported from another insurer; wait already served"}}
-        task_id = await h.complete("confirm_registration", {"overrides": overrides})
+        await h.complete("confirm_registration", {"overrides": overrides})
         await h.wait_for(
             lambda: bool(h.tasks.unfinished("confirm_deductions")), "deductions checkpoint"
         )
         history = await StageRecordRepository(sessions).history(
             submission.claim_id, Stage.REGISTRATION
         )
-        assert [r.created_by for r in history] == ["code", f"task:{task_id}"]
+        assert [r.created_by for r in history] == ["code", f"user:{MEMBER_USER_ID}"]
         r5 = next(r for r in history[-1].payload["rule_results"] if r["rule_id"] == "R5")
         assert r5["judged_by"] == "person"
         await env.client.get_workflow_handle(str(submission.claim_id)).terminate()

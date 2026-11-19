@@ -20,13 +20,13 @@ async def _count(sessions: async_sessionmaker[AsyncSession], model: type) -> int
         return int(await session.scalar(select(func.count()).select_from(model)) or 0)
 
 
-async def test_seed_is_idempotent_and_creates_six_users_and_five_hospitals(
+async def test_seed_is_idempotent_and_creates_eight_users_and_five_hospitals(
     sessions: async_sessionmaker[AsyncSession],
 ) -> None:
     await seed_claims_db(sessions)
     await seed_claims_db(sessions)
 
-    assert await _count(sessions, UserRow) == 6
+    assert await _count(sessions, UserRow) == 8  # P2-6: the supervisor and an AYUSH doctor
     assert await _count(sessions, HospitalRow) == 5
     # Reimbursement 11 (with the FIR or MLC, P2-1); pre-auth 3, enhancement 3, discharge 5.
     assert await _count(sessions, DocumentChecklistRow) == 22

@@ -12,6 +12,7 @@ from app.database.models import (
     LetterRow,
     PageRow,
     QueryRow,
+    ReconsiderationRow,
     SubmissionRow,
 )
 from app.database.repositories.stage_records import StageRecordRepository
@@ -25,6 +26,7 @@ from app.services.claims.contract import (
     ClaimSummary,
     LetterView,
     OpenQueryView,
+    ReconsiderationView,
     StoredFile,
     SubmissionView,
     SubmittedFileView,
@@ -91,6 +93,13 @@ class DefaultClaimQueryService:
                 .order_by(QueryRow.raised_at.desc())
                 .limit(1)
             )
+            reconsiderations = list(
+                await session.scalars(
+                    select(ReconsiderationRow)
+                    .where(ReconsiderationRow.claim_id == claim_id)
+                    .order_by(ReconsiderationRow.number)
+                )
+            )
         first = next((s for s in submissions if s.id == claim.submission_id), None)
         authorised = await StageRecordRepository(self._sessions).history(
             claim_id, Stage.AUTHORISATION
@@ -108,6 +117,19 @@ class DefaultClaimQueryService:
             ],
             originals_due_at=claim.originals_due_at,
             originals_received_at=claim.originals_received_at,
+            held_at=claim.held_at,
+            hold_reason=claim.hold_reason,
+            reconsiderations=[
+                ReconsiderationView(
+                    number=r.number,
+                    grounds=r.grounds,
+                    requested_at=r.requested_at,
+                    previous_decision=r.previous_decision,
+                    previous_amount=r.previous_amount,
+                    previously_paid=r.previously_paid,
+                )
+                for r in reconsiderations
+            ],
             **_summary(claim, first).model_dump(),
             policy_number=claim.policy_number,
             member_id=claim.member_id,

@@ -1,6 +1,6 @@
 import type { User } from '../../lib/api'
 import { href } from '../../lib/router'
-import { isStaff, SEEDED_USERS } from '../../lib/users'
+import { isStaff, isSupervisor, SEEDED_USERS } from '../../lib/users'
 
 export function TopBar({
   userId,
@@ -19,7 +19,9 @@ export function TopBar({
     : staff
       ? [
           { to: '/review', label: 'Review' },
+          ...(isSupervisor(user) ? [{ to: '/supervisor', label: 'Supervisor' }] : []),
           { to: '/monitoring', label: 'Monitoring' },
+          { to: '/overrides', label: 'Overrides' },
         ]
       : user.kind === 'hospital'
         ? [
@@ -39,7 +41,8 @@ export function TopBar({
         </a>
         <nav aria-label="Main" className="flex flex-1 gap-1">
           {links.map((l) => {
-            const active = path === l.to || (l.to !== '/submit' && path.startsWith(`${l.to}/`))
+            const bare = path.split('?')[0]
+            const active = bare === l.to || (l.to !== '/submit' && bare.startsWith(`${l.to}/`))
             return (
               <a
                 key={l.to}

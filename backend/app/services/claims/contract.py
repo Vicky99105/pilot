@@ -71,6 +71,15 @@ class AuthorisationView(BaseModel):
     authorised_at: datetime
 
 
+class ReconsiderationView(BaseModel):
+    number: int
+    grounds: str
+    requested_at: datetime
+    previous_decision: str | None
+    previous_amount: Decimal
+    previously_paid: Decimal
+
+
 class ChecklistItem(BaseModel):
     doc_type: DocType
     required: bool
@@ -94,6 +103,10 @@ class ClaimDetail(ClaimSummary):
     authorisations: list[AuthorisationView] = []
     originals_due_at: datetime | None = None
     originals_received_at: datetime | None = None
+    # A supervisor's hold, while it lasts; and the claimant's reconsiderations, oldest first.
+    held_at: datetime | None = None
+    hold_reason: str | None = None
+    reconsiderations: list[ReconsiderationView] = []
 
 
 class ClaimPage(BaseModel):

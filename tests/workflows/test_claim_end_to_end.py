@@ -5,7 +5,7 @@ core policy and money services, and a fake notification sender. The claim is a m
 reimbursement for a laparoscopic appendicectomy at Sunrise (CGHS NABH, X tier) with a missing
 payment receipt. Medical coding builds 0DTJ4ZZ; bill review maps it to package AG095,
 which does not cap a reimbursement under this wording, so the room cap and the
-proportionate deduction apply (R13); the full medical review reads the SG017B guideline; a
+proportionate deduction apply (R13, R15); the full medical review reads the SG017B guideline; a
 query is raised and answered by a reply upload, which re-runs coding and bill review; the
 partial is approved and upheld by the CRC, a letter is issued, finance releases
 the payment, and the claim closes.
@@ -102,6 +102,7 @@ BILL: dict[str, Any] = {
 CLAIMED = "42250"
 PART_A_REPLY = {
     **copy.deepcopy(PART_A),
+    "date_of_birth": v("1984-06-12"),  # the insured member's, so no identity flag (RF10)
     "claimed_hospital_expenses": v(CLAIMED),
     "claimed_total": v("42,250.00"),
 }
@@ -152,7 +153,7 @@ PARTIAL_DRAFT = {
         {"text": "Room above the Rs 5,000 a day cap", "clause_ref": "ROOM-CAP", "rule_id": "R13",
          "line_id": 1},
         {"text": "Reduced in proportion to the room cap", "clause_ref": "PROP-DED",
-         "rule_id": "R13", "line_id": 2},
+         "rule_id": "R15", "line_id": 2},
     ],
     "summary": "Room cap with proportionate deduction.",
 }  # fmt: skip
@@ -352,7 +353,7 @@ async def test_the_tracer_claim_runs_from_intake_to_closed(harness: Harness) -> 
     sheet = await h.records.latest(claim_id, Stage.BILL_REVIEW)
     assert sheet is not None
     assert [p["package_code"] for p in sheet.payload["package"]["packages"]] == ["AG095"]
-    assert [ln["rule_id"] for ln in sheet.payload["lines"]] == ["R13", "R13", None, None]
+    assert [ln["rule_id"] for ln in sheet.payload["lines"]] == ["R13", "R15", None, None]
     assert not any(ln["in_package"] for ln in sheet.payload["lines"])
     assert sheet.payload["admissible_total"] == "38250.00"
     assert sheet.payload["payable"] == str(PAYABLE)

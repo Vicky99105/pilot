@@ -27,9 +27,10 @@ async def add_user(
     name: str,
     roles: list[Role],
     max_amount: Decimal | None = None,
+    system_of_medicine: str | None = None,
 ) -> UUID:
     """max_amount is the limit on the user's APPROVER role, if they hold it."""
-    user = UserRow(id=uuid4(), name=name, kind="staff")
+    user = UserRow(id=uuid4(), name=name, kind="staff", system_of_medicine=system_of_medicine)
     async with sessions.begin() as session:
         session.add(user)
         await session.flush()

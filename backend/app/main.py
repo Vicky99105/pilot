@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 from app.api.routes import health
 from app.api.routes import monitoring as monitoring_routes
+from app.api.routes import review as review_routes
 from app.api.routes import submissions as submission_routes
 from app.api.routes import tasks as task_routes
 from app.api.routes import users as user_routes
@@ -47,13 +48,19 @@ from app.services.monitoring.contract import Monitoring
 from app.services.monitoring.service import DefaultMonitoring
 from app.services.notification.contract import NotificationService
 from app.services.notification.service import build_notification_service
+from app.services.overrides.contract import OverrideLog
+from app.services.overrides.service import DefaultOverrideLog
 from app.services.page_prep.service import DefaultPagePreparer
 from app.services.query.contract import QueryService
 from app.services.query.service import DefaultQueryService
+from app.services.reconsideration.contract import ReconsiderationService
+from app.services.reconsideration.service import DefaultReconsiderationService
 from app.services.registration.service import DefaultRegistrationService
 from app.services.risk.service import DefaultRiskService
 from app.services.rules.service import DefaultRulesEngine
 from app.services.settlement.service import DefaultSettlementService
+from app.services.supervision.contract import SupervisionService
+from app.services.supervision.service import DefaultClaimSignaller, DefaultSupervisionService
 from app.services.tasks.contract import TaskService
 from app.services.tasks.service import DefaultTaskService, DefaultWorkflowSignaller
 from app.services.users.contract import UserService
@@ -78,6 +85,9 @@ def create_app(
     query_service: QueryService | None = None,
     notification_service: NotificationService | None = None,
     cashless_service: CashlessService | None = None,
+    supervision_service: SupervisionService | None = None,
+    override_log: OverrideLog | None = None,
+    reconsideration_service: ReconsiderationService | None = None,
 ) -> FastAPI:
     """Services passed in (tests) are used as given; the rest are built in the lifespan."""
     settings = settings or Settings()
@@ -113,6 +123,19 @@ def create_app(
             )
         if app.state.claim_queries is None:
             app.state.claim_queries = DefaultClaimQueryService(sessions)
+        if app.state.supervision_service is None:
+            app.state.supervision_service = DefaultSupervisionService(
+                sessions,
+                app.state.task_service,
+                app.state.monitoring,
+                DefaultClaimSignaller(settings),
+            )
+        if app.state.override_log is None:
+            app.state.override_log = DefaultOverrideLog(sessions)
+        if app.state.reconsideration_service is None:
+            app.state.reconsideration_service = DefaultReconsiderationService(
+                sessions, app.state.intake_service, app.state.monitoring
+            )
         gateway = model_gateway or build_model_gateway(
             config_path=settings.config_dir / "models.yaml", file_store=files, sessions=sessions
         )
@@ -144,7 +167,7 @@ def create_app(
             medical_review=DefaultMedicalReviewService(
                 sessions, gateway, kb, rules, policies, files
             ),
-            risk=DefaultRiskService(sessions, gateway, policies),
+            risk=DefaultRiskService(sessions, gateway, policies, kb=kb),
             adjudication=DefaultAdjudicationService(sessions, gateway, kb),
             decision=DefaultDecisionService(
                 sessions, settings.config_dir / "authority_matrix.yaml"
@@ -177,12 +200,16 @@ def create_app(
     app.state.permission_service = permission_service
     app.state.query_service = query_service
     app.state.cashless_service = cashless_service
+    app.state.supervision_service = supervision_service
+    app.state.override_log = override_log
+    app.state.reconsideration_service = reconsideration_service
     app.state.mock_core_admin_enabled = settings.mock_core_admin_enabled
     app.include_router(health.router)
     app.include_router(task_routes.router)
     app.include_router(monitoring_routes.router)
     app.include_router(submission_routes.router)
     app.include_router(user_routes.router)
+    app.include_router(review_routes.router)
     app.include_router(mock_core_router, prefix="/mock-core")
 
     # Mounted last so API routes take precedence over static files.

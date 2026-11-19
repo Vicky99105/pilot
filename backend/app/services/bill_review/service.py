@@ -11,8 +11,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models import ClaimRow, NonPayableItemRow
+from app.database.repositories.overrides import OverrideRepository
 from app.database.repositories.stage_records import StageRecordRepository
-from app.services.bill_review._helpers import ZERO, claim_route, map_head, money
+from app.services.bill_review._helpers import ZERO, map_head, money
 from app.services.bill_review._prompts import (
     NON_PAYABLE_PURPOSE,
     PACKAGE_PURPOSE,
@@ -47,9 +48,11 @@ from app.services.knowledge_base.contract import (
 )
 from app.services.medical_review.contract import MedicalCoding
 from app.services.model_gateway.contract import ModelGateway, ModelRole
+from app.services.overrides.contract import OverrideEntry
 from app.services.registration.contract import RegistrationResult
 from app.services.rules.contract import (
     ClaimRoute,
+    DeductionCitation,
     DrugFacts,
     Facts,
     Head,
@@ -64,6 +67,7 @@ from app.services.rules.contract import (
     RulesEngine,
 )
 from app.shared.codes import code_in_ranges
+from app.shared.routes import claim_route
 from app.shared.types import RequestType, RuleResult, Stage
 
 ONE_DAY = Decimal("1")
@@ -192,7 +196,7 @@ class DefaultBillReviewService:
             )
             review.spread("R20", priced, facts)
 
-        # 3. Per line outside the package: R24, R13, R14.
+        # 3. Per line outside the package: R24, R13, R14, R15.
         discount = agreement.non_package_discount_percent if agreement else None
         for line in review.payable():
             review.apply(
@@ -211,7 +215,7 @@ class DefaultBillReviewService:
             differential_billing=registration.hospital.differential_billing,
         )
         for line in review.payable():
-            for rule_id in ("R13", "R14"):
+            for rule_id in ("R13", "R14", "R15"):
                 review.apply(
                     rule_id,
                     line,
@@ -249,13 +253,9 @@ class DefaultBillReviewService:
             review.results,
             self._rules,
         ).model_copy(
-            update={
-                "coding_version": coded.version,
-                "agreement": agreement,
-                "package": mapping,
-                "findings": review.findings,
-            }
+            update={"coding_version": coded.version, "agreement": agreement, "package": mapping}
         )
+        sheet.findings = _with_r22_finding(review.findings, sheet)
         created_by = "model" if review.model_used else "code"
         await self._records.append(
             claim_id, Stage.BILL_REVIEW, sheet.model_dump(mode="json"), created_by=created_by
@@ -270,6 +270,7 @@ class DefaultBillReviewService:
             raise InvalidEdit(f"claim {claim_id} has no deduction sheet to edit")
         current = DeductionSheet.model_validate(copy.deepcopy(latest.payload))
         found = {ln.line_id: ln for ln in current.lines}
+        entries = []
         for edit in edits:
             line = found.get(edit.line_id)
             reason = edit.reason.strip()
@@ -282,11 +283,23 @@ class DefaultBillReviewService:
                     f"line {edit.line_id}: admissible {edit.admissible} is outside "
                     f"0 to {line.claimed}"
                 )
+            entries.append(
+                OverrideEntry(
+                    claim_id=claim_id,
+                    stage=Stage.BILL_REVIEW,
+                    kind="deduction_edit",
+                    field=f"line {line.line_id} admissible",
+                    before=str(line.admissible),
+                    after=str(money(edit.admissible)),
+                    reason=reason,
+                    actor=actor,
+                )
+            )
             line.admissible = edit.admissible
             line.deducted = money(line.claimed - edit.admissible)
             line.reason, line.judged_by = reason, "person"
         product = self._rules.product(current.product_uin)
-        line_results = [r for r in current.rule_results if r.rule_id != "R21"]
+        line_results = [r for r in current.rule_results if r.rule_id not in SHEET_RULES]
         sheet = _sheet(
             claim_id,
             current.digitisation_version,
@@ -300,12 +313,13 @@ class DefaultBillReviewService:
                 "coding_version": current.coding_version,
                 "agreement": current.agreement,
                 "package": current.package,
-                "findings": current.findings,
             }
         )
+        sheet.findings = _with_r22_finding(current.findings, sheet)
         await self._records.append(
             claim_id, Stage.BILL_REVIEW, sheet.model_dump(mode="json"), created_by=actor
         )
+        await OverrideRepository(self._sessions).append(entries)
         return sheet
 
     async def _approved(self, claim_id: UUID) -> PreAuthFacts | None:
@@ -543,6 +557,10 @@ class DefaultBillReviewService:
             ]
 
 
+# Rules on the whole sheet, computed again whenever the lines change.
+SHEET_RULES = ("R21", "R22")
+
+
 class _Review:
     """The lines under review, the rule results so far and the findings."""
 
@@ -732,6 +750,43 @@ def _deduct(line: DeductionLine, result: RuleResult, amount: Decimal) -> None:
     line.judged_by = main.judged_by
 
 
+def _citations(lines: list[DeductionLine]) -> list[DeductionCitation]:
+    """R22: every amount taken off a line. A line a person set is one amount, citing the
+    clause the line kept."""
+    found = []
+    for ln in lines:
+        if ln.judged_by == "person":
+            if ln.deducted > 0:
+                found.append(
+                    DeductionCitation(
+                        line_id=ln.line_id,
+                        rule_id=None,
+                        amount=ln.deducted,
+                        clause_ref=ln.clause_ref,
+                        judged_by="person",
+                    )
+                )
+            continue
+        found += [
+            DeductionCitation(
+                line_id=ln.line_id,
+                rule_id=d.rule_id,
+                amount=d.amount,
+                clause_ref=d.clause_ref,
+                judged_by=d.judged_by,
+            )
+            for d in ln.deductions
+        ]
+    return found
+
+
+def _with_r22_finding(findings: list[BillFinding], sheet: DeductionSheet) -> list[BillFinding]:
+    """The findings, with R22's when it failed: a deduction a letter could not explain."""
+    kept = [f for f in findings if f.kind != "uncited_deduction"]
+    failed = [r for r in sheet.rule_results if r.rule_id == "R22" and not r.passed]
+    return kept + [BillFinding(kind="uncited_deduction", text=r.reason) for r in failed]
+
+
 def _sheet(
     claim_id: UUID,
     digitisation_version: int,
@@ -741,9 +796,10 @@ def _sheet(
     line_results: list[RuleResult],
     rules: RulesEngine,
 ) -> DeductionSheet:
-    """Totals, then the co-pay last, on the admissible total."""
+    """Totals, then the co-pay last, on the admissible total, then R22 on the deductions."""
     admissible = money(sum((ln.admissible for ln in lines), ZERO))
     [r21] = rules.evaluate(["R21"], Facts(admissible_total=admissible), product)
+    [r22] = rules.evaluate(["R22"], Facts(deductions=_citations(lines)), product)
     co_pay = money(-r21.amount_effect)
     return DeductionSheet(
         claim_id=claim_id,
@@ -751,7 +807,7 @@ def _sheet(
         registration_version=registration_version,
         product_uin=product.product_uin,
         lines=lines,
-        rule_results=[*line_results, r21],
+        rule_results=[*line_results, r21, r22],
         claimed_total=money(sum((ln.claimed for ln in lines), ZERO)),
         admissible_total=admissible,
         co_pay=co_pay,
