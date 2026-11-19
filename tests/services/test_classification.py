@@ -174,3 +174,52 @@ async def test_apply_labels_refuses_an_unknown_page(env: Env) -> None:
 
     with pytest.raises(UnknownPage):
         await service.apply_labels(submission.claim_id, {UUID(int=1): B}, actor="user:ops")
+
+
+# A merged upload has no slots, so intake cannot list missing documents; classification does.
+P, C, R = DocType.CLAIM_FORM_PART_B, DocType.CANCELLED_CHEQUE, DocType.PAYMENT_RECEIPT
+BUNDLE = [label(A, 0.95), label(P, 0.95), label(D, 0.95), label(B, 0.95), label(C, 0.95)]
+
+
+async def _intake_missing(env: Env, submission: Submission) -> tuple[list[str], list[DocType]]:
+    """The missing documents on the intake stage record and on the stored submission."""
+    record = await StageRecordRepository(env.sessions).latest(submission.claim_id, Stage.INTAKE)
+    stored = await env.intake.get(submission.submission_id)
+    assert record is not None and stored is not None
+    return record.payload["missing_documents"], stored.missing_documents
+
+
+async def test_a_merged_upload_records_its_missing_documents_after_classification(
+    env: Env,
+) -> None:
+    submission = await env.submit((None, ["PART A", "PART B", "SUMMARY", "BILL", "CHEQUE"]))
+    assert submission.missing_documents == []  # intake cannot tell without slots
+
+    await env.service(BUNDLE).classify(submission.submission_id)
+
+    assert await _intake_missing(env, submission) == (["payment_receipt"], [R])
+
+
+async def test_relabelling_a_merged_upload_updates_its_missing_documents(env: Env) -> None:
+    submission = await env.submit((None, ["PART A", "PART B", "SUMMARY", "BILL", "CHEQUE"]))
+    service = env.service(BUNDLE)
+    before = await service.classify(submission.submission_id)
+
+    await service.apply_labels(submission.claim_id, {before.pages[4].page_id: R}, actor="user:ops")
+
+    assert await _intake_missing(env, submission) == (["cancelled_cheque"], [C])
+
+
+async def test_slotted_uploads_keep_the_missing_documents_intake_found(env: Env) -> None:
+    submission = await env.submit((A, ["PART A"]), (P, ["PART B"]), (D, ["SUMMARY"]),
+                                  (B, ["BILL"]), (C, ["CHEQUE"]))  # fmt: skip
+    assert submission.missing_documents == [R]
+    history_before = await StageRecordRepository(env.sessions).history(
+        submission.claim_id, Stage.INTAKE
+    )
+
+    await env.service(BUNDLE).classify(submission.submission_id)
+
+    assert await _intake_missing(env, submission) == (["payment_receipt"], [R])
+    history = await StageRecordRepository(env.sessions).history(submission.claim_id, Stage.INTAKE)
+    assert len(history) == len(history_before)  # nothing new written

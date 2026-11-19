@@ -25,6 +25,7 @@ from app.config import Settings
 from app.database.models import ClaimRow
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
+from app.integrations.core.contract import MemberPolicy
 from app.services.adjudication.service import DefaultAdjudicationService
 from app.services.bill_review.service import DefaultBillReviewService
 from app.services.classification.service import DefaultClassificationService
@@ -186,12 +187,17 @@ def _gateway() -> Gateway:
 
 class Harness:
     def __init__(
-        self, env: WorkflowEnvironment, sessions: async_sessionmaker[AsyncSession]
+        self,
+        env: WorkflowEnvironment,
+        sessions: async_sessionmaker[AsyncSession],
+        *,
+        gateway: Gateway | None = None,
+        policy: MemberPolicy | None = None,
     ) -> None:
         self.env = env
         self.sessions = sessions
         self.files = FakeFileStore()
-        self.gateway = _gateway()
+        self.gateway = gateway or _gateway()
         self.money = FakeMoneyService()
         self.notifications = FakeNotificationService()
         self.tasks = FakeTaskService()
@@ -204,7 +210,7 @@ class Harness:
         config = Settings().config_dir
         rules = DefaultRulesEngine(config / "products")
         kb = DefaultKnowledgeBase(sessions)
-        policies = FakePolicyService([asha_policy()])
+        policies = FakePolicyService([policy or asha_policy()])
         communication = DefaultCommunicationService(
             sessions, self.files, self.gateway, self.notifications
         )

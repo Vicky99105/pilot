@@ -61,7 +61,10 @@ class UnknownPage(PermanentError):
 
 
 class ClassificationService(Protocol):
-    async def classify(self, submission_id: UUID) -> DocumentSet: ...
+    async def classify(self, submission_id: UUID) -> DocumentSet:
+        """For the claim's own submission with a merged file, the documents found missing
+        are also stored on the submission and as a new intake record version."""
+        ...
 
     async def apply_labels(
         self, claim_id: UUID, labels: dict[UUID, DocType], *, actor: str

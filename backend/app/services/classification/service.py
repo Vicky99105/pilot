@@ -4,9 +4,17 @@ import asyncio
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import ClaimRow, DocumentRow, PageRow, SubmissionRow
+from app.database.models import (
+    ClaimRow,
+    DocumentRow,
+    FileRow,
+    PageRow,
+    StageRecordRow,
+    SubmissionRow,
+)
 from app.database.repositories.document_checklists import checklist
 from app.database.repositories.stage_records import StageRecordRepository, append_in_session
 from app.services.classification import prompts
@@ -158,7 +166,45 @@ class DefaultClassificationService:
                 doc_set.model_dump(mode="json"),
                 created_by=created_by,
             )
+            await self._record_missing(session, doc_set, created_by=created_by)
         return doc_set
+
+    @staticmethod
+    async def _record_missing(
+        session: AsyncSession, doc_set: DocumentSet, *, created_by: str
+    ) -> None:
+        """For the claim's own submission with a merged file, intake could not list the
+        missing documents; the classified pages do. Record them on the submission and as a
+        new intake version, so the query and adjudication stages see them. Slotted uploads
+        and follow-ups keep what intake found."""
+        claim = await session.get(ClaimRow, doc_set.claim_id)
+        submission = await session.get(SubmissionRow, doc_set.submission_id)
+        assert claim is not None and submission is not None
+        merged = await session.scalar(
+            select(FileRow.id)
+            .where(FileRow.submission_id == submission.id, FileRow.slot_hint.is_(None))
+            .limit(1)
+        )
+        if claim.submission_id != submission.id or merged is None:
+            return
+        missing = [m.doc_type.value for m in doc_set.mismatches if m.kind == "missing"]
+        if missing == submission.missing_documents:
+            return
+        submission.missing_documents = missing
+        intake = await session.scalar(
+            select(StageRecordRow)
+            .where(StageRecordRow.claim_id == claim.id, StageRecordRow.stage == Stage.INTAKE.value)
+            .order_by(StageRecordRow.version.desc())
+            .limit(1)
+        )
+        if intake is not None:
+            await append_in_session(
+                session,
+                claim.id,
+                Stage.INTAKE,
+                {**intake.payload, "missing_documents": missing},
+                created_by=created_by,
+            )
 
     @staticmethod
     async def _checklist(

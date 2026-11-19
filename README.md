@@ -3,13 +3,14 @@
 Agentic health-claims processing pilot. Temporal runs the claim lifecycle; one
 FastAPI process serves the API and the React UI and runs the Temporal worker.
 
-Current state: Phase 1 (tracer bullet), backend slices 1 to 5. One reimbursement claim
+Current state: Phase 1 (tracer bullet), slices 1 to 7. One reimbursement claim
 runs through all 13 stages with real services: intake, classification, digitisation,
 registration, bill review, medical review, risk, adjudication, decision (approver bands
 and CRC), communication (letter PDFs), the query loop, settlement and monitoring. People
 decide at checkpoints in the Review area task queues. Core systems (policy, money,
 permissions) are mocked behind contracts, and letters are recorded, not emailed (shadow
-mode). The Phase 1 UI (slice 6) and the seeded acceptance claim (slice 7) come next.
+mode). The Phase 1 UI (slice 6) has the Submit and Review areas. Slice 7 adds the seeded
+acceptance claim and a live end-to-end run against OpenRouter.
 Contracts and slices: `docs/plans/2026-11-19-phase-1-tracer.md`.
 
 ## Layout
@@ -25,7 +26,8 @@ backend/            Python (uv). FastAPI app, Temporal worker, Alembic.
 config/             Model roles, product rules config, authority matrix
 ui/                 React + Vite + TypeScript + Tailwind
 tests/              All backend tests (run against contracts, with fakes)
-deploy/             Dockerfile, docker-compose.yml, Caddyfile, Postgres init
+deploy/             Dockerfile, docker-compose.yml (+ .local.yml), Caddyfile, Postgres init
+tools/              Mock claim generator and the live acceptance runner
 .github/workflows/  CI: lint, types, tests, UI build, full-stack health check
 ```
 
@@ -74,5 +76,42 @@ Letters are never emailed by default. Microsoft Graph sending is off unless
 - On the server, pass real values: copy `.env.example` to `.env`, fill it in, and
   add `--env-file .env` to each `docker compose` command.
 
-For UI development, run the backend on port 8000 and `npm --prefix ui run dev`.
-The Vite dev server proxies `/health` to it.
+### Local access on port 8000
+
+`deploy/docker-compose.local.yml` is a local-only override that also publishes the app on
+`127.0.0.1:8000`, so host tools reach it over plain HTTP without Caddy's self-signed
+certificate. Production compose is unchanged; never use the override on the server.
+
+```bash
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.local.yml up -d --build
+curl http://127.0.0.1:8000/health
+```
+
+For UI development, start the stack with the override and run `npm --prefix ui run dev`.
+The Vite dev server proxies `/health` to port 8000.
+
+## Tracer acceptance claim
+
+`tools/mockgen/tracer_claim.py` writes the acceptance bundle: a reimbursement claim for the
+seeded member Asha Verma at Sunrise Multispeciality Hospital (acute appendicitis, 4 days,
+a deluxe room above the room cap, one non-payable item), as one PDF per document, one
+merged PDF and `ground_truth.json`. The payment receipt is left out of the bundle and
+written separately as the query reply. Expected deductions come from the real rules engine.
+
+```bash
+uv run --project backend python tools/mockgen/tracer_claim.py --out .local/tracer
+```
+
+`tools/acceptance/run_tracer.py` runs the claim live through the stack on port 8000 (start it
+with the override above, with `OPENROUTER_API_KEY` set, then migrate and seed). It submits
+the merged PDF as the member, completes every checkpoint as ops, doctor and finance through
+the API, answers the query with the receipt, and scores the run against the ground truth.
+Each run picks an admission date that overlaps no earlier claim, so it can be re-run.
+
+```bash
+uv run --project backend python tools/acceptance/run_tracer.py --out .local/acceptance
+```
+
+The report (`report.md` and `report.json` in the run folder) covers page labels, field
+extraction, bill lines, rules and deductions, ICD codes, the drafts, letters, events, model
+calls, tokens, cost and the time each stage took.
