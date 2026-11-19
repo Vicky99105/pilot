@@ -8,11 +8,15 @@ from decimal import Decimal
 from typing import Literal, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.shared.types import DocType, RequestType
 
 Channel = Literal["member", "hospital"]
+
+ClaimCategory = Literal["inpatient", "day_care", "pre_post_hospitalisation"]
+Cause = Literal["illness", "injury", "maternity"]
+IFSC_PATTERN = r"^[A-Z]{4}0[A-Z0-9]{6}$"
 
 MB = 1024 * 1024
 MAX_FILE_BYTES: dict[Channel, int] = {"hospital": 15 * MB, "member": 10 * MB}
@@ -29,6 +33,13 @@ class ClaimForm(BaseModel):
     admission_date: date
     discharge_date: date | None = None
     claimed_amount: Decimal
+    # Member form extras. Optional so hospital requests and older submissions still parse.
+    hospital_city: str | None = None
+    claim_category: ClaimCategory | None = None
+    cause: Cause | None = None
+    bank_account_number: str | None = Field(default=None, pattern=r"^[0-9]{6,18}$")
+    ifsc: str | None = Field(default=None, pattern=IFSC_PATTERN)
+    declaration_accepted: bool = False
 
     @field_validator("claimed_amount")
     @classmethod

@@ -249,3 +249,31 @@ async def test_a_query_reply_is_refused_for_strangers_unknown_and_answered_queri
 
     assert (stranger.status_code, unknown.status_code) == (404, 404)
     assert (staff.status_code, first.status_code, answered.status_code) == (403, 201, 409)
+
+
+async def test_the_member_form_keeps_bank_category_and_declaration_fields(api: Api) -> None:
+    extra = {
+        "hospital_city": "Pune",
+        "claim_category": "inpatient",
+        "cause": "illness",
+        "bank_account_number": "001234567890",
+        "ifsc": "HDFC0001234",
+        "declaration_accepted": True,
+    }
+
+    ok = await api.submit(MEMBER, TYPED, **extra)
+    bad_ifsc = await api.submit(MEMBER, TYPED, **(extra | {"ifsc": "HDFC1234"}))
+
+    assert ok.status_code == 201
+    assert {k: ok.json()["form"][k] for k in extra} == extra
+    assert bad_ifsc.status_code == 422
+
+
+async def test_a_claims_pages_are_for_staff_only(api: Api) -> None:
+    claim_id = (await api.submit(MEMBER, TYPED)).json()["claim_id"]
+    path = f"/api/claims/{claim_id}/pages"
+
+    member, ops = await api.get(MEMBER, path), await api.get(OPS, path)
+
+    assert member.status_code == 403
+    assert ops.status_code == 404  # not classified yet: the fake starter runs no workflow

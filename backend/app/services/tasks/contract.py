@@ -12,6 +12,14 @@ from app.shared.types import Role
 TaskStatus = Literal["open", "taken", "done", "escalated"]
 
 
+class ClaimBrief(BaseModel):
+    """What a queue row shows about the task's claim."""
+
+    claim_number: str | None
+    patient_name: str | None
+    claimed_amount: Decimal | None  # as typed on the claim's first submission
+
+
 class Task(BaseModel):
     id: UUID
     claim_id: UUID
@@ -26,6 +34,8 @@ class Task(BaseModel):
     outcome: dict[str, Any] | None
     # Approver tasks: the user's approver max_amount must cover this (empty: no limit).
     authority_amount: Decimal | None = None
+    created_at: datetime | None = None
+    claim: ClaimBrief | None = None  # set on queue reads: list_queue, take_next, get_task
 
 
 class TaskNotFound(Exception):

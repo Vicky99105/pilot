@@ -12,8 +12,9 @@ from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 
 from app.config import Settings
-from app.database.models import TaskRow, UserRoleRow, utcnow
+from app.database.models import ClaimRow, SubmissionRow, TaskRow, UserRoleRow, utcnow
 from app.services.tasks.contract import (
+    ClaimBrief,
     Task,
     TaskAlreadyDone,
     TaskNotAllowed,
@@ -27,7 +28,7 @@ UNFINISHED = ("open", "taken", "escalated")
 TASK_COMPLETED_SIGNAL = "task_completed"
 
 
-def _to_task(row: TaskRow) -> Task:
+def _to_task(row: TaskRow, claim: ClaimBrief | None = None) -> Task:
     return Task(
         id=row.id,
         claim_id=row.claim_id,
@@ -41,7 +42,40 @@ def _to_task(row: TaskRow) -> Task:
         assignee=row.assignee,
         outcome=row.outcome,
         authority_amount=row.authority_amount,
+        created_at=row.created_at,
+        claim=claim,
     )
+
+
+def _amount(raw: object) -> Decimal | None:
+    try:
+        return Decimal(str(raw)) if raw is not None else None
+    except ArithmeticError:
+        return None
+
+
+async def _briefs(session: AsyncSession, claim_ids: set[UUID]) -> dict[UUID, ClaimBrief]:
+    """Claim number, patient and claimed amount for each claim, in one query."""
+    if not claim_ids:
+        return {}
+    rows = await session.execute(
+        select(ClaimRow.id, ClaimRow.claim_number, SubmissionRow.form)
+        .outerjoin(SubmissionRow, SubmissionRow.id == ClaimRow.submission_id)
+        .where(ClaimRow.id.in_(claim_ids))
+    )
+    return {
+        claim_id: ClaimBrief(
+            claim_number=number,
+            patient_name=(form or {}).get("patient_name"),
+            claimed_amount=_amount((form or {}).get("claimed_amount")),
+        )
+        for claim_id, number, form in rows
+    }
+
+
+async def _with_briefs(session: AsyncSession, rows: list[TaskRow]) -> list[Task]:
+    briefs = await _briefs(session, {r.claim_id for r in rows})
+    return [_to_task(r, briefs.get(r.claim_id)) for r in rows]
 
 
 async def _roles(session: AsyncSession, user_id: UUID) -> dict[str, Decimal | None]:
@@ -138,7 +172,7 @@ class DefaultTaskService:
                 )
                 .order_by(TaskRow.deadline, TaskRow.created_at)
             )
-            return [_to_task(r) for r in rows]
+            return await _with_briefs(session, list(rows))
 
     async def take_next(self, *, user_id: UUID) -> Task | None:
         """SKIP LOCKED makes concurrent callers pick different rows on Postgres."""
@@ -154,7 +188,8 @@ class DefaultTaskService:
             if row is None:
                 return None
             row.status, row.assignee, row.taken_at = "taken", user_id, self._now()
-            return _to_task(row)
+            [task] = await _with_briefs(session, [row])
+            return task
 
     async def complete(self, *, task_id: UUID, user_id: UUID, outcome: dict[str, Any]) -> Task:
         async with self._sessions.begin() as session:
@@ -184,7 +219,8 @@ class DefaultTaskService:
             row = await session.get(TaskRow, task_id)
             if row is None or _refusal(row, await _roles(session, user_id)) is not None:
                 return None
-            return _to_task(row)
+            [task] = await _with_briefs(session, [row])
+            return task
 
 
 class DefaultWorkflowSignaller:

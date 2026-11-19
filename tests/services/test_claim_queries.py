@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.services.claims.contract import ClaimQueryService
 from app.services.claims.service import DefaultClaimQueryService
@@ -15,7 +16,7 @@ from app.services.page_prep.service import DefaultPagePreparer
 from app.services.query.contract import QueryItem
 from app.services.query.service import DefaultQueryService
 from app.shared.seed_ids import HOSPITAL_USER_ID, MEMBER_USER_ID
-from app.shared.types import DocType, RequestType
+from app.shared.types import DocType, RequestType, Stage
 from tests.docs import make_pdf
 from tests.fakes.file_store import FakeFileStore
 from tests.fakes.intake import FakeWorkflowStarter
@@ -129,3 +130,57 @@ async def test_get_shows_letters_and_the_open_query_and_letters_resolve_as_files
     stored = await env.claims.stored_file(letter.pdf_key)
     assert stored is not None
     assert (stored.mime, stored.claim_id) == ("application/pdf", submission.claim_id)
+
+
+async def test_pages_map_each_page_to_its_document_and_page_within_it(env: Env) -> None:
+    submission = await env.submit(MEMBER_USER_ID, "one")
+    assert await env.claims.pages(submission.claim_id) is None  # not classified yet
+    doc_id, p1, p2, p3 = uuid4(), uuid4(), uuid4(), uuid4()
+
+    def page(page_id: UUID, seq: int, doc_type: DocType) -> dict[str, object]:
+        return {
+            "page_id": str(page_id),
+            "file_id": str(submission.files[0].file_id),
+            "seq": seq,
+            "file_page": seq,
+            "slot": None,
+            "image_key": f"img-{seq}",
+            "doc_type": doc_type.value,
+            "confidence": 0.9,
+        }
+
+    await StageRecordRepository(env.sessions).append(
+        submission.claim_id,
+        Stage.CLASSIFICATION,
+        {
+            "claim_id": str(submission.claim_id),
+            "submission_id": str(submission.submission_id),
+            "pages": [
+                page(p1, 1, DocType.FINAL_BILL),
+                page(p2, 2, DocType.FINAL_BILL),
+                page(p3, 3, DocType.OTHER),
+            ],
+            "documents": [
+                {
+                    "document_id": str(doc_id),
+                    "doc_type": "final_bill",
+                    "page_range": {"start": 1, "end": 2},
+                    "page_ids": [str(p1), str(p2)],
+                    "confidence": 0.9,
+                }
+            ],
+            "mismatches": [],
+            "needs_review": False,
+        },
+        created_by="model",
+    )
+
+    pages = await env.claims.pages(submission.claim_id)
+
+    assert pages is not None
+    assert [(p.seq, p.image_key, p.document_id, p.page_in_document) for p in pages.pages] == [
+        (1, "img-1", doc_id, 1),
+        (2, "img-2", doc_id, 2),
+        (3, "img-3", None, None),
+    ]
+    assert [d.document_id for d in pages.documents] == [doc_id]

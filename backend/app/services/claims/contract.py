@@ -71,6 +71,32 @@ class ClaimDetail(ClaimSummary):
     open_query: OpenQueryView | None = None
 
 
+class ClaimPage(BaseModel):
+    """One page of the claim's latest classified document set, for the page viewer."""
+
+    page_id: UUID
+    seq: int  # 1-based position across the submission
+    doc_type: DocType
+    confidence: float
+    image_key: str  # GET /api/files/{image_key}, permission checked
+    quality_warning: str | None
+    document_id: UUID | None  # None when the page belongs to no document
+    page_in_document: int | None  # what PageRef.page means for this page
+
+
+class ClaimPageDocument(BaseModel):
+    document_id: UUID
+    doc_type: DocType
+    page_ids: list[UUID]  # in order; PageRef.page n is page_ids[n - 1]
+
+
+class ClaimPages(BaseModel):
+    claim_id: UUID
+    classification_version: int
+    pages: list[ClaimPage]
+    documents: list[ClaimPageDocument]
+
+
 class StoredFile(BaseModel):
     """What a permission check needs to know about a stored file or page image."""
 
@@ -85,6 +111,10 @@ class ClaimQueryService(Protocol):
     async def list_for_submitter(self, user_id: UUID) -> list[ClaimSummary]: ...
 
     async def get(self, claim_id: UUID) -> ClaimDetail | None: ...
+
+    async def pages(self, claim_id: UUID) -> ClaimPages | None:
+        """The latest classified pages, or None before classification."""
+        ...
 
     async def stored_file(self, storage_key: str) -> StoredFile | None:
         """An uploaded file, a rendered page image or a letter PDF, by its storage key."""

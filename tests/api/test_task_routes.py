@@ -158,3 +158,12 @@ async def test_a_claims_event_history_is_for_staff_only(api: Api) -> None:
     assert staff.status_code == 200
     assert [(e["stage"], e["action"]) for e in staff.json()] == [("intake", "stage_completed")]
     assert member.status_code == 403
+
+
+async def test_me_returns_the_selected_user_with_roles(api: Api) -> None:
+    response = await api.client.get("/api/me", headers=api.as_user(OPS))
+
+    assert response.status_code == 200
+    assert response.json()["roles"] == ["claims_operator"]
+    assert response.json()["kind"] == "staff"
+    assert (await api.client.get("/api/me")).status_code == 401

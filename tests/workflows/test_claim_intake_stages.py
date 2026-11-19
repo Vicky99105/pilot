@@ -188,6 +188,9 @@ async def test_a_low_confidence_field_opens_fix_fields_and_resumes_after_it(
         await h.wait_for(lambda: bool(h.tasks.unfinished("fix_fields")), "fix fields task")
         [task] = h.tasks.unfinished("fix_fields")
         assert task.payload["low_confidence_fields"] == ["identity.patient_name"]
+        # The current value travels with the task, so the screen can show and cite it.
+        flagged = task.payload["fields"]["identity.patient_name"]
+        assert (flagged["value"], flagged["confidence"]) == ("Asha Varma", 0.6)
         assert h.tasks.unfinished("confirm_registration") == []
 
         task_id = await h.complete(

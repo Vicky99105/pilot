@@ -14,6 +14,7 @@ from app.api.routes import health
 from app.api.routes import monitoring as monitoring_routes
 from app.api.routes import submissions as submission_routes
 from app.api.routes import tasks as task_routes
+from app.api.routes import users as user_routes
 from app.config import Settings
 from app.integrations.core.contract import PermissionService
 from app.integrations.core.http import (
@@ -171,6 +172,7 @@ def create_app(
     app.include_router(task_routes.router)
     app.include_router(monitoring_routes.router)
     app.include_router(submission_routes.router)
+    app.include_router(user_routes.router)
     app.include_router(mock_core_router, prefix="/mock-core")
 
     # Mounted last so API routes take precedence over static files.

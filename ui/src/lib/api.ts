@@ -1,0 +1,353 @@
+// Typed client for the claims API. Shapes mirror the backend pydantic models; money and
+// other Decimals arrive as strings (pydantic JSON mode) and stay strings until formatted.
+
+export type Money = string
+export type Uuid = string
+export type IsoDateTime = string
+export type IsoDate = string
+
+export type Role =
+  | 'hospital_user'
+  | 'member'
+  | 'claims_operator'
+  | 'bill_processor'
+  | 'medical_officer'
+  | 'approver'
+  | 'crc_reviewer'
+  | 'investigator'
+  | 'finance'
+  | 'qc_auditor'
+  | 'supervisor'
+  | 'admin'
+
+export type Stage =
+  | 'intake'
+  | 'classification'
+  | 'digitisation'
+  | 'registration'
+  | 'bill_review'
+  | 'medical_review'
+  | 'risk'
+  | 'adjudication'
+  | 'decision'
+  | 'communication'
+  | 'query'
+  | 'settlement'
+  | 'monitoring'
+
+export const DOC_TYPES = [
+  'claim_form_part_a',
+  'claim_form_part_b',
+  'final_bill',
+  'payment_receipt',
+  'discharge_summary',
+  'investigation_report',
+  'prescription',
+  'pharmacy_bill',
+  'cancelled_cheque',
+  'kyc',
+  'other',
+] as const
+export type DocType = (typeof DOC_TYPES)[number]
+
+export type RequestType =
+  | 'preauth'
+  | 'enhancement'
+  | 'discharge'
+  | 'reimbursement'
+  | 'query_reply'
+  | 'reconsideration'
+  | 'cancellation'
+
+export type User = {
+  id: Uuid
+  name: string
+  kind: 'staff' | 'member' | 'hospital'
+  roles: Role[]
+  max_amount: Money | null
+  hospital_id: string | null
+  policy_number: string | null
+  member_id: string | null
+}
+
+// --- Submit area ---------------------------------------------------------------------
+
+export type ClaimFormFields = {
+  policy_number: string
+  member_id: string
+  patient_name: string
+  hospital_id?: string | null
+  hospital_name?: string | null
+  hospital_city?: string | null
+  admission_date: IsoDate
+  discharge_date?: IsoDate | null
+  claimed_amount: Money
+  claim_category?: 'inpatient' | 'day_care' | 'pre_post_hospitalisation' | null
+  cause?: 'illness' | 'injury' | 'maternity' | null
+  bank_account_number?: string | null
+  ifsc?: string | null
+  declaration_accepted?: boolean
+}
+
+export type SubmissionForm = ClaimFormFields & { request_type: RequestType }
+
+export type SubmittedFile = {
+  file_id: Uuid
+  filename: string | null
+  sha256: string
+  slot: DocType | null
+  mime: string
+  size_bytes: number
+  storage_key: string
+  quality_warning: string | null
+}
+
+export type Submission = {
+  submission_id: Uuid
+  claim_id: Uuid
+  request_type: RequestType
+  parent_claim_id: Uuid | null
+  form: ClaimFormFields
+  files: SubmittedFile[]
+  missing_documents: DocType[]
+  warnings: string[]
+  deadline: IsoDateTime | null
+  duplicate_of: Uuid | null
+  workflow_id: string | null
+  created_at: IsoDateTime
+}
+
+export type ClaimSummary = {
+  claim_id: Uuid
+  claim_number: string | null
+  request_type: RequestType
+  status: string
+  patient_name: string | null
+  deadline: IsoDateTime | null
+  created_at: IsoDateTime
+}
+
+export type SubmittedFileView = {
+  file_id: Uuid
+  filename: string | null
+  slot: DocType | null
+  mime: string
+  size_bytes: number
+  storage_key: string
+  quality_warning: string | null
+}
+
+export type SubmissionView = {
+  submission_id: Uuid
+  request_type: RequestType
+  created_at: IsoDateTime
+  duplicate_of: Uuid | null
+  files: SubmittedFileView[]
+  missing_documents: DocType[]
+  warnings: string[]
+}
+
+export type LetterView = {
+  letter_id: Uuid
+  kind: string
+  created_at: IsoDateTime
+  pdf_key: string
+  download_url: string
+  sent: boolean
+}
+
+export type OpenQueryView = {
+  query_id: Uuid
+  items: string[]
+  status: string
+  raised_at: IsoDateTime
+  deadline: IsoDateTime
+  reply_url: string
+}
+
+export type ClaimDetail = ClaimSummary & {
+  policy_number: string | null
+  member_id: string | null
+  hospital_id: string | null
+  submitted_by: Uuid | null
+  closed_at: IsoDateTime | null
+  submissions: SubmissionView[]
+  letters: LetterView[]
+  open_query: OpenQueryView | null
+}
+
+// --- Review area -----------------------------------------------------------------------
+
+export type ClaimBrief = {
+  claim_number: string | null
+  patient_name: string | null
+  claimed_amount: Money | null
+}
+
+export type TaskKind =
+  | 'fix_labels'
+  | 'fix_fields'
+  | 'confirm_registration'
+  | 'confirm_deductions'
+  | 'medical_findings'
+  | 'investigate'
+  | 'approve'
+  | 'crc'
+  | 'query_no_reply'
+  | 'release_payment'
+
+export type Task = {
+  id: Uuid
+  claim_id: Uuid
+  workflow_id: string
+  kind: TaskKind | string
+  role: Role
+  title: string
+  payload: Record<string, unknown>
+  deadline: IsoDateTime
+  status: 'open' | 'taken' | 'done' | 'escalated'
+  assignee: Uuid | null
+  outcome: Record<string, unknown> | null
+  authority_amount: Money | null
+  created_at: IsoDateTime | null
+  claim: ClaimBrief | null
+}
+
+export type PageRef = { document_id: Uuid; page: number }
+
+export type ClaimPage = {
+  page_id: Uuid
+  seq: number
+  doc_type: DocType
+  confidence: number
+  image_key: string
+  quality_warning: string | null
+  document_id: Uuid | null
+  page_in_document: number | null
+}
+
+export type ClaimPages = {
+  claim_id: Uuid
+  classification_version: number
+  pages: ClaimPage[]
+  documents: { document_id: Uuid; doc_type: DocType; page_ids: Uuid[] }[]
+}
+
+// --- Monitoring ------------------------------------------------------------------------
+
+export type ClaimStatusRow = {
+  claim_id: Uuid
+  claim_number: string | null
+  state: string
+  entered_at: IsoDateTime
+  dwell_seconds: number
+  deadline: IsoDateTime | null
+}
+
+export type ClaimEvent = {
+  stage: Stage
+  action: string
+  actor: string
+  detail: Record<string, unknown> | null
+  created_at: IsoDateTime
+}
+
+// --- Transport ---------------------------------------------------------------------------
+
+export class ApiError extends Error {
+  readonly status: number
+  readonly messages: string[]
+
+  constructor(status: number, messages: string[]) {
+    super(messages.join('; ') || `request failed (${status})`)
+    this.status = status
+    this.messages = messages
+  }
+}
+
+let currentUserId: string | null = null
+
+/** The X-User-Id header sent on every request. The user picker sets it. */
+export function setApiUser(id: string | null): void {
+  currentUserId = id
+}
+
+type PydanticError = { loc?: (string | number)[]; msg?: string }
+
+function detailMessages(detail: unknown): string[] {
+  if (typeof detail === 'string') return [detail]
+  if (Array.isArray(detail)) {
+    return detail.map((d: unknown) => {
+      if (typeof d === 'string') return d
+      const e = d as PydanticError
+      const where = (e.loc ?? []).filter((p) => p !== 'body').join('.')
+      return where ? `${where}: ${e.msg ?? 'invalid'}` : (e.msg ?? 'invalid')
+    })
+  }
+  return []
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers)
+  if (currentUserId) headers.set('X-User-Id', currentUserId)
+  const response = await fetch(path, { ...init, headers })
+  if (response.status === 204) return null as T
+  const text = await response.text()
+  const body: unknown = text ? JSON.parse(text) : null
+  if (!response.ok) {
+    const detail = (body as { detail?: unknown } | null)?.detail
+    throw new ApiError(response.status, detailMessages(detail))
+  }
+  return body as T
+}
+
+function json(body: unknown): RequestInit {
+  return {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }
+}
+
+/** A file part: its field name is the slot (a document type) or "merged". */
+export type UploadPart = { slot: DocType | 'merged'; file: File }
+
+function multipart(parts: UploadPart[], form?: SubmissionForm): FormData {
+  const data = new FormData()
+  if (form) data.append('form', JSON.stringify(form))
+  for (const part of parts) data.append(part.slot, part.file, part.file.name)
+  return data
+}
+
+export const api = {
+  me: () => request<User>('/api/me'),
+
+  submit: (form: SubmissionForm, parts: UploadPart[]) =>
+    request<Submission>('/api/submissions', { method: 'POST', body: multipart(parts, form) }),
+  myClaims: () => request<ClaimSummary[]>('/api/claims/mine'),
+  claim: (id: Uuid) => request<ClaimDetail>(`/api/claims/${id}`),
+  claimEvents: (id: Uuid) => request<ClaimEvent[]>(`/api/claims/${id}/events`),
+  claimPages: (id: Uuid) => request<ClaimPages>(`/api/claims/${id}/pages`),
+  replyToQuery: (queryId: Uuid, parts: UploadPart[]) =>
+    request<Submission>(`/api/queries/${queryId}/reply`, {
+      method: 'POST',
+      body: multipart(parts),
+    }),
+
+  queue: () => request<Task[]>('/api/tasks/queue'),
+  takeNext: () => request<Task | null>('/api/tasks/next', { method: 'POST' }),
+  task: (id: Uuid) => request<Task>(`/api/tasks/${id}`),
+  complete: (id: Uuid, outcome: Record<string, unknown>) =>
+    request<Task>(`/api/tasks/${id}/complete`, json({ outcome })),
+
+  monitoringClaims: () => request<ClaimStatusRow[]>('/api/monitoring/claims'),
+}
+
+/** Files are permission checked by X-User-Id, so a plain link cannot fetch them. */
+export async function fetchFileBlob(key: string): Promise<Blob> {
+  const headers = new Headers()
+  if (currentUserId) headers.set('X-User-Id', currentUserId)
+  const response = await fetch(`/api/files/${key}`, { headers })
+  if (!response.ok) throw new ApiError(response.status, [`file not available (${response.status})`])
+  return response.blob()
+}

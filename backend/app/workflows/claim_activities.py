@@ -182,15 +182,21 @@ class ClaimActivities:
     @activity.defn(name="digitisation")
     async def digitisation(self, inp: StageInput) -> StageResult:
         record = await self._run(inp.claim_id, inp.stage, self._digitisation.extract(inp.claim_id))
-        payload = {
+        payload: dict[str, Any] = {
             "low_confidence_fields": record.low_confidence_fields,
             "failed_checks": [c.model_dump(mode="json") for c in record.failed_checks],
         }
+        paths = [
+            *record.low_confidence_fields,
+            *(p for c in record.failed_checks for p in c.fields),
+        ]
+        dumped = record.model_dump(mode="json")
+        fields = {p: f for p in dict.fromkeys(paths) if (f := _at_path(dumped, p)) is not None}
         return await self._stage_done(
             inp,
             payload,
             needs_checkpoint=bool(record.low_confidence_fields or record.failed_checks),
-            checkpoint_payload=payload,
+            checkpoint_payload={**payload, "fields": fields},  # the flagged Fields, as they are
         )
 
     @activity.defn(name="apply_corrections")
@@ -602,6 +608,19 @@ def _labels(raw: dict[str, Any]) -> dict[UUID, DocType]:
             type="PermanentError",
             non_retryable=True,
         ) from exc
+
+
+def _at_path(data: Any, path: str) -> dict[str, Any] | None:
+    """The dumped Field at a dotted path such as "bill.lines.0.amount", if there is one."""
+    node = data
+    for part in path.split("."):
+        if isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        elif isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return None
+    return node if isinstance(node, dict) and "value" in node else None
 
 
 def _at(inp: OutcomeInput) -> StageInput:

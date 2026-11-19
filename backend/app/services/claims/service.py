@@ -6,8 +6,12 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.database.models import ClaimRow, FileRow, LetterRow, PageRow, QueryRow, SubmissionRow
+from app.database.repositories.stage_records import StageRecordRepository
 from app.services.claims.contract import (
     ClaimDetail,
+    ClaimPage,
+    ClaimPageDocument,
+    ClaimPages,
     ClaimSummary,
     LetterView,
     OpenQueryView,
@@ -15,7 +19,8 @@ from app.services.claims.contract import (
     SubmissionView,
     SubmittedFileView,
 )
-from app.shared.types import DocType, RequestType
+from app.services.classification.contract import DocumentSet
+from app.shared.types import DocType, RequestType, Stage
 
 
 def _summary(claim: ClaimRow, first: SubmissionRow | None) -> ClaimSummary:
@@ -128,6 +133,40 @@ class DefaultClaimQueryService:
                     warnings=s.warnings,
                 )
                 for s in submissions
+            ],
+        )
+
+    async def pages(self, claim_id: UUID) -> ClaimPages | None:
+        record = await StageRecordRepository(self._sessions).latest(claim_id, Stage.CLASSIFICATION)
+        if record is None:
+            return None
+        doc_set = DocumentSet.model_validate(record.payload)
+        place = {
+            page_id: (d.document_id, n)
+            for d in doc_set.documents
+            for n, page_id in enumerate(d.page_ids, start=1)
+        }
+        return ClaimPages(
+            claim_id=claim_id,
+            classification_version=record.version,
+            pages=[
+                ClaimPage(
+                    page_id=p.page_id,
+                    seq=p.seq,
+                    doc_type=p.doc_type,
+                    confidence=p.confidence,
+                    image_key=p.image_key,
+                    quality_warning=p.quality_warning,
+                    document_id=place[p.page_id][0] if p.page_id in place else None,
+                    page_in_document=place[p.page_id][1] if p.page_id in place else None,
+                )
+                for p in sorted(doc_set.pages, key=lambda p: p.seq)
+            ],
+            documents=[
+                ClaimPageDocument(
+                    document_id=d.document_id, doc_type=d.doc_type, page_ids=d.page_ids
+                )
+                for d in doc_set.documents
             ],
         )
 

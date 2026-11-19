@@ -5,7 +5,9 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.database.models import ClaimRow, SubmissionRow
 from app.services.tasks.contract import (
+    ClaimBrief,
     Task,
     TaskAlreadyDone,
     TaskNotAllowed,
@@ -184,3 +186,33 @@ async def test_an_approver_task_above_the_users_limit_is_hidden_and_refused(ctx:
     taken = await ctx.service.take_next(user_id=doctor)
     assert taken is not None and taken.id == small.id
     assert large.authority_amount == Decimal("133000.00")
+
+
+async def test_queue_tasks_carry_the_claim_brief_and_when_they_opened(ctx: Ctx) -> None:
+    """The queue shows claim number, patient and claimed amount without a call per row."""
+    async with ctx.sessions.begin() as session:
+        claim = await session.get(ClaimRow, ctx.claim_id)
+        assert claim is not None
+        submission = SubmissionRow(
+            id=uuid4(),
+            request_type="reimbursement",
+            claim_id=ctx.claim_id,
+            form={"patient_name": "Asha Verma", "claimed_amount": "133000.00"},
+        )
+        session.add(submission)
+        await session.flush()
+        claim.claim_number, claim.submission_id = "CLM-7", submission.id
+    ops = await add_user(ctx.sessions, "ops", [Role.CLAIMS_OPERATOR])
+    opened = await ctx.open("fix_labels", Role.CLAIMS_OPERATOR, hours=4)
+
+    [queued] = await ctx.service.list_queue(user_id=ops)
+    taken = await ctx.service.take_next(user_id=ops)
+    fetched = await ctx.service.get_task(task_id=opened.id, user_id=ops)
+
+    expected = ClaimBrief(
+        claim_number="CLM-7", patient_name="Asha Verma", claimed_amount=Decimal("133000.00")
+    )
+    for task in (queued, taken, fetched):
+        assert task is not None
+        assert task.claim == expected
+        assert task.created_at is not None
