@@ -10,10 +10,10 @@ findings -> hospital_codes -> length_of_stay -> pre_existing -> validate ->
 
 The model rewrites diagnosis phrases into index terms and chooses codes from the lookup
 results; in the review it writes findings and picks query items from the case's document
-options. Code runs every lookup and every check. The validator accepts a code only if a
-lookup in this run returned it and it is billable, and a finding only if it has a valid
-citation. Rejected items go back to the model once; what is still wrong is dropped with
-the reason.
+options. Code writes each request's text from the options picked, and code runs every
+lookup and every check. The validator accepts a code only if a lookup in this run returned
+it and it is billable, and a finding only if it has a valid citation. Rejected items go
+back to the model once; what is still wrong is dropped with the reason.
 
 Procedures are coded in ICD-10-PCS by a constrained builder: at each of the seven positions
 the reply schema is the list of values the PCS tables allow after the code built so far, so
@@ -28,8 +28,10 @@ from langgraph.graph import END, START, StateGraph
 from app.agents.medical_case import (
     CaseFact,
     CaseFile,
+    DocumentOption,
     Statement,
     compare_hospital_codes,
+    document_requests,
     length_of_stay,
     pre_existing,
     valid_citations,
@@ -410,21 +412,18 @@ async def run_medical_review(
                         )
                     )
 
-        requests: list[DocumentRequest] = []
         options = {d.label: d for d in case.documents}
-        for item in proposal.query_items:
-            option = options.get(item.document)
+        chosen: list[DocumentOption] = []
+        for label in proposal.query_items:
+            option = options.get(label)
             if option is None:  # the reply schema already excludes these; the second check
-                reason = f"{item.document} is not a document this claim may be asked for"
+                reason = f"{label} is not a document this claim may be asked for"
                 rejected.append(
-                    (DroppedItem(item="query_item", detail=item.text, reason=reason), False)
+                    (DroppedItem(item="query_item", detail=label, reason=reason), False)
                 )
                 continue
-            same = next((r for r in requests if r.doc_type == option.doc_type), None)
-            if same is None:
-                requests.append(DocumentRequest(doc_type=option.doc_type, text=item.text))
-            elif item.text not in same.text:  # one request per document type
-                same.text = f"{same.text}; {item.text}"
+            chosen.append(option)
+        requests = document_requests(chosen)
 
         fixable = [item for item, can_fix in rejected if can_fix]
         if fixable and revisions < MAX_REVISIONS:

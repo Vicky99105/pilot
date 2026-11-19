@@ -23,8 +23,10 @@ The claim:
   so they are deducted in full. The room cap (Rs 5,000 a day) and the proportionate
   deduction (R13) then reduce the room, OT and professional fee lines by 2/3.
 - Bundle: claim form Part A (typed), claim form Part B (hospital), discharge summary,
-  operation theatre notes, itemised final bill, cancelled cheque. The payment receipt is left
-  out on purpose, so a query is raised; it is written separately as the query reply.
+  operation theatre notes, the histopathology report of the appendix (a mandatory document
+  of the SG017B guideline, as in a real appendicectomy file), itemised final bill, cancelled
+  cheque. The payment receipt is left out on purpose, so a query is raised; it is written
+  separately as the query reply.
 
 The ground truth's deductions come from the real rules engine run on the ground-truth bill
 lines in bill review's order (R11, R12, R18, R23, R20, R24, R13, R14, R19, R16, R17, R26,
@@ -108,6 +110,7 @@ ACCOUNT_HOLDER = "ASHA VERMA"
 
 SURGEON = "Dr. Rajiv Khanna"
 ANAESTHETIST = "Dr. Meera Joshi"
+PATHOLOGIST = "Dr. Nandini Rao"
 DIAGNOSIS = "Acute appendicitis"
 PROCEDURE = "Laparoscopic appendicectomy"
 HOSPITAL_ICD = "K35.8"  # less specific than the code medical review should verify
@@ -619,11 +622,12 @@ def ground_truth(claim: TracerClaim, rules: RulesEngine, files: dict[str, Any]) 
             "drug_price_findings": drug_findings(claim, rules),
             "expected": {
                 "first_draft": "query",
-                # The intake's missing document. Medical review may also ask for the
-                # guideline's missing mandatory documents (histopathology and pre-anaesthesia
-                # reports, both investigation reports); that is the model's call.
+                # The intake's missing document. The bundle holds the histopathology report,
+                # an investigation report, which is the only document type the SG017B
+                # guideline makes mandatory that the claim would otherwise lack, so medical
+                # review has no document it may ask for.
                 "query_items": ["payment receipt"],
-                "medical_query_items_allowed": [DocType.INVESTIGATION_REPORT.value],
+                "medical_query_items_allowed": [],
                 "package": PACKAGE.package_code,
                 "guideline_code": GUIDELINE_CODE,
                 "los_norm_days": LOS_NORM_DAYS,
@@ -1335,6 +1339,64 @@ def ot_notes(claim: TracerClaim) -> bytes:
     return _save(build)
 
 
+def histopathology_report(claim: TracerClaim) -> bytes:
+    """The hospital laboratory's histopathology report on the appendix: one page. The
+    discharge summary quotes its diagnosis and the bill charges for it."""
+
+    def build(pdf: Canvas) -> None:
+        y = _hospital_header(pdf, "DEPARTMENT OF PATHOLOGY - HISTOPATHOLOGY REPORT")
+        y = _box_row(
+            pdf,
+            y,
+            [
+                ("Patient name", f"Mrs. {PATIENT.upper()}", 3),
+                ("Age / Sex", f"{claim.age} Y / F", 1.3),
+                ("IP No.", claim.ip_number, 1.8),
+            ],
+        )
+        y = (
+            _box_row(
+                pdf,
+                y,
+                [
+                    ("Lab No.", f"HP/{claim.surgery:%y}/{claim.serial}", 1.6),
+                    ("Received", dmon(claim.surgery), 1.3),
+                    ("Reported", dmon(claim.on(3)), 1.3),
+                    ("Referred by", SURGEON, 2),
+                ],
+            )
+            - 12
+        )
+        y = _labelled(pdf, y, "SPECIMEN", f"Appendix ({PROCEDURE.lower()}).")
+        y = _labelled(
+            pdf,
+            y,
+            "GROSS EXAMINATION",
+            "Received in formalin an appendix measuring 8 x 0.9 cm. Serosa congested with "
+            "fibrinous exudate. Cut section shows a narrowed lumen with pus. No perforation "
+            "identified. Representative sections submitted.",
+        )
+        y = _labelled(
+            pdf,
+            y,
+            "MICROSCOPIC EXAMINATION",
+            "Sections show transmural infiltration by neutrophils with mucosal ulceration and "
+            "serositis. No granulomas. No dysplasia or malignancy seen.",
+        )
+        y = _labelled(
+            pdf, y, "DIAGNOSIS", "Appendix, appendicectomy: acute suppurative appendicitis."
+        )
+        pdf.setFont("Helvetica-Oblique", 12)
+        pdf.drawString(LEFT + 10, y - 30, "N. Rao")
+        pdf.setFont("Helvetica", 8.5)
+        pdf.drawString(LEFT + 10, y - 44, f"{PATHOLOGIST}, MD (Pathology)")
+        _seal(pdf, RIGHT - 90, y - 50)
+        _footer(pdf, "Histopathology report, page 1 of 1")
+        pdf.showPage()
+
+    return _save(build)
+
+
 _COLUMNS = [("Date", LEFT + 4), ("Particulars", LEFT + 78), ("Qty", 352.0)]
 _RATE_X, _AMOUNT_X = 440.0, RIGHT - 4
 
@@ -1628,11 +1690,12 @@ BUNDLE: list[tuple[str, DocType, Callable[[TracerClaim], bytes]]] = [
     ("02_claim_form_part_b.pdf", DocType.CLAIM_FORM_PART_B, claim_form_part_b),
     ("03_discharge_summary.pdf", DocType.DISCHARGE_SUMMARY, discharge_summary),
     ("04_ot_notes.pdf", DocType.OT_NOTES, ot_notes),
-    ("05_final_bill.pdf", DocType.FINAL_BILL, final_bill),
-    ("06_cancelled_cheque.pdf", DocType.CANCELLED_CHEQUE, cancelled_cheque),
+    ("05_histopathology_report.pdf", DocType.INVESTIGATION_REPORT, histopathology_report),
+    ("06_final_bill.pdf", DocType.FINAL_BILL, final_bill),
+    ("07_cancelled_cheque.pdf", DocType.CANCELLED_CHEQUE, cancelled_cheque),
 ]
 # (file, page index, angle in degrees): the pages that get the scan treatment.
-SCANS = {"03_discharge_summary.pdf": (1, 0.8), "06_cancelled_cheque.pdf": (0, -1.3)}
+SCANS = {"03_discharge_summary.pdf": (1, 0.8), "07_cancelled_cheque.pdf": (0, -1.3)}
 MERGED = "bundle_merged.pdf"
 REPLY = "query_reply_payment_receipt.pdf"
 GROUND_TRUTH = "ground_truth.json"

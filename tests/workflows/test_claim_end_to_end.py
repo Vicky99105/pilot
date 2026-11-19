@@ -73,7 +73,7 @@ from tests.knowledge import sources
 from tests.services.claim_builders import DIAGNOSIS
 from tests.services.reference_rows import add_reference_rows
 from tests.services.test_digitisation import CHEQUE, PART_A, line, section, v
-from tests.services.test_medical_review import APPENDIX_ITEM
+from tests.services.test_medical_review import APPENDIX_ITEM, HPE, PAC
 from tests.services.test_medical_review_coding import LAPAROSCOPIC_APPENDICECTOMY
 from tests.services.test_registration import asha_policy
 
@@ -437,3 +437,64 @@ EXPECTED_EVENTS = [
     ("settlement", "claim_closed"),
     ("monitoring", "stage_completed"),
 ]
+
+
+async def test_a_query_answered_in_part_is_not_raised_again(
+    sessions: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """The first review asks for two of the guideline's missing documents; the reply holds
+    only the payment receipt. The second review offers nothing to ask for, records the
+    documents still missing as findings, and the claim goes on to its decision and CLOSED
+    with one query."""
+    await seed_claims_db(sessions)
+    await seed_icd_fixture(sessions)
+    await load_icd10pcs(sessions, sources.write_sources(tmp_path / "icd-2027"))
+    await add_reference_rows(sessions)
+    gateway = _gateway()
+    gateway._script["medical_findings"] = [
+        {"findings": [], "query_items": [HPE, "Detailed operative notes"]},
+        {"findings": [], "query_items": []},
+    ]
+    async with await WorkflowEnvironment.start_time_skipping(
+        data_converter=pydantic_data_converter
+    ) as env:
+        h = Harness(env, sessions, gateway=gateway)
+        async with build_worker(env.client, TASK_QUEUE, claim_activities=h.activities):
+            claim_id = (await h.submit()).claim_id
+            await h.complete("confirm_registration", OPS_USER_ID, {"action": "confirm"})
+            await h.complete("confirm_deductions", OPS_USER_ID, {"action": "confirm"})
+            query = await h.wait_for(lambda: h.queries.open_query(claim_id), "the query")
+            assert [(i.doc_type, i.text) for i in query.items] == [
+                (DocType.PAYMENT_RECEIPT, "Payment receipt"),
+                (DocType.INVESTIGATION_REPORT, HPE),
+                (DocType.OT_NOTES, "Detailed operative notes"),
+            ]
+            await h.intake.accept_followup(
+                claim_id,
+                submitted_by=MEMBER_USER_ID,
+                channel="member",
+                files=[
+                    UploadedFile(filename="receipt.pdf", data=make_pdf(["RECEIPT"]),
+                                 slot=DocType.PAYMENT_RECEIPT)
+                ],
+            )  # fmt: skip
+            await h.complete("confirm_deductions", OPS_USER_ID, {"action": "confirm"})
+            await h.complete("approve", DOCTOR_USER_ID, {"action": "approve"})
+            await h.complete("crc", DOCTOR_USER_ID, {"action": "uphold"})
+            await h.complete("release_payment", FINANCE_USER_ID, {"action": "release"})
+            handle = h.env.client.get_workflow_handle_for(ClaimWorkflow.run, str(claim_id))
+            result = await handle.result()
+
+    assert (result.status, result.draft) == ("closed", "partial")
+    raised = {r.payload["query_id"] for r in await h.records.history(claim_id, Stage.QUERY)}
+    assert len(raised) == 1
+    second = [c for c in gateway.calls if c.purpose == "medical_findings"][-1].schema
+    assert second is not None
+    assert second.model_json_schema()["properties"]["query_items"]["maxItems"] == 0
+    medical = await h.records.latest(claim_id, Stage.MEDICAL_REVIEW)
+    assert medical is not None and medical.payload["query_items"] == []
+    still = [f["text"].split(":")[0] for f in medical.payload["findings"]
+             if f["kind"] == "documents"]  # fmt: skip
+    assert still == ["Detailed operative notes", HPE, PAC]
+    events = [(e.stage.value, e.action) for e in await h.monitoring.events(claim_id)]
+    assert events == EXPECTED_EVENTS

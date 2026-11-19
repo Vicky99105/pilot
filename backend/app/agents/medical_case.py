@@ -14,6 +14,7 @@ from app.services.medical_review.contract import (
     PED_CLAUSE,
     STG_PREFIX,
     Citation,
+    DocumentRequest,
     Finding,
 )
 from app.shared.types import Code, DocType, PageRef
@@ -43,8 +44,9 @@ class CaseFact(BaseModel):
 
 class DocumentOption(BaseModel):
     """A document a query may ask for: a mandatory document of the package's guideline that
-    the claim does not hold, or a medical document type. label is the value the reply
-    schema allows; doc_type is the type it asks for."""
+    the claim does not hold, or, with no guideline, a medical document type. label is the
+    value the reply schema allows and the text the claimant reads; doc_type is the type it
+    asks for."""
 
     label: str
     doc_type: DocType
@@ -76,6 +78,17 @@ class CaseFile(BaseModel):
     guideline: dict[str, list[str]] = {}  # section -> items
     los_norm_days: int | None = None
     los_norm_source: str | None = None
+
+
+def document_requests(options: list[DocumentOption]) -> list[DocumentRequest]:
+    """The requests for the chosen options: one per document type, in the order chosen. The
+    text is the chosen options' labels, so code writes every word the claimant reads."""
+    labels: dict[DocType, list[str]] = {}
+    for option in options:
+        chosen = labels.setdefault(option.doc_type, [])
+        if option.label not in chosen:
+            chosen.append(option.label)
+    return [DocumentRequest(doc_type=t, text="; ".join(names)) for t, names in labels.items()]
 
 
 def stg_key(code: str, section: str) -> str:

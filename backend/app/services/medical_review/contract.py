@@ -15,9 +15,12 @@ These guarantees hold for every MedicalCoding and MedicalFindings:
   pcs_validate. Each step names its lookup.
 - Every finding cites a page of the claim or a clause or ICD reference. Uncited items go back
   to the model once, then are dropped with the reason recorded.
-- Every query item names a document the claim does not hold and the claimant has not
-  answered: a mandatory document of the package's guideline, or one of MEDICAL_DOCUMENTS.
-  Free-text concerns are findings, never query items.
+- Every query item names a document type the claim does not hold and no earlier query asked
+  for, answered or not. With a guideline for the package, it is one of the guideline's
+  mandatory documents; without one, one of MEDICAL_DOCUMENTS. Code writes its text from the
+  option's label. Free-text concerns are findings, never query items.
+- A mandatory document an earlier query asked for and the claim still does not hold is a
+  "documents" finding for the approver, never a second query.
 
 Callers import this module only.
 """
@@ -32,13 +35,19 @@ from app.shared.types import Code, DocType, PageRef, RuleResult
 
 Severity = Literal["info", "query", "adverse"]
 FindingKind = Literal[
-    "coding", "hospital_codes", "length_of_stay", "pre_existing", "eligibility", "clinical"
+    "coding",
+    "hospital_codes",
+    "length_of_stay",
+    "pre_existing",
+    "eligibility",
+    "clinical",
+    "documents",  # a mandatory document a query asked for and the claim still does not hold
 ]
 LookupTool = Literal["search_icd_index", "get_icd_tabular", "pcs_options", "pcs_validate"]
 PED_CLAUSE = "Excl01"
 
-# The documents medical review may ask the claimant for. A query item also excludes any of
-# these the claim already holds or the claimant already answered.
+# The documents medical review may ask the claimant for when the package has no guideline.
+# A query item also excludes any of these the claim already holds or a query asked for.
 MEDICAL_DOCUMENTS = (
     DocType.DISCHARGE_SUMMARY,
     DocType.OT_NOTES,

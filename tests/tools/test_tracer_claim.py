@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import pypdfium2 as pdfium
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -126,6 +127,28 @@ def test_merged_pdf_has_every_part_and_no_receipt(bundle: tuple[Path, dict[str, 
     assert [p["doc_type"] for p in parts if p["doc_type"] == "ot_notes"] == ["ot_notes"]
     assert truth["expected"]["query_items"] == ["payment receipt"]
     assert gen.page_count((out / gen.REPLY).read_bytes()) == truth["files"]["reply"]["pages"] == 1
+
+
+def test_the_bundle_holds_the_histopathology_report(bundle: tuple[Path, dict[str, Any]]) -> None:
+    """A real appendicectomy file carries the histopathology report the guideline makes
+    mandatory, so medical review has nothing to ask for: the payment receipt is the only
+    query item."""
+    out, truth = bundle
+    [part] = [p for p in truth["files"]["bundle"] if p["doc_type"] == "investigation_report"]
+    assert part["pages"] == 1
+    names = [p["file"] for p in truth["files"]["bundle"]]
+    assert names.index(part["file"]) == names.index("04_ot_notes.pdf") + 1
+    assert truth["files"]["merged_pages"].count("investigation_report") == 1
+    doc = pdfium.PdfDocument((out / part["file"]).read_bytes())
+    try:
+        text = doc[0].get_textpage().get_text_range()
+    finally:
+        doc.close()
+    assert "HISTOPATHOLOGY REPORT" in text
+    assert "acute suppurative appendicitis" in text.lower()
+    assert "Appendix" in text and "malignancy" in text
+    assert truth["expected"]["query_items"] == ["payment receipt"]
+    assert truth["expected"]["medical_query_items_allowed"] == []
 
 
 def test_another_admission_date_gives_different_documents(

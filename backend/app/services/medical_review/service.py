@@ -6,7 +6,6 @@ re-read the cited history pages for pre-existing disease, run the review graph, 
 R5, R6, R7 and R9 on the verified codes."""
 
 import re
-from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -19,6 +18,7 @@ from app.agents.medical_case import (
     Statement,
     history_pages,
     pre_existing_onsets,
+    stg_key,
     unique,
 )
 from app.agents.medical_review_graph import run_medical_coding, run_medical_review
@@ -53,6 +53,13 @@ from app.services.rules.contract import Facts, RulesEngine
 from app.shared.types import DocType, PageRef, RuleResult, Stage
 
 RERUN_RULES = ["R5", "R6", "R7", "R9"]
+# The names the claimant reads for the medical document types.
+DOCUMENT_NAMES = {
+    DocType.DISCHARGE_SUMMARY: "Discharge summary",
+    DocType.OT_NOTES: "Operation theatre notes",
+    DocType.INVESTIGATION_REPORT: "Investigation report",
+    DocType.PRESCRIPTION: "Prescription",
+}
 PMJAY = "PMJAY"
 # The guideline sections the review reads: what the treatment needs and what a claim must
 # hold. Pre-auth and doctor-qualification sections are for other stages.
@@ -142,15 +149,16 @@ class DefaultMedicalReviewService:
         record = ClaimRecord.model_validate(digitised.payload)
         policy = await self._policy(claim_id, RegistrationResult.model_validate(registered.payload))
 
-        answered = await self._answered_doc_types(claim_id)
+        requested = await self._requested_doc_types(claim_id)
         held = await self._held_doc_types(claim_id)
         case = _case_file(record, policy, await self._clause_refs(policy.product_uin))
         case.verified_codes = [v.code.code for v in coding.verified_codes]
         guideline = await self._guideline(case, sheet)
-        missing = _mandatory_missing(case, held | answered)
+        loaded = case.guideline if case.guideline_code else None
+        missing = _mandatory_missing(loaded or {}, held)
         if guideline is not None:
             guideline.mandatory_missing = [label for label, _ in missing]
-        case.documents = _document_options(missing, held | answered)
+        case.documents = document_options(loaded, held=held, requested=requested)
 
         reread = await self._reread_history(claim_id, case)
         looked_up = {code for call in coding.lookups for code in call.returned_codes}
@@ -164,8 +172,8 @@ class DefaultMedicalReviewService:
         query_items, repeated = [], []
         for item in result["query_items"]:  # second check behind the reply schema
             reason = (
-                "already answered by the claimant in a query reply"
-                if item.doc_type in answered
+                f"an earlier query already asked for {item.doc_type.value}"
+                if item.doc_type in requested
                 else f"{item.doc_type.value} is already in the claim's documents"
                 if item.doc_type in held
                 else None
@@ -186,9 +194,10 @@ class DefaultMedicalReviewService:
         )
         rule_results = self._rules.evaluate(RERUN_RULES, facts, product)
         eligibility = await self._eligibility(rule_results)
+        still_missing = _still_missing(case, missing, requested)
         findings = [
             f.model_copy(update={"finding_id": i})
-            for i, f in enumerate([*result["findings"], *eligibility], start=1)
+            for i, f in enumerate([*result["findings"], *still_missing, *eligibility], start=1)
         ]
         medical = MedicalFindings(
             claim_id=claim_id,
@@ -387,17 +396,12 @@ class DefaultMedicalReviewService:
             )
         return findings
 
-    async def _answered_doc_types(self, claim_id: UUID) -> set[DocType]:
-        """Document types asked for in the claim's answered queries, from each query's latest
-        stage record."""
-        latest: dict[str, dict[str, Any]] = {}
-        for record in await self._records.history(claim_id, Stage.QUERY):
-            latest[str(record.payload.get("query_id"))] = record.payload
+    async def _requested_doc_types(self, claim_id: UUID) -> set[DocType]:
+        """Document types any of the claim's queries asked for, answered or not."""
         return {
             DocType(item["doc_type"])
-            for query in latest.values()
-            if query.get("status") == "answered"
-            for item in query.get("items", [])
+            for record in await self._records.history(claim_id, Stage.QUERY)
+            for item in record.payload.get("items", [])
             if item.get("doc_type")
         }
 
@@ -434,10 +438,17 @@ def _clean(item: str) -> str:
     return text[:1].upper() + text[1:] if text else item
 
 
-def _mandatory_missing(case: CaseFile, held: set[DocType]) -> list[tuple[str, DocType]]:
-    """The guideline's mandatory claim documents whose document type the claim does not hold
-    and the claimant has not answered: (document name, type)."""
-    items = case.guideline.get("claim_documents") or case.guideline.get("claim_checks") or []
+def _documents_section(guideline: dict[str, list[str]]) -> str:
+    """The guideline section that lists the mandatory claim documents."""
+    return "claim_documents" if guideline.get("claim_documents") else "claim_checks"
+
+
+def _mandatory_missing(
+    guideline: dict[str, list[str]], held: set[DocType]
+) -> list[tuple[str, DocType]]:
+    """The guideline's mandatory claim documents whose document type the claim does not
+    hold: (document name, type)."""
+    items = guideline.get(_documents_section(guideline)) or []
     missing = []
     for item in items:
         doc_type = guideline_doc_type(item)
@@ -446,16 +457,48 @@ def _mandatory_missing(case: CaseFile, held: set[DocType]) -> list[tuple[str, Do
     return list(dict.fromkeys(missing))
 
 
-def _document_options(
-    missing: list[tuple[str, DocType]], unavailable: set[DocType]
+def document_options(
+    guideline: dict[str, list[str]] | None, *, held: set[DocType], requested: set[DocType]
 ) -> list[DocumentOption]:
-    """The guideline's missing mandatory documents, then the medical document types the
-    claim may still be asked for."""
-    options = [DocumentOption(label=label, doc_type=t, from_guideline=True) for label, t in missing]
-    options += [
-        DocumentOption(label=d.value, doc_type=d) for d in MEDICAL_DOCUMENTS if d not in unavailable
+    """The documents a query may ask for, never a type the claim holds or an earlier query
+    asked for. With a guideline (its sections by name): exactly its mandatory documents.
+    Without one: the medical document types."""
+    if guideline is not None:
+        return [
+            DocumentOption(label=label, doc_type=t, from_guideline=True)
+            for label, t in _mandatory_missing(guideline, held)
+            if t not in requested
+        ]
+    return [
+        DocumentOption(label=DOCUMENT_NAMES[d], doc_type=d)
+        for d in MEDICAL_DOCUMENTS
+        if d not in held | requested
     ]
-    return options
+
+
+def _still_missing(
+    case: CaseFile, missing: list[tuple[str, DocType]], requested: set[DocType]
+) -> list[Finding]:
+    """A finding for each of the guideline's mandatory documents an earlier query asked for
+    that the claim still does not hold. The approver weighs it; no second query asks."""
+    if case.guideline_code is None:
+        return []
+    ref = stg_key(case.guideline_code, _documents_section(case.guideline))
+    return [
+        Finding(
+            kind="documents",
+            text=(
+                f"{label}: mandatory under guideline {case.guideline_code}. A query asked for "
+                f"the {DOCUMENT_NAMES.get(t, t.value).lower()} and the claim still does not "
+                "hold one."
+            ),
+            severity="query",
+            citations=[Citation(ref=ref)],
+            judged_by="code",
+        )
+        for label, t in missing
+        if t in requested
+    ]
 
 
 def _case_file(record: ClaimRecord, policy: MemberPolicy, clause_refs: list[str]) -> CaseFile:

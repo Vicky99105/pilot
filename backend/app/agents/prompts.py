@@ -98,18 +98,13 @@ class StayReason(BaseModel):
     citations: list[str] = []
 
 
-class DocumentRequestReply(BaseModel):
-    document: str  # one of the case's document options
-    text: str  # the request as the claimant reads it
-
-
 class ChooseCodesReply(BaseModel):
     codes: list[CodeChoice]
 
 
 class FindingsReply(BaseModel):
     findings: list[FindingReply] = []
-    query_items: list[DocumentRequestReply] = []
+    query_items: list[str] = []  # labels of the case's document options
     long_stay_reason: StayReason | None = None
 
 
@@ -133,16 +128,11 @@ def choose_schema(case: CaseFile, candidates: list[IcdTabularEntry]) -> type[Cho
 
 def findings_schema(case: CaseFile) -> type[FindingsReply]:
     """The findings reply for this case: citations are the case's pages, clauses, verified
-    codes and guideline sections; query items name only the case's document options; a
-    long-stay reason only when the stay is over its norm."""
+    codes and guideline sections; query items are labels of the case's document options and
+    nothing else (an empty list when there are none); a long-stay reason only when the stay
+    is over its norm."""
     cites = list_of(citation_keys(case, case.verified_codes))
     finding = closed_schema(FindingReply, "FindingClosed", citations=(cites, []))
-    labels = [d.label for d in case.documents]
-    request = closed_schema(
-        DocumentRequestReply,
-        "DocumentRequestClosed",
-        document=(one_of(labels), ...) if labels else (str, ...),
-    )
     days, (limit, _) = stay_days(case), stay_limit(case)
     long_stay = days is not None and days > limit
     stay = closed_schema(StayReason, "StayReasonClosed", citations=(cites, []))
@@ -150,7 +140,7 @@ def findings_schema(case: CaseFile) -> type[FindingsReply]:
         FindingsReply,
         "FindingsReply",
         findings=(list[finding], []),  # type: ignore[valid-type]
-        query_items=(list[request] if labels else list_of([]), []),  # type: ignore[valid-type]
+        query_items=(list_of([d.label for d in case.documents]), []),
         long_stay_reason=(stay | None, None) if long_stay else (None, None),
     )
 

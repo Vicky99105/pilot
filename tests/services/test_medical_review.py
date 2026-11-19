@@ -12,6 +12,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agents.medical_case import DocumentOption, document_requests
 from app.config import Settings
 from app.database.models import ExclusionRow
 from app.database.repositories.stage_records import StageRecordRepository
@@ -26,7 +27,10 @@ from app.services.medical_review.contract import (
     MedicalReviewService,
     NotReadyForMedicalReview,
 )
-from app.services.medical_review.service import DefaultMedicalReviewService
+from app.services.medical_review.service import (
+    DefaultMedicalReviewService,
+    document_options,
+)
 from app.services.registration.service import DefaultRegistrationService
 from app.services.rules.service import DefaultRulesEngine
 from app.shared.types import DocType, Stage
@@ -45,7 +49,7 @@ from tests.services.claim_builders import (
     fact,
     page,
 )
-from tests.services.reference_rows import add_reference_rows
+from tests.services.reference_rows import SG017B_CLAIM_DOCUMENTS, add_reference_rows
 from tests.services.test_registration import asha_policy
 
 APPENDIX_TERM = "appendicitis acute perforation localized peritonitis"
@@ -273,56 +277,140 @@ async def test_the_review_reads_the_packages_guideline_and_norm_and_reruns_the_r
 async def test_query_items_are_an_enum_of_the_missing_mandatory_documents(env: Env) -> None:
     claim_id = await env.coded()
     await env.held(claim_id, "discharge_summary", "ot_notes", "final_bill")
-    reply = {
-        "findings": [],
-        "query_items": [
-            {"document": HPE, "text": "Histopathology report of the appendix"},
-            {"document": PAC, "text": "Pre-anaesthesia check-up report"},
-        ],
-    }
-    gateway = FakeModelGateway({"medical_findings": [reply]})
+    gateway = FakeModelGateway({"medical_findings": [{"findings": [], "query_items": [HPE, PAC]}]})
 
     findings = await env.service(gateway).review(claim_id)
 
     schema = gateway.calls[-1].schema
-    # The guideline's mandatory documents the claim does not hold, then the medical document
-    # types it may still be asked for. Operative notes and the discharge summary are held.
-    assert enum_at(schema, "query_items", "document") == [
-        HPE, PAC, "investigation_report", "prescription",
-    ]  # fmt: skip
+    # Exactly the guideline's mandatory documents the claim does not hold. A guideline is
+    # loaded, so no other medical document type is offered.
+    assert enum_at(schema, "query_items") == [HPE, PAC]
     assert findings.guideline is not None
     assert findings.guideline.mandatory_missing == [HPE, PAC]
-    # Both are investigation reports: one request, both asked for.
+    # Both are investigation reports: one request, its text built in code from the
+    # guideline's own wording.
     assert findings.query_items == [
-        DocumentRequest(
-            doc_type=DocType.INVESTIGATION_REPORT,
-            text="Histopathology report of the appendix; Pre-anaesthesia check-up report",
-        )
+        DocumentRequest(doc_type=DocType.INVESTIGATION_REPORT, text=f"{HPE}; {PAC}")
     ]
     assert schema is not None
-    for held in ("ot_notes", "discharge_summary", "Detailed operative notes"):
+    for other in ("ot_notes", "Operative notes", "Prescription", "prescription"):
         with pytest.raises(ValidationError):
-            schema.model_validate({"query_items": [{"document": held, "text": "x"}]})
+            schema.model_validate({"query_items": [other]})
+    # A query item is the option alone: the model cannot attach free text to it.
+    with pytest.raises(ValidationError):
+        schema.model_validate({"query_items": [{"document": HPE, "text": "x"}]})
 
 
-async def test_an_item_the_claimant_already_answered_is_not_asked_again(env: Env) -> None:
-    """After a query reply the review runs again. A document type already answered is not
-    offered, however it is worded, so the same query is never raised twice."""
+@pytest.mark.parametrize("status", ["answered", "open", "overdue"])
+async def test_a_document_type_an_earlier_query_asked_for_is_never_asked_again(
+    env: Env, status: str
+) -> None:
+    """After a query reply the review runs again. A document type an earlier query asked
+    for is not offered, answered or not, however it is worded. A mandatory document still
+    missing becomes a finding for the approver, never a second query."""
     claim_id = await env.coded()
-    await env.held(claim_id, "discharge_summary", "ot_notes")
-    answered = {
+    await env.held(claim_id, "discharge_summary", "payment_receipt")
+    asked = {
         "query_id": "6f1c1d1e-5a43-4a8e-9a55-0c1a1f0c0002",
-        "status": "answered",
-        "items": [{"text": "HPE report", "source": "medical", "doc_type": "investigation_report"}],
-    }
-    await StageRecordRepository(env.sessions).append(claim_id, Stage.QUERY, answered,
+        "status": status,
+        "items": [
+            {"text": "Payment receipt", "source": "missing_document",
+             "doc_type": "payment_receipt"},
+            {"text": "HPE report", "source": "medical", "doc_type": "investigation_report"},
+            {"text": "Operative notes", "source": "medical", "doc_type": "ot_notes"},
+        ],
+    }  # fmt: skip
+    await StageRecordRepository(env.sessions).append(claim_id, Stage.QUERY, asked,
                                                      created_by="test")  # fmt: skip
     gateway = FakeModelGateway({"medical_findings": [NO_FINDINGS]})
 
     findings = await env.service(gateway).review(claim_id)
 
-    assert enum_at(gateway.calls[-1].schema, "query_items", "document") == ["prescription"]
+    schema = gateway.calls[-1].schema
+    assert schema is not None
+    assert schema.model_json_schema()["properties"]["query_items"]["maxItems"] == 0
+    for label in (HPE, PAC, "Detailed operative notes", "Prescription"):
+        with pytest.raises(ValidationError):
+            schema.model_validate({"query_items": [label]})
     assert findings.query_items == []
+    assert findings.guideline is not None
+    assert findings.guideline.mandatory_missing == ["Detailed operative notes", HPE, PAC]
+    still = [f for f in findings.findings if f.kind == "documents"]
+    assert [(f.severity, f.judged_by) for f in still] == [("query", "code")] * 3
+    assert [f.text.split(":")[0] for f in still] == ["Detailed operative notes", HPE, PAC]
+    assert all(f.citations == [Citation(ref="stg:SG017B:claim_documents")] for f in still)
+    assert findings.adverse is False
+
+
+async def test_without_a_guideline_the_options_are_the_medical_documents_not_held(
+    env: Env,
+) -> None:
+    claim_id = await env.claim()
+    await add_coding(env.sessions, claim_id)
+    await add_sheet(env.sessions, claim_id, packages=())
+    await env.held(claim_id, "discharge_summary", "ot_notes")
+    gateway = FakeModelGateway(
+        {"medical_findings": [{"findings": [], "query_items": ["Investigation report"]}]}
+    )
+
+    findings = await env.service(gateway).review(claim_id)
+
+    assert findings.guideline is None
+    assert enum_at(gateway.calls[-1].schema, "query_items") == [
+        "Investigation report", "Prescription",
+    ]  # fmt: skip
+    assert findings.query_items == [
+        DocumentRequest(doc_type=DocType.INVESTIGATION_REPORT, text="Investigation report")
+    ]
+
+
+# --- The option builder and the request text, as pure functions ----------------------------
+
+GUIDELINE = {"claim_documents": SG017B_CLAIM_DOCUMENTS, "alos": ["3 Days"]}
+OPERATIVE = "Detailed operative notes"
+INVESTIGATION = DocType.INVESTIGATION_REPORT
+
+
+def offered(options: list[DocumentOption]) -> list[tuple[str, DocType, bool]]:
+    return [(o.label, o.doc_type, o.from_guideline) for o in options]
+
+
+def test_with_a_guideline_the_options_are_exactly_its_missing_mandatory_documents() -> None:
+    held = {DocType.DISCHARGE_SUMMARY, DocType.OT_NOTES}
+    assert offered(document_options(GUIDELINE, held=held, requested=set())) == [
+        (HPE, INVESTIGATION, True), (PAC, INVESTIGATION, True),
+    ]  # fmt: skip
+
+
+def test_a_type_an_earlier_query_asked_for_is_not_offered() -> None:
+    requested = {INVESTIGATION, DocType.PAYMENT_RECEIPT}
+    options = document_options(GUIDELINE, held={DocType.DISCHARGE_SUMMARY}, requested=requested)
+    assert offered(options) == [(OPERATIVE, DocType.OT_NOTES, True)]
+
+
+def test_with_every_missing_document_requested_nothing_is_offered() -> None:
+    held = {DocType.DISCHARGE_SUMMARY, DocType.OT_NOTES}
+    assert document_options(GUIDELINE, held=held, requested={INVESTIGATION}) == []
+    # A guideline without document requirements offers nothing either: no fallback.
+    assert document_options({"alos": ["3 Days"]}, held=set(), requested=set()) == []
+
+
+def test_without_a_guideline_the_medical_document_types_not_held_or_requested() -> None:
+    options = document_options(None, held={DocType.DISCHARGE_SUMMARY}, requested={INVESTIGATION})
+    assert offered(options) == [
+        ("Operation theatre notes", DocType.OT_NOTES, False),
+        ("Prescription", DocType.PRESCRIPTION, False),
+    ]
+
+
+def test_the_request_text_is_built_from_the_chosen_options() -> None:
+    ot, hpe, pac = document_options(GUIDELINE, held={DocType.DISCHARGE_SUMMARY}, requested=set())
+    assert [ot.label, hpe.label, pac.label] == [OPERATIVE, HPE, PAC]
+    assert document_requests([hpe, ot, pac, hpe]) == [
+        DocumentRequest(doc_type=INVESTIGATION, text=f"{HPE}; {PAC}"),
+        DocumentRequest(doc_type=DocType.OT_NOTES, text=OPERATIVE),
+    ]
+    assert document_requests([]) == []
 
 
 async def test_uncited_findings_are_sent_back_once_then_dropped(env: Env) -> None:
