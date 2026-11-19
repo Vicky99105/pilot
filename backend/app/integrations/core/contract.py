@@ -29,16 +29,21 @@ class InsuredMember(BaseModel):
     relationship: str  # self, spouse, son, daughter, father, mother
 
 
+PremiumFrequency = Literal["monthly", "quarterly", "half_yearly", "annual"]
+
+
 class MemberPolicy(BaseModel):
     policy_number: str
     product_uin: str
     sum_insured: Decimal
     cumulative_bonus: Decimal
     utilised: Decimal
+    blocked: Decimal = Decimal("0")  # active blocks not yet released
     inception_date: date
     continuous_cover_start: date
     policy_start: date
     policy_end: date
+    premium_frequency: PremiumFrequency = "annual"
     premium_payments: list[PremiumPayment]
     declared_peds: list[Code]
     insured_members: list[InsuredMember]

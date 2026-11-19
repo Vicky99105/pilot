@@ -1,7 +1,9 @@
-"""Seed the claims database with the Phase 1 users, mock hospitals and document checklists.
+"""Seed the claims database: Phase 1 users, mock hospitals, document checklists, policy
+clauses and non-payable items.
 
-Idempotent: rows are merged by primary key (checklists by request type and document type),
-so running it twice changes nothing.
+Idempotent: rows are merged by primary key or natural key (checklists by request type and
+document type, clauses by product and clause, non-payable items by list and number), so
+running it twice changes nothing.
 Run inside the app container: python -m app.database.seed
 """
 
@@ -14,7 +16,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings
-from app.database.models import DocumentChecklistRow, HospitalRow, UserRoleRow, UserRow
+from app.database.models import (
+    DocumentChecklistRow,
+    HospitalRow,
+    NonPayableItemRow,
+    PolicyClauseRow,
+    UserRoleRow,
+    UserRow,
+)
+from app.database.seed_knowledge import NON_PAYABLE_ITEMS, POLICY_CLAUSES
 from app.shared.seed_ids import (
     DOCTOR_USER_ID,
     FINANCE_USER_ID,
@@ -24,6 +34,7 @@ from app.shared.seed_ids import (
     MEMBER_POLICY_NUMBER,
     MEMBER_USER_ID,
     OPS_USER_ID,
+    PRODUCT_UIN,
 )
 from app.shared.types import DocType, RequestType, Role
 
@@ -31,6 +42,7 @@ RowT = TypeVar("RowT", UserRow, UserRoleRow, HospitalRow)
 
 SOURCE = "pilot_seed"
 SOURCE_VERSION = "2026-11-19"
+FIXTURE = "fixture"  # a hand-made subset standing in for a full source load
 
 USERS = [
     UserRow(
@@ -65,12 +77,14 @@ ROLES = [
     UserRoleRow(user_id=FINANCE_USER_ID, role=Role.FINANCE.value),
 ]
 
+# (name, city, state, pincode, beds, differential billing). The nursing home charges one
+# rate for every room category, so no proportionate deduction applies there.
 _HOSPITALS = [
-    ("Sunrise Multispeciality Hospital", "New Delhi", "Delhi", "110017", 120),
-    ("Lotus Care Hospital", "Gurugram", "Haryana", "122001", 80),
-    ("Ganga Medical Centre", "Lucknow", "Uttar Pradesh", "226010", 150),
-    ("Sahyadri Nursing Home", "Pune", "Maharashtra", "411004", 40),
-    ("Kaveri General Hospital", "Bengaluru", "Karnataka", "560034", 200),
+    ("Sunrise Multispeciality Hospital", "New Delhi", "Delhi", "110017", 120, True),
+    ("Lotus Care Hospital", "Gurugram", "Haryana", "122001", 80, True),
+    ("Ganga Medical Centre", "Lucknow", "Uttar Pradesh", "226010", 150, True),
+    ("Sahyadri Nursing Home", "Pune", "Maharashtra", "411004", 40, False),
+    ("Kaveri General Hospital", "Bengaluru", "Karnataka", "560034", 200, True),
 ]
 
 HOSPITALS = [
@@ -81,12 +95,13 @@ HOSPITALS = [
         state=state,
         pincode=pincode,
         network=True,
+        differential_billing=differential,
         beds=beds,
         registered_on=date(2018, 4, 1),
         source=SOURCE,
         source_version=SOURCE_VERSION,
     )
-    for rohini, (name, city, state, pincode, beds) in zip(
+    for rohini, (name, city, state, pincode, beds, differential) in zip(
         HOSPITAL_ROHINI_IDS, _HOSPITALS, strict=True
     )
 ]
@@ -118,6 +133,38 @@ async def seed_claims_db(sessions: async_sessionmaker[AsyncSession]) -> None:
         for hospital in HOSPITALS:
             await session.merge(_copy(hospital))
         await _seed_checklist(session, RequestType.REIMBURSEMENT, REIMBURSEMENT_CHECKLIST)
+        await _seed_clauses(session)
+        await _seed_non_payable(session)
+
+
+async def _seed_clauses(session: AsyncSession) -> None:
+    existing = {
+        row.clause_ref: row
+        for row in await session.scalars(
+            select(PolicyClauseRow).where(PolicyClauseRow.product_uin == PRODUCT_UIN)
+        )
+    }
+    for clause_ref, title, text in POLICY_CLAUSES:
+        row = existing.get(clause_ref) or PolicyClauseRow(
+            product_uin=PRODUCT_UIN, clause_ref=clause_ref
+        )
+        row.title, row.text = title, text
+        row.source, row.source_version = SOURCE, SOURCE_VERSION
+        session.add(row)
+
+
+async def _seed_non_payable(session: AsyncSession) -> None:
+    existing = {
+        (row.list_name, row.item_number): row
+        for row in await session.scalars(select(NonPayableItemRow))
+    }
+    for list_name, number, item, category, condition in NON_PAYABLE_ITEMS:
+        row = existing.get((list_name, number)) or NonPayableItemRow(
+            list_name=list_name, item_number=number
+        )
+        row.item, row.category, row.condition = item, category, condition
+        row.source, row.source_version = FIXTURE, SOURCE_VERSION
+        session.add(row)
 
 
 async def _seed_checklist(
@@ -157,7 +204,8 @@ async def main() -> None:
         await engine.dispose()
     print(
         f"Seeded {len(USERS)} users, {len(ROLES)} roles, {len(HOSPITALS)} hospitals, "
-        f"{len(REIMBURSEMENT_CHECKLIST)} reimbursement checklist items"
+        f"{len(REIMBURSEMENT_CHECKLIST)} reimbursement checklist items, "
+        f"{len(POLICY_CLAUSES)} policy clauses, {len(NON_PAYABLE_ITEMS)} non-payable items"
     )
 
 

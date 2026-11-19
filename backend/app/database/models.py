@@ -290,12 +290,14 @@ class IcdTabularRow(Base):
 
 class NonPayableItemRow(Base):
     __tablename__ = "non_payable_items"
+    __table_args__ = (UniqueConstraint("list_name", "item_number"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     list_name: Mapped[str] = mapped_column(String(20))  # IRDAI List I to IV
     item_number: Mapped[int] = mapped_column(Integer)
     item: Mapped[str] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(String(100))
+    condition: Mapped[str | None] = mapped_column(Text)  # when the item is not paid separately
     source: Mapped[str] = mapped_column(String(60))
     source_version: Mapped[str] = mapped_column(String(40))
 
@@ -337,6 +339,8 @@ class HospitalRow(Base):
     state: Mapped[str] = mapped_column(String(100))
     pincode: Mapped[str | None] = mapped_column(String(6))
     network: Mapped[bool] = mapped_column(Boolean, default=True)
+    # False when the hospital charges the same rates whatever the room category.
+    differential_billing: Mapped[bool] = mapped_column(Boolean, default=True)
     beds: Mapped[int | None] = mapped_column(Integer)
     registered_on: Mapped[date | None] = mapped_column(Date)
     source: Mapped[str] = mapped_column(String(60))

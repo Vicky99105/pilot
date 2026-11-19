@@ -1,9 +1,18 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import DocumentChecklistRow, HospitalRow, UserRoleRow, UserRow
+from app.config import Settings
+from app.database.models import (
+    DocumentChecklistRow,
+    HospitalRow,
+    NonPayableItemRow,
+    PolicyClauseRow,
+    UserRoleRow,
+    UserRow,
+)
 from app.database.seed import seed_claims_db
-from app.shared.seed_ids import DOCTOR_USER_ID, OPS_USER_ID
+from app.services.rules.service import DefaultRulesEngine
+from app.shared.seed_ids import DOCTOR_USER_ID, OPS_USER_ID, PRODUCT_UIN
 
 
 async def _count(sessions: async_sessionmaker[AsyncSession], model: type) -> int:
@@ -53,3 +62,47 @@ async def test_seeded_hospitals_have_13_digit_rohini_ids(
         ids = (await session.scalars(select(HospitalRow.rohini_id))).all()
 
     assert all(len(i) == 13 and i.isdigit() for i in ids)
+
+
+async def test_seed_has_a_clause_for_every_clause_the_product_config_cites(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    await seed_claims_db(sessions)
+    await seed_claims_db(sessions)
+    clauses = DefaultRulesEngine(Settings().config_dir / "products").product(PRODUCT_UIN).clauses
+
+    async with sessions() as session:
+        rows = (await session.scalars(select(PolicyClauseRow))).all()
+    seeded = {r.clause_ref for r in rows if r.product_uin == PRODUCT_UIN}
+    cited = {v for k, v in clauses.model_dump().items() if k != "non_payable"}
+
+    assert cited | set(clauses.non_payable.values()) <= seeded
+    assert {"Excl01", "Excl02", "Excl03"} <= seeded
+    assert len(rows) == len(seeded)  # idempotent: no duplicates after two seeds
+
+
+async def test_seed_has_non_payable_items_from_all_four_lists_marked_fixture(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    await seed_claims_db(sessions)
+    await seed_claims_db(sessions)
+
+    async with sessions() as session:
+        rows = (await session.scalars(select(NonPayableItemRow))).all()
+
+    assert 25 <= len(rows) <= 40
+    assert {r.list_name for r in rows} == {"I", "II", "III", "IV"}
+    assert {r.source for r in rows} == {"fixture"}
+    assert all(r.condition for r in rows)
+    assert len({(r.list_name, r.item_number) for r in rows}) == len(rows)
+
+
+async def test_one_seeded_hospital_has_no_differential_billing(
+    sessions: async_sessionmaker[AsyncSession],
+) -> None:
+    await seed_claims_db(sessions)
+
+    async with sessions() as session:
+        flags = (await session.scalars(select(HospitalRow.differential_billing))).all()
+
+    assert sorted(flags) == [False, True, True, True, True]

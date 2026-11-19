@@ -48,6 +48,7 @@ class HospitalDetails(BaseModel):  # from claim form Part A
 class Admission(BaseModel):  # Part A first, then the discharge summary
     admission_date: Field[date] = missing()
     discharge_date: Field[date] = missing()
+    accident: Field[bool] = missing()  # Part A: hospitalisation due to an injury or accident
 
 
 class ClaimedAmounts(BaseModel):  # from claim form Part A

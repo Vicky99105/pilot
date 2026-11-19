@@ -102,6 +102,7 @@ async def find_member(
             sum_insured=policy.sum_insured,
             cumulative_bonus=policy.cumulative_bonus,
             utilised=policy.utilised,
+            blocked=policy.blocked,
             inception_date=policy.inception_date,
             continuous_cover_start=policy.continuous_cover_start,
             policy_start=policy.policy_start,

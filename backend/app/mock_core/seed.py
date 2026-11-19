@@ -1,8 +1,13 @@
 """Create the mock_core tables and seed 10 synthetic members on 6 policies.
 
-Idempotent: tables are created if missing and rows are merged by primary key. Balances
-(utilised, blocked) are only set when a policy is first inserted, so a re-seed never resets
-blocks made since. All data is synthetic.
+Policy dates are relative to the day the seed runs, so the claims they describe stay
+current: policy 6 always started 18 days ago, inside the 30-day initial wait, and policy 4
+always lapsed beyond its grace period.
+
+Idempotent: tables are created if missing and rows are merged by primary key. A re-seed on
+a later day moves the dates forward and changes nothing else. Balances (utilised, blocked)
+are only set when a policy is first inserted, so a re-seed never resets blocks made since.
+All data is synthetic.
 Run inside the app container: python -m app.mock_core.seed
 """
 
@@ -10,6 +15,7 @@ import asyncio
 from datetime import date, timedelta
 from decimal import Decimal
 
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -25,9 +31,13 @@ from app.mock_core.models import (
     McSubmitGrant,
     MockCoreBase,
 )
-from app.shared.seed_ids import HOSPITAL_ROHINI_IDS, HOSPITAL_USER_ID, MEMBER_USER_ID
+from app.shared.seed_ids import (
+    HOSPITAL_ROHINI_IDS,
+    HOSPITAL_USER_ID,
+    MEMBER_USER_ID,
+    PRODUCT_UIN,
+)
 
-PRODUCT_UIN = "PLACEHOLDER-AROGYA-SANJEEVANI-UIN"
 DIABETES = {
     "system": "ICD-10-CM",
     "version": "2026",
@@ -41,16 +51,17 @@ HYPERTENSION = {
     "display": "Essential (primary) hypertension",
 }
 
-# (n, sum insured, cumulative bonus, inception, policy start, premium, peds, members)
-# Member tuple: (name, dob, gender, relationship). Policy 6 started 2026-11-01, inside the
-# 30-day initial wait on the pilot date (2026-11-19).
+# (n, sum insured, cumulative bonus, inception days ago, policy start days ago, premium,
+#  peds, members). Member tuple: (name, dob, gender, relationship).
+# Policy 4 started 405 days ago: it ended 41 days ago, past the 30-day grace period.
+# Policy 6 started 18 days ago: inside the 30-day initial wait.
 _POLICIES = [
     (
         1,
         "500000",
         "50000",
-        date(2023, 4, 1),
-        date(2026, 4, 1),
+        1328,
+        232,
         "18450",
         [DIABETES],
         [
@@ -62,8 +73,8 @@ _POLICIES = [
         2,
         "300000",
         "0",
-        date(2025, 1, 15),
-        date(2026, 1, 15),
+        673,
+        308,
         "9870",
         [],
         [
@@ -75,8 +86,8 @@ _POLICIES = [
         3,
         "400000",
         "20000",
-        date(2024, 7, 1),
-        date(2026, 7, 1),
+        871,
+        141,
         "14200",
         [HYPERTENSION],
         [
@@ -88,8 +99,8 @@ _POLICIES = [
         4,
         "300000",
         "15000",
-        date(2022, 10, 10),
-        date(2025, 10, 10),
+        1501,
+        405,
         "11300",
         [],
         [("Pooja Nair", date(1995, 5, 9), "F", "self")],
@@ -98,8 +109,8 @@ _POLICIES = [
         5,
         "500000",
         "0",
-        date(2025, 6, 1),
-        date(2026, 6, 1),
+        536,
+        171,
         "16700",
         [DIABETES, HYPERTENSION],
         [
@@ -111,8 +122,8 @@ _POLICIES = [
         6,
         "350000",
         "0",
-        date(2026, 11, 1),
-        date(2026, 11, 1),
+        18,
+        18,
         "10950",
         [],
         [("Arjun Mehta", date(1999, 4, 2), "M", "self")],
@@ -128,13 +139,30 @@ def _member_id(n: int, m: int) -> str:
     return f"MOCK-M-{100 + n:06d}-{m:02d}"
 
 
-async def seed_mock_core(engine: AsyncEngine, sessions: async_sessionmaker[AsyncSession]) -> int:
+def _year_end(start: date) -> date:
+    """The last day of a one-year policy that starts on start."""
+    try:
+        anniversary = start.replace(year=start.year + 1)
+    except ValueError:  # 29 February
+        anniversary = date(start.year + 1, 3, 1)
+    return anniversary - timedelta(days=1)
+
+
+async def seed_mock_core(
+    engine: AsyncEngine,
+    sessions: async_sessionmaker[AsyncSession],
+    *,
+    today: date | None = None,
+) -> int:
+    today = today or date.today()
     async with engine.begin() as conn:
         await conn.run_sync(MockCoreBase.metadata.create_all)
     members = 0
     async with sessions.begin() as session:
-        for n, si, bonus, inception, start, premium, peds, people in _POLICIES:
+        for n, si, bonus, inception_ago, start_ago, premium, peds, people in _POLICIES:
             number = _policy_number(n)
+            inception = today - timedelta(days=inception_ago)
+            start = today - timedelta(days=start_ago)
             existing = await session.get(McPolicy, number)
             policy = McPolicy(
                 policy_number=number,
@@ -146,14 +174,21 @@ async def seed_mock_core(engine: AsyncEngine, sessions: async_sessionmaker[Async
                 inception_date=inception,
                 continuous_cover_start=inception,
                 policy_start=start,
-                policy_end=start.replace(year=start.year + 1) - timedelta(days=1),
+                policy_end=_year_end(start),
                 declared_peds=peds,
             )
             await session.merge(policy)
             await session.flush()
+            premium_id = f"{number}/premium/current"
+            # Earlier seeds keyed the payment by its date; keep one payment per policy.
+            await session.execute(
+                delete(McPremiumPayment).where(
+                    McPremiumPayment.policy_number == number, McPremiumPayment.id != premium_id
+                )
+            )
             await session.merge(
                 McPremiumPayment(
-                    id=f"{number}/premium/{start.isoformat()}",
+                    id=premium_id,
                     policy_number=number,
                     paid_on=start - timedelta(days=3),  # received before cover starts
                     amount=Decimal(premium),

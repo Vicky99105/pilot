@@ -6,9 +6,16 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+from app.services.bill_review.contract import DeductionSheet, LineEdit
 from app.services.classification.contract import DocumentSet
 from app.services.digitisation.contract import ClaimRecord
 from app.services.intake.contract import ClaimForm, Submission
+from app.services.registration.contract import (
+    MatchedHospital,
+    MatchedMember,
+    RegistrationOverrides,
+    RegistrationResult,
+)
 from app.shared.types import DocType, RequestType
 
 _NAMESPACE = uuid.UUID("6f1c1d1e-5a43-4a8e-9a55-0c1a1f0c0001")
@@ -73,4 +80,59 @@ class FakeDigitisationService:
     async def apply_corrections(
         self, claim_id: UUID, fields: dict[str, Any], *, actor: str
     ) -> ClaimRecord:
+        raise NotImplementedError
+
+
+class FakeRegistrationService:
+    async def register(self, claim_id: UUID) -> RegistrationResult:
+        return RegistrationResult(
+            claim_id=claim_id,
+            digitisation_version=1,
+            claim_number="CLM-2026-000001",
+            member=MatchedMember(
+                match="exact_id",
+                member_id="M-1",
+                name="A",
+                dob=date(1990, 1, 1),
+                relationship="self",
+                reason="exact member ID M-1",
+            ),
+            policy=None,
+            hospital=MatchedHospital(
+                match="none", rohini_id=None, name=None, city=None, differential_billing=True
+            ),
+            admission_date=date(2026, 11, 2),
+            accident=False,
+            block_amount=Decimal("1000.00"),
+            rule_results=[],
+            duplicates=[],
+            block_ref=None,
+        )
+
+    async def apply_overrides(
+        self, claim_id: UUID, overrides: RegistrationOverrides, *, actor: str
+    ) -> RegistrationResult:
+        raise NotImplementedError
+
+
+class FakeBillReviewService:
+    async def review(self, claim_id: UUID) -> DeductionSheet:
+        zero = Decimal("0.00")
+        return DeductionSheet(
+            claim_id=claim_id,
+            digitisation_version=1,
+            registration_version=1,
+            product_uin="UIN",
+            lines=[],
+            rule_results=[],
+            claimed_total=zero,
+            admissible_total=zero,
+            co_pay=zero,
+            payable=zero,
+            flagged_lines=[],
+        )
+
+    async def apply_edits(
+        self, claim_id: UUID, edits: list[LineEdit], *, actor: str
+    ) -> DeductionSheet:
         raise NotImplementedError

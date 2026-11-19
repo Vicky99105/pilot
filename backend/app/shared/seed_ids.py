@@ -23,3 +23,6 @@ HOSPITAL_ROHINI_IDS = (
     "8900000000042",
     "8900000000059",
 )
+
+# The product UIN of every mock policy. config/products/ and policy_clauses use it too.
+PRODUCT_UIN = "PLACEHOLDER-AROGYA-SANJEEVANI-UIN"

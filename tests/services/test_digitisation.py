@@ -63,6 +63,7 @@ PART_A: dict[str, Any] = {
     "hospital_city": v("New Delhi"),
     "admission_date": v("2026-11-02"),
     "discharge_date": v("2026-11-05"),
+    "hospitalisation_due_to_injury": v(False),
     "claimed_hospital_expenses": v("48250"),
     "claimed_pre_hospitalisation": v(None),
     "claimed_post_hospitalisation": v(None),
@@ -198,6 +199,7 @@ async def test_a_clean_claim_assembles_one_record_with_page_sources(env: Env) ->
     assert record.identity.patient_name.source == PageRef(document_id=part_a, page=1)
     assert record.hospital.city.value == "New Delhi"
     assert record.admission.admission_date.value == date(2026, 11, 2)
+    assert record.admission.accident.value is False
     assert record.claimed.total.value == Decimal("48250.00")
     assert record.claimed.pre_hospitalisation.value is None
     assert record.clinical.diagnoses[0].value == "Acute gastroenteritis with moderate dehydration"

@@ -21,9 +21,11 @@ from app.workflows.claim_workflow import CHECKPOINT_SLA, ClaimWorkflow
 from app.workflows.worker import build_worker
 from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.stages import (
+    FakeBillReviewService,
     FakeClassificationService,
     FakeDigitisationService,
     FakeIntakeService,
+    FakeRegistrationService,
 )
 from tests.fakes.tasks import FakeTaskService
 
@@ -93,6 +95,8 @@ async def _harness(activities_cls: type[ClaimActivities]) -> AsyncIterator[Harne
             intake=FakeIntakeService(),
             classification=FakeClassificationService(),
             digitisation=FakeDigitisationService(),
+            registration=FakeRegistrationService(),
+            bill_review=FakeBillReviewService(),
         )
         worker: Worker = build_worker(env.client, TASK_QUEUE, claim_activities=activities)
         async with worker:

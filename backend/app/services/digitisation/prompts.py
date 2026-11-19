@@ -54,6 +54,7 @@ class PartAReply(BaseModel):
     hospital_city: Extracted[str] = Extracted()
     admission_date: Extracted[dt.date] = Extracted()
     discharge_date: Extracted[dt.date] = Extracted()
+    hospitalisation_due_to_injury: Extracted[bool] = Extracted()
     claimed_hospital_expenses: Extracted[Amount] = Extracted()
     claimed_pre_hospitalisation: Extracted[Amount] = Extracted()
     claimed_post_hospitalisation: Extracted[Amount] = Extracted()
@@ -144,7 +145,8 @@ PROMPTS = {
     DocType.CLAIM_FORM_PART_A: _COMMON
     + "Document: claim form Part A, filled by the insured person.\n"
     "Extract: the patient's name, policy number, member or insured ID, date of birth, "
-    "gender, the hospital's name and city, the admission and discharge dates, the claimed "
+    "gender, the hospital's name and city, the admission and discharge dates, whether the "
+    "hospitalisation was due to an injury or accident (true or false, as ticked), the claimed "
     "amounts (hospital expenses, pre-hospitalisation, post-hospitalisation, total), and the "
     "bank account number, IFSC and account holder name.",
     DocType.DISCHARGE_SUMMARY: _COMMON + "Document: hospital discharge summary.\n"

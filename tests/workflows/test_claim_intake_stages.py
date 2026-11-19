@@ -1,6 +1,8 @@
-"""ClaimWorkflow with the real intake, classification and digitisation services.
+"""ClaimWorkflow with the real intake, classification, digitisation, registration and
+bill review services.
 
-Time-skipping Temporal, SQLite, an in-memory file store and a scripted model gateway.
+Time-skipping Temporal, SQLite, an in-memory file store, a scripted model gateway and fake
+core policy and money services.
 """
 
 import asyncio
@@ -20,6 +22,7 @@ from app.config import Settings
 from app.database.repositories.stage_records import StageRecordRepository
 from app.database.seed import seed_claims_db
 from app.integrations.openai_compatible import ProviderPermanentError
+from app.services.bill_review.service import DefaultBillReviewService
 from app.services.classification.service import DefaultClassificationService
 from app.services.digitisation.service import DefaultDigitisationService
 from app.services.intake.contract import (
@@ -31,17 +34,21 @@ from app.services.intake.contract import (
 )
 from app.services.intake.service import DefaultIntakeService, DefaultWorkflowStarter
 from app.services.page_prep.service import DefaultPagePreparer
+from app.services.registration.service import DefaultRegistrationService
+from app.services.rules.service import DefaultRulesEngine
 from app.shared.seed_ids import MEMBER_USER_ID
 from app.shared.types import RequestType, Stage
 from app.workflows.claim_activities import ClaimActivities
 from app.workflows.claim_workflow import ClaimWorkflow
 from app.workflows.worker import build_worker
 from tests.docs import make_pdf
+from tests.fakes.core import FakeMoneyService, FakePolicyService
 from tests.fakes.file_store import FakeFileStore
 from tests.fakes.model_gateway import FakeModelGateway
 from tests.fakes.monitoring import FakeMonitoring
 from tests.fakes.tasks import FakeTaskService
 from tests.services.test_digitisation import BILL, CHEQUE, DISCHARGE, PAGES, PART_A, v
+from tests.services.test_registration import asha_policy
 
 TASK_QUEUE = "test-claims-slice-2"
 
@@ -63,14 +70,23 @@ class Harness:
             Settings(temporal_task_queue=TASK_QUEUE), client=env.client
         )
         self.intake = DefaultIntakeService(sessions, self.files, self.starter)
-        self.activities = ClaimActivities(
+        self.money = FakeMoneyService()
+        self.activities = self.build_activities(gateway)
+
+    def build_activities(self, gateway: Any) -> ClaimActivities:
+        rules = DefaultRulesEngine(Settings().config_dir / "products")
+        return ClaimActivities(
             self.monitoring,
             self.tasks,
             intake=self.intake,
             classification=DefaultClassificationService(
-                sessions, self.files, gateway, DefaultPagePreparer(sessions, self.files)
+                self.sessions, self.files, gateway, DefaultPagePreparer(self.sessions, self.files)
             ),
-            digitisation=DefaultDigitisationService(sessions, self.files, gateway),
+            digitisation=DefaultDigitisationService(self.sessions, self.files, gateway),
+            registration=DefaultRegistrationService(
+                self.sessions, FakePolicyService([asha_policy()]), self.money, rules
+            ),
+            bill_review=DefaultBillReviewService(self.sessions, rules),
         )
 
     async def submit(self) -> Submission:
@@ -228,15 +244,7 @@ async def test_a_permanent_model_failure_fails_the_stage_with_an_event(
     env: WorkflowEnvironment, sessions: async_sessionmaker[AsyncSession]
 ) -> None:
     h = await _harness(env, sessions, FakeModelGateway({}))  # no scripted replies
-    h.activities = ClaimActivities(
-        h.monitoring,
-        h.tasks,
-        intake=h.intake,
-        classification=DefaultClassificationService(
-            sessions, h.files, _FailingGateway(), DefaultPagePreparer(sessions, h.files)
-        ),
-        digitisation=DefaultDigitisationService(sessions, h.files, _FailingGateway()),
-    )
+    h.activities = h.build_activities(_FailingGateway())
     async with build_worker(env.client, TASK_QUEUE, claim_activities=h.activities):
         submission = await h.submit()
         handle = env.client.get_workflow_handle(str(submission.claim_id))
@@ -277,3 +285,98 @@ class _FailingGateway:
 
 def _no_key() -> Exception:
     return ProviderPermanentError("no API key configured for provider openrouter")
+
+
+# --- Registration and bill review (slice 3) ------------------------------------------------
+
+
+async def test_registration_and_bill_review_open_their_checkpoints_with_the_records(
+    env: WorkflowEnvironment, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    h = await _harness(env, sessions, _script())
+    async with build_worker(env.client, TASK_QUEUE, claim_activities=h.activities):
+        submission = await h.submit()
+        await h.wait_for(
+            lambda: bool(h.tasks.unfinished("confirm_registration")), "registration checkpoint"
+        )
+        [registration] = h.tasks.unfinished("confirm_registration")
+        assert registration.role.value == "claims_operator"
+        assert registration.payload["claim_number"].startswith("CLM-")
+        assert [r["rule_id"] for r in registration.payload["rule_results"]] == [
+            "R3", "R1", "R2", "R5", "R10",
+        ]  # fmt: skip
+        assert registration.payload["block_ref"] is not None
+        assert h.tasks.unfinished("confirm_deductions") == []
+
+        await h.complete("confirm_registration", {"action": "confirm"})
+        await h.wait_for(
+            lambda: bool(h.tasks.unfinished("confirm_deductions")), "deductions checkpoint"
+        )
+        [deductions] = h.tasks.unfinished("confirm_deductions")
+        assert deductions.role.value == "bill_processor"
+        assert deductions.payload["admissible_total"] == "48250.00"
+        assert deductions.payload["payable"] == "45837.50"  # after the 5% co-pay
+        assert len(h.money.blocks) == 1
+        await env.client.get_workflow_handle(str(submission.claim_id)).terminate()
+
+
+async def test_a_person_edit_at_confirm_deductions_is_a_new_version_by_a_person(
+    env: WorkflowEnvironment, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    h = await _harness(env, sessions, _script())
+    async with build_worker(env.client, TASK_QUEUE, claim_activities=h.activities):
+        submission = await h.submit()
+        await h.complete("confirm_registration", {"action": "confirm"})
+        edit = {"line_id": 4, "admissible": "20000", "reason": "Stool culture not advised"}
+        task_id = await h.complete("confirm_deductions", {"action": "confirm", "lines": [edit]})
+        await h.wait_for(lambda: bool(h.tasks.unfinished("approve")), "approve checkpoint")
+
+        history = await StageRecordRepository(sessions).history(
+            submission.claim_id, Stage.BILL_REVIEW
+        )
+        assert [r.created_by for r in history] == ["code", f"task:{task_id}"]
+        line = next(ln for ln in history[-1].payload["lines"] if ln["line_id"] == 4)
+        assert (line["judged_by"], line["admissible"]) == ("person", "20000.00")
+        assert history[-1].payload["payable"] == "43937.50"
+        assert "corrections_applied" in h.monitoring.actions(Stage.BILL_REVIEW)
+
+        # A send-back from a later stage re-runs bill review and keeps the person's version.
+        await h.complete("approve", {"action": "send_back", "stage": "bill_review"})
+        await h.wait_for(lambda: bool(h.tasks.unfinished("confirm_deductions")), "deductions again")
+        [again] = h.tasks.unfinished("confirm_deductions")
+        assert again.payload["payable"] == "43937.50"
+        assert h.monitoring.actions(Stage.BILL_REVIEW).count("stage_completed") == 2
+        await env.client.get_workflow_handle(str(submission.claim_id)).terminate()
+
+
+async def test_a_registration_override_is_stored_and_a_bad_one_reopens_the_task(
+    env: WorkflowEnvironment, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    h = await _harness(env, sessions, _script())
+    async with build_worker(env.client, TASK_QUEUE, claim_activities=h.activities):
+        submission = await h.submit()
+        await h.complete(
+            "confirm_registration", {"overrides": {"member_id": "NOPE", "reason": "x"}}
+        )
+        await h.wait_for(
+            lambda: "corrections_rejected" in h.monitoring.actions(Stage.REGISTRATION),
+            "rejection event",
+        )
+        await h.wait_for(
+            lambda: bool(h.tasks.unfinished("confirm_registration")), "registration again"
+        )
+        [again] = h.tasks.unfinished("confirm_registration")
+        assert "not on the policy" in again.payload["correction_error"]
+
+        overrides = {"rules": {"R5": "Ported from another insurer; wait already served"}}
+        task_id = await h.complete("confirm_registration", {"overrides": overrides})
+        await h.wait_for(
+            lambda: bool(h.tasks.unfinished("confirm_deductions")), "deductions checkpoint"
+        )
+        history = await StageRecordRepository(sessions).history(
+            submission.claim_id, Stage.REGISTRATION
+        )
+        assert [r.created_by for r in history] == ["code", f"task:{task_id}"]
+        r5 = next(r for r in history[-1].payload["rule_results"] if r["rule_id"] == "R5")
+        assert r5["judged_by"] == "person"
+        await env.client.get_workflow_handle(str(submission.claim_id)).terminate()

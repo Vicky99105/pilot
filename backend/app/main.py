@@ -16,8 +16,13 @@ from app.api.routes import submissions as submission_routes
 from app.api.routes import tasks as task_routes
 from app.config import Settings
 from app.integrations.core.contract import PermissionService
-from app.integrations.core.http import HttpPermissionService
+from app.integrations.core.http import (
+    HttpMoneyService,
+    HttpPermissionService,
+    HttpPolicyService,
+)
 from app.mock_core.router import router as mock_core_router
+from app.services.bill_review.service import DefaultBillReviewService
 from app.services.claims.contract import ClaimQueryService
 from app.services.claims.service import DefaultClaimQueryService
 from app.services.classification.service import DefaultClassificationService
@@ -33,6 +38,8 @@ from app.services.model_gateway.service import build_model_gateway
 from app.services.monitoring.contract import Monitoring
 from app.services.monitoring.service import DefaultMonitoring
 from app.services.page_prep.service import DefaultPagePreparer
+from app.services.registration.service import DefaultRegistrationService
+from app.services.rules.service import DefaultRulesEngine
 from app.services.tasks.contract import TaskService
 from app.services.tasks.service import DefaultTaskService, DefaultWorkflowSignaller
 from app.services.users.contract import UserService
@@ -91,6 +98,7 @@ def create_app(
         gateway = model_gateway or build_model_gateway(
             config_path=settings.config_dir / "models.yaml", file_store=files, sessions=sessions
         )
+        rules = DefaultRulesEngine(settings.config_dir / "products")
         activities = ClaimActivities(
             app.state.monitoring,
             app.state.task_service,
@@ -99,6 +107,13 @@ def create_app(
                 sessions, files, gateway, DefaultPagePreparer(sessions, files)
             ),
             digitisation=DefaultDigitisationService(sessions, files, gateway),
+            registration=DefaultRegistrationService(
+                sessions,
+                HttpPolicyService(settings.mock_core_base_url, core_http),
+                HttpMoneyService(settings.mock_core_base_url, core_http),
+                rules,
+            ),
+            bill_review=DefaultBillReviewService(sessions, rules),
         )
         worker_task = asyncio.create_task(
             run_worker_forever(settings, activities), name="temporal-worker"

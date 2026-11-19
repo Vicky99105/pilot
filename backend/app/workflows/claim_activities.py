@@ -1,20 +1,23 @@
 """ClaimWorkflow activities. Thin wrappers that call service contracts only.
 
-Slice 2: intake, classification and digitisation call their services. The later stages
-still only record an event; slices 3 to 5 replace them.
+Slices 2 and 3: intake through bill review call their services. The later stages still
+only record an event; slices 4 and 5 replace them.
 """
 
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 from uuid import UUID
 
+from pydantic import TypeAdapter, ValidationError
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from app.services.bill_review.contract import BillReviewService, LineEdit
 from app.services.classification.contract import ClassificationService
 from app.services.digitisation.contract import DigitisationService
 from app.services.intake.contract import IntakeService
 from app.services.monitoring.contract import Monitoring
+from app.services.registration.contract import RegistrationOverrides, RegistrationService
 from app.services.tasks.contract import TaskService
 from app.shared.errors import PermanentError
 from app.shared.types import DocType, Stage
@@ -28,6 +31,7 @@ from app.workflows.claim_models import (
 )
 
 R = TypeVar("R")
+_LINE_EDITS = TypeAdapter(list[LineEdit])
 
 
 async def _non_retryable_on_permanent(call: Awaitable[R]) -> R:
@@ -50,12 +54,16 @@ class ClaimActivities:
         intake: IntakeService,
         classification: ClassificationService,
         digitisation: DigitisationService,
+        registration: RegistrationService,
+        bill_review: BillReviewService,
     ) -> None:
         self._monitoring = monitoring
         self._tasks = tasks
         self._intake = intake
         self._classification = classification
         self._digitisation = digitisation
+        self._registration = registration
+        self._bill_review = bill_review
 
     async def _run(self, claim_id: UUID, stage: Stage, call: Awaitable[R]) -> R:
         """Run a stage's service call. A permanent failure is recorded as an event, so it
@@ -172,6 +180,14 @@ class ClaimActivities:
             fields = inp.outcome.get("fields") or {}
             call = self._digitisation.apply_corrections(inp.claim_id, fields, actor=inp.actor)
             changed = sorted(fields)
+        elif inp.stage is Stage.REGISTRATION:
+            overrides = _parse(RegistrationOverrides.model_validate, inp.outcome.get("overrides"))
+            call = self._registration.apply_overrides(inp.claim_id, overrides, actor=inp.actor)
+            changed = sorted(overrides.model_dump(exclude_defaults=True))
+        elif inp.stage is Stage.BILL_REVIEW:
+            edits = _parse(_LINE_EDITS.validate_python, inp.outcome.get("lines"))
+            call = self._bill_review.apply_edits(inp.claim_id, edits, actor=inp.actor)
+            changed = [f"line {e.line_id}" for e in edits]
         else:
             raise ApplicationError(
                 f"{inp.stage} takes no corrections", type="PermanentError", non_retryable=True
@@ -187,11 +203,33 @@ class ClaimActivities:
 
     @activity.defn(name="registration")
     async def registration(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        result = await self._run(inp.claim_id, inp.stage, self._registration.register(inp.claim_id))
+        return await self._stage_done(
+            inp,
+            {
+                "claim_number": result.claim_number,
+                "failed_rules": [r.rule_id for r in result.rule_results if not r.passed],
+                "duplicates": [str(d.claim_id) for d in result.duplicates],
+                "blocked": str(result.block_ref.amount) if result.block_ref else None,
+            },
+            needs_checkpoint=True,  # "confirm registration" is always on
+            checkpoint_payload=result.model_dump(mode="json"),
+        )
 
     @activity.defn(name="bill_review")
     async def bill_review(self, inp: StageInput) -> StageResult:
-        return await self._stage_done(inp)
+        sheet = await self._run(inp.claim_id, inp.stage, self._bill_review.review(inp.claim_id))
+        return await self._stage_done(
+            inp,
+            {
+                "claimed": str(sheet.claimed_total),
+                "admissible": str(sheet.admissible_total),
+                "payable": str(sheet.payable),
+                "flagged_lines": sheet.flagged_lines,
+            },
+            needs_checkpoint=True,  # "confirm deductions" is always on
+            checkpoint_payload=sheet.model_dump(mode="json"),
+        )
 
     @activity.defn(name="medical_review")
     async def medical_review(self, inp: StageInput) -> StageResult:
@@ -262,6 +300,15 @@ class ClaimActivities:
     def all(self) -> list[Callable[..., Awaitable[Any]]]:
         names = [s.value for s in Stage] + ["open_task", "record_event", "apply_corrections"]
         return [getattr(self, n) for n in names]
+
+
+def _parse(parse: Callable[[Any], R], raw: Any) -> R:
+    try:
+        return parse(raw)
+    except ValidationError as exc:
+        raise ApplicationError(
+            f"invalid corrections: {exc}", type="PermanentError", non_retryable=True
+        ) from exc
 
 
 def _labels(raw: dict[str, Any]) -> dict[UUID, DocType]:

@@ -122,7 +122,9 @@ def _read_part_a(
     )
     record.hospital = HospitalDetails(name=read(r.hospital_name), city=read(r.hospital_city))
     record.admission = Admission(
-        admission_date=read(r.admission_date), discharge_date=read(r.discharge_date)
+        admission_date=read(r.admission_date),
+        discharge_date=read(r.discharge_date),
+        accident=read(r.hospitalisation_due_to_injury),
     )
     record.claimed = ClaimedAmounts(
         hospital_expenses=read(r.claimed_hospital_expenses),

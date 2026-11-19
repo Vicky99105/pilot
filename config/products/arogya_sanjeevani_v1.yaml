@@ -1,0 +1,53 @@
+# Product parameters for the rules engine. One file per product version.
+# The rules read every limit from here; changing a limit is a change to this file only.
+# Clause references match the policy_clauses seed (backend/app/database/seed.py).
+
+product_uin: PLACEHOLDER-AROGYA-SANJEEVANI-UIN
+name: Arogya Sanjeevani style standard product (pilot)
+version: 1
+
+room_rent:
+  percent_of_sum_insured: 2
+  max_per_day: 5000
+icu:
+  percent_of_sum_insured: 5
+  max_per_day: 10000
+
+proportionate_deduction:
+  # Heads reduced in the ratio (room cap / room rate charged) when the room breaches its cap.
+  linked_heads: [nursing, ot, professional_fees]
+  # Heads that are never reduced in proportion.
+  excluded_heads: [pharmacy, consumables, implants, diagnostics]
+  # When the hospital charges the same rates for every room category, no deduction applies.
+  only_with_differential_billing: true
+
+co_pay:
+  percent: 5
+
+initial_waiting:
+  days: 30
+  accident_exempt: true
+  # Continuous cover longer than this many months waives the initial wait.
+  waived_after_continuous_cover_months: 12
+
+grace_period_days:
+  monthly: 15
+  other: 30
+
+clauses:
+  premium_received: 64VB
+  policy_period: POLICY-PERIOD
+  grace_period: GRACE
+  insured_person: INSURED
+  initial_waiting: Excl03
+  sum_insured: SUM-INSURED
+  room_cap: ROOM-CAP
+  icu_cap: ICU-CAP
+  proportionate_deduction: PROP-DED
+  co_pay: CO-PAY
+  # Non-payable annexure, by IRDAI list number.
+  non_payable:
+    I: ANNEX-I
+    II: ANNEX-II
+    III: ANNEX-III
+    IV: ANNEX-IV

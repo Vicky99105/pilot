@@ -10,6 +10,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.integrations.core.contract import (
@@ -25,6 +26,7 @@ from app.integrations.core.http import (
     HttpPermissionService,
     HttpPolicyService,
 )
+from app.mock_core.models import McPolicy, McPremiumPayment
 from app.mock_core.router import router as mock_core_router
 from app.mock_core.seed import seed_mock_core
 from app.shared.seed_ids import (
@@ -93,7 +95,7 @@ async def test_seed_has_ten_members_one_recent_inception_and_declared_peds(core:
                 policies[f"{n}-{m}"] = p
 
     assert len(policies) == 10
-    assert any((date(2026, 11, 19) - p.inception_date).days < 30 for p in policies.values())
+    assert any((date.today() - p.inception_date).days < 30 for p in policies.values())
     assert any(p.declared_peds for p in policies.values())
     assert all(c.system == "ICD-10-CM" for p in policies.values() for c in p.declared_peds)
 
@@ -192,3 +194,24 @@ async def test_permissions_follow_seeded_grants(core: Core) -> None:
     assert not await perm.can_submit_for(
         user_id=HOSPITAL_USER_ID, policy_number=None, hospital_id=HOSPITAL_ROHINI_IDS[1]
     )
+
+
+async def test_seed_dates_follow_the_seed_day_and_a_reseed_stays_idempotent(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'mc.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    later = date(2027, 6, 30)
+    await seed_mock_core(engine, sessions, today=date(2026, 11, 19))
+    await seed_mock_core(engine, sessions, today=later)
+    await seed_mock_core(engine, sessions, today=later)
+
+    async with sessions() as session:
+        recent = await session.get(McPolicy, "MOCK/AS/2026/000106")
+        payments = (await session.scalars(select(McPremiumPayment))).all()
+    await engine.dispose()
+
+    assert recent is not None
+    assert (later - recent.inception_date).days == 18
+    assert recent.policy_start <= later <= recent.policy_end
+    assert len(payments) == 6  # one per policy, whatever the number of seeds

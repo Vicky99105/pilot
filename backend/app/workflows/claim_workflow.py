@@ -83,8 +83,13 @@ CRC = Checkpoint("crc", Role.CRC_REVIEWER, "Approve rejection or partial")
 QUERY_NO_REPLY = Checkpoint("query_no_reply", Role.CLAIMS_OPERATOR, "Handle query with no reply")
 RELEASE_PAYMENT = Checkpoint("release_payment", Role.FINANCE, "Release payment")
 
-# Stages whose checkpoint outcome can carry corrections ("labels" or "fields").
-CORRECTABLE = {Stage.CLASSIFICATION, Stage.DIGITISATION}
+# Stages whose checkpoint outcome can carry corrections, and the outcome key that holds them.
+CORRECTABLE = {
+    Stage.CLASSIFICATION: "labels",
+    Stage.DIGITISATION: "fields",
+    Stage.REGISTRATION: "overrides",
+    Stage.BILL_REVIEW: "lines",
+}
 
 CONDITIONAL = {
     Stage.CLASSIFICATION: FIX_LABELS,
@@ -221,7 +226,7 @@ class ClaimWorkflow:
     ) -> dict[str, Any]:
         """Apply a person's corrections as a new stage record. Corrections the service
         refuses send the same checkpoint back to the queue with the reason."""
-        while outcome.get("labels") or outcome.get("fields"):
+        while outcome.get(CORRECTABLE[stage]):
             assert self._claim_id is not None
             try:
                 await workflow.execute_activity_method(
