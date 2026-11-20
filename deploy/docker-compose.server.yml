@@ -1,0 +1,13 @@
+# Pilot server override. Use with docker-compose.yml:
+#   docker compose --env-file .env -f deploy/docker-compose.yml -f deploy/docker-compose.server.yml up -d --build
+# The app listens on the server's localhost only and is reached through an SSH tunnel.
+# Caddy stays off until Consint IT opens 80/443 and gives a domain:
+#   add --profile public to start it.
+
+services:
+  app:
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  caddy:
+    profiles: ["public"]
