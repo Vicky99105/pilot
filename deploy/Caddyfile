@@ -3,6 +3,12 @@
 # basic_auth: one shared site password for the pilot team, checked before the app.
 # The defaults are LOCAL-ONLY (user "pilot", password "local-dev-only"). On the server,
 # SITE_USER and SITE_PASSWORD_HASH come from .env (hash made with caddy hash-password).
+{
+	# Browsers send no server name (SNI) when the address is a bare IP, so tell Caddy which
+	# certificate to present then.
+	default_sni {$SITE_ADDRESS:localhost}
+}
+
 {$SITE_ADDRESS:localhost} {
 	tls internal
 	encode zstd gzip
