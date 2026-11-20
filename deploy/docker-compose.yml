@@ -128,6 +128,10 @@ services:
     image: caddy:2.11.9
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+      # The shared site password (see Caddyfile). The defaults are LOCAL-ONLY: user "pilot",
+      # password "local-dev-only". On the server, set both in .env ($$ escapes $ here).
+      SITE_USER: ${SITE_USER:-pilot}
+      SITE_PASSWORD_HASH: ${SITE_PASSWORD_HASH:-$$2a$$14$$xjSvvXG/FoiejG8Oj92tB.ldgXf80Ez9Dkr4xhOsmcD5oAsaQZ.j.}
     ports:
       - "80:80"
       - "443:443"

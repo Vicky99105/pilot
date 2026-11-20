@@ -1,7 +1,13 @@
 # SITE_ADDRESS is the server IP now, the domain later. Defaults to localhost.
 # tls internal: Caddy issues its own certificate until a domain exists.
+# basic_auth: one shared site password for the pilot team, checked before the app.
+# The defaults are LOCAL-ONLY (user "pilot", password "local-dev-only"). On the server,
+# SITE_USER and SITE_PASSWORD_HASH come from .env (hash made with caddy hash-password).
 {$SITE_ADDRESS:localhost} {
 	tls internal
 	encode zstd gzip
+	basic_auth {
+		{$SITE_USER:pilot} {$SITE_PASSWORD_HASH:$2a$14$xjSvvXG/FoiejG8Oj92tB.ldgXf80Ez9Dkr4xhOsmcD5oAsaQZ.j.}
+	}
 	reverse_proxy app:8000
 }
